@@ -2514,29 +2514,36 @@ if not has_splits or np.nanmax(VP["Vmax_mps"]) <= 0:
 TSI_raw = _percentile01(VP["Vmax_mps"])
 TSI = (TSI_raw * (1.0 - trim_V)).clip(0.0, 1.0)
 
-# --------- Revised SSI calculation (distance-aware & RSI-aware) ----------
-dur01 = _percentile01(VP["Sustain_s"] / (VP["RaceTime_s"] + 1e-6))
-dst01 = _percentile01(VP["Sustain_m"] / D_m)
-eff   = np.nan_to_num(VP["AUC_90_100"] / (VP["Sustain_s"] + 1e-6), nan=0.0)
+# ---------- Improved SSI (core of V-Profile) ----------
+# Normalise sustain duration & distance by race scale
+dur_rel = np.nan_to_num(VP["Sustain_s"] / (VP["RaceTime_s"] + 1e-6))
+dst_rel = np.nan_to_num(VP["Sustain_m"] / D_m)
+
+dur01 = _percentile01(dur_rel)
+dst01 = _percentile01(dst_rel)
+
+# Efficiency = how much "AUC" per second (not total AUC)
+eff = np.nan_to_num(VP["AUC_90_100"] / (VP["Sustain_s"] + 1e-6))
 eff01 = _percentile01(eff)
 
+# Smoothness = steadiness across Accel/Grind
 acc = pd.to_numeric(VP.get("Accel"), errors="coerce")
 grd = pd.to_numeric(VP.get(GR_COL), errors="coerce")
-sm_raw = -(acc - grd).abs()      
-sm01   = _percentile01(sm_raw.fillna(sm_raw.median(skipna=True)))
+sm_raw = 1.0 - np.abs(acc - grd) / np.maximum(acc.add(grd, fill_value=0)/2, 1e-6)
+sm01 = _percentile01(sm_raw.fillna(sm_raw.median(skipna=True)))
 
-# Earlier onset → better (reverse percentile)
+# Onset = earlier sustain → higher score
+on_bonus = pd.Series(0.0, index=VP.index)
 if np.isfinite(VP["Onset_from_home_m"]).any():
     on01 = 1.0 - _percentile01(VP["Onset_from_home_m"])
     on_bonus = 0.08 * on01
-else:
-    on_bonus = pd.Series(0.0, index=VP.index)
 
-SSI = (0.35*dur01 + 0.25*dst01 + 0.20*eff01 + 0.15*sm01 + on_bonus).clip(0.0, 1.0)
+# Weighted blend
+SSI = (0.38*dur01 + 0.25*dst01 + 0.20*eff01 + 0.12*sm01 + on_bonus).clip(0.0, 1.0)
 
-# Adjust for race shape (fast-early boost, slow-early trim)
+# Optional shape modulation (light touch)
 if np.isfinite(RSI) and np.isfinite(SCI) and SCI >= 0.5:
-    SSI = SSI * (1.0 + 0.05 * np.sign(-RSI) * min(abs(RSI)/10.0, 1.0))
+    SSI *= (1.0 + 0.04 * np.sign(-RSI))
 
 # shape headwind/tailwind tiny modifier on SSI (reward sustain against fast-early)
 if RSI < -0.5 and SCI >= 0.6:
