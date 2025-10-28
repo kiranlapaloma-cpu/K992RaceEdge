@@ -2514,25 +2514,29 @@ if not has_splits or np.nanmax(VP["Vmax_mps"]) <= 0:
 TSI_raw = _percentile01(VP["Vmax_mps"])
 TSI = (TSI_raw * (1.0 - trim_V)).clip(0.0, 1.0)
 
-# SSI components: duration, distance, AUC, smoothness & onset bonus
-dur01 = _percentile01(VP["Sustain_s"])
-dst01 = _percentile01(VP["Sustain_m"])
-auc01 = _percentile01(VP["AUC_90_100"])
+# --------- Revised SSI calculation (distance-aware & RSI-aware) ----------
+dur01 = _percentile01(VP["Sustain_s"] / (VP["RaceTime_s"] + 1e-6))
+dst01 = _percentile01(VP["Sustain_m"] / D_m)
+eff   = np.nan_to_num(VP["AUC_90_100"] / (VP["Sustain_s"] + 1e-6), nan=0.0)
+eff01 = _percentile01(eff)
 
-# Smoothness bonus: prefer low jerk near top → proxy via Accel vs Grind consistency
 acc = pd.to_numeric(VP.get("Accel"), errors="coerce")
 grd = pd.to_numeric(VP.get(GR_COL), errors="coerce")
-sm_raw = -(acc - grd).abs()      # closer = smoother
+sm_raw = -(acc - grd).abs()      
 sm01   = _percentile01(sm_raw.fillna(sm_raw.median(skipna=True)))
 
-# Earlier onset bonus (harder to do early)
-on_bonus = pd.Series(0.0, index=VP.index)
+# Earlier onset → better (reverse percentile)
 if np.isfinite(VP["Onset_from_home_m"]).any():
-    # earlier (bigger metres-from-home) → better
-    on01 = _percentile01(VP["Onset_from_home_m"])
-    on_bonus = 0.08 * on01  # modest cap
+    on01 = 1.0 - _percentile01(VP["Onset_from_home_m"])
+    on_bonus = 0.08 * on01
+else:
+    on_bonus = pd.Series(0.0, index=VP.index)
 
-SSI = (0.40*dur01 + 0.25*dst01 + 0.25*auc01 + 0.10*sm01 + on_bonus).clip(0.0, 1.0)
+SSI = (0.35*dur01 + 0.25*dst01 + 0.20*eff01 + 0.15*sm01 + on_bonus).clip(0.0, 1.0)
+
+# Adjust for race shape (fast-early boost, slow-early trim)
+if np.isfinite(RSI) and np.isfinite(SCI) and SCI >= 0.5:
+    SSI = SSI * (1.0 + 0.05 * np.sign(-RSI) * min(abs(RSI)/10.0, 1.0))
 
 # shape headwind/tailwind tiny modifier on SSI (reward sustain against fast-early)
 if RSI < -0.5 and SCI >= 0.6:
