@@ -2485,7 +2485,13 @@ for _, r in VP.iterrows():
         # degrade: use proxies when splits unavailable → we’ll score through percentiles later
         Vmax.append(np.nan); SustainDur.append(0.0); SustainDist.append(0.0); AUC_90_100.append(0.0); Onset_m.append(np.nan)
 
-VP["Vmax_mps"]     = Vmax
+# Store both m/s and km/h for display
+VP["Vmax_mps"] = Vmax
+VP["Vmax_kmph"] = np.where(
+    pd.notna(VP["Vmax_mps"]),
+    VP["Vmax_mps"] * 3.6,  # convert to km/h
+    np.nan
+)
 VP["Sustain_s"]    = SustainDur
 VP["Sustain_m"]    = SustainDist
 VP["AUC_90_100"]   = AUC_90_100
@@ -2562,13 +2568,13 @@ def _flags_row(r):
 VP["Flags"] = VP.apply(_flags_row, axis=1)
 
 # --------- tidy view ----------
-show_cols = ["Horse","VProfile","TSI","SSI","Vmax_mps","Sustain_s","Sustain_m","Flags"]
+show_cols = ["Horse","VProfile","TSI","SSI","Vmax_kmph","Sustain_s","Sustain_m","Flags"]
 for c in show_cols:
     if c not in VP.columns: VP[c] = np.nan
 
 VP_view = VP.sort_values(["VProfile","SSI","TSI"], ascending=[False,False,False])[show_cols]
 VP_view = VP_view.rename(columns={
-    "Vmax_mps":"Vmax (m/s)",
+    "Vmax_kmph":"Vmax (km/h)",
     "Sustain_s":"Sustain (s ≥~95%)",
     "Sustain_m":"Sustain (m ≥~95%)"
 })
@@ -2601,6 +2607,92 @@ st.caption(
     "Flags: Raw Pace Weapon / True Sustainer / Dual Threat / Flash Risk / Wants Further."
 )
 # ======================= /V-Profile =======================
+
+# ======================= V-Profile — Style Quadrant (polished) =======================
+st.markdown("## V-Profile Style Quadrant — Size = V-Profile · Colour = Onset (earlier = cooler)")
+
+# Expect these in VP from the V-Profile block:
+#   Horse, TSI (0..100), SSI (0..100), VProfile (0..10), Onset_from_home_m
+need = {"Horse","TSI","SSI","VProfile","Onset_from_home_m"}
+missing = [c for c in need if c not in VP.columns]
+if missing:
+    st.info("Style Quadrant: missing columns — " + ", ".join(missing))
+else:
+    plot_df = VP.copy()
+    # keep rows that at least have TSI & SSI; fill safe defaults for aesthetics
+    plot_df = plot_df.dropna(subset=["TSI","SSI"])
+    if plot_df.empty:
+        st.info("Style Quadrant: nothing to plot (no TSI/SSI).")
+    else:
+        # Data vectors
+        X  = pd.to_numeric(plot_df["TSI"], errors="coerce").clip(0, 100)
+        Y  = pd.to_numeric(plot_df["SSI"], errors="coerce").clip(0, 100)
+        SZ = 60.0 + (pd.to_numeric(plot_df["VProfile"], errors="coerce").clip(0,10) / 10.0) * 240.0
+        ON = pd.to_numeric(plot_df["Onset_from_home_m"], errors="coerce")
+
+        # Robust onset color range (falls back to ~200..650m if degenerate)
+        vmin = float(np.nanpercentile(ON, 10)) if ON.notna().any() else 200.0
+        vmax = float(np.nanpercentile(ON, 90)) if ON.notna().any() else 650.0
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+            vmin, vmax = 200.0, 650.0
+
+        figQ, axQ = plt.subplots(figsize=(8.8, 6.6), layout="constrained")
+
+        # Soft background quadrants (same idea as your earlier map)
+        axQ.axvspan(60, 100, ymin=0.6, ymax=1.0, alpha=0.06)  # BR (complete)
+        axQ.axvspan(0,  60,  ymin=0.6, ymax=1.0, alpha=0.06)  # BL (grinder)
+        axQ.axvspan(60, 100, ymin=0.0, ymax=0.6, alpha=0.06)  # TR (speedball)
+        axQ.axvspan(0,  60,  ymin=0.0, ymax=0.6, alpha=0.06)  # TL (out-of-trip)
+
+        # Crosshairs + optional balance diagonal
+        axQ.axvline(60, color="gray", lw=0.8, ls="--", alpha=0.45)
+        axQ.axhline(60, color="gray", lw=0.8, ls="--", alpha=0.45)
+        axQ.plot([0,100],[0,100], color="gray", lw=0.7, ls=":", alpha=0.40)  # balance line (TSI≈SSI)
+
+        # Scatter
+        sc = axQ.scatter(X, Y, s=SZ, c=ON, cmap="coolwarm", vmin=vmin, vmax=vmax,
+                         edgecolor="black", linewidth=0.6, alpha=0.95)
+
+        # Labels with your repel helper if available
+        try:
+            label_points_neatly(axQ, X.values, Y.values, plot_df["Horse"].astype(str).tolist())
+        except Exception:
+            for xi, yi, nm in zip(X, Y, plot_df["Horse"]):
+                axQ.text(xi, yi, str(nm), fontsize=8.4,
+                         bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.75))
+
+        # Axes & grid
+        axQ.set_xlim(0, 100); axQ.set_ylim(0, 100)
+        axQ.set_xlabel("TSI — Top-Speed Index (right = faster top gear) →")
+        axQ.set_ylabel("SSI — Sustain Index (up = longer at/near top speed) ↑")
+        axQ.set_title("V-Profile Style Quadrant — Size = V-Profile · Colour = Onset (early → cool, late → warm)")
+        axQ.grid(True, linestyle=":", alpha=0.25)
+
+        # Corner quadrant labels (subtle, presentation-friendly)
+        axQ.text(98,  96, "🏆 Complete",          ha="right", va="top",    fontsize=10, alpha=0.85)
+        axQ.text(2,   96, "🏋️ Grinder/Stayer",    ha="left",  va="top",    fontsize=10, alpha=0.85)
+        axQ.text(98,   4, "⚡ Speedball",         ha="right", va="bottom", fontsize=10, alpha=0.85)
+        axQ.text(2,    4, "🧩 Out-of-Trip",       ha="left",  va="bottom", fontsize=10, alpha=0.85)
+
+        # Point-size legend (V-Profile)
+        for s, lab in [(60, "V-Profile low"), (160, "V-Profile mid"), (260, "V-Profile high")]:
+            axQ.scatter([], [], s=s, label=lab, color="gray", edgecolor="black", alpha=0.6)
+        leg = axQ.legend(loc="upper left", frameon=False, fontsize=9, title="Point size:")
+        if leg: leg._legend_box.align = "left"
+
+        # Colourbar
+        cbar = figQ.colorbar(sc, ax=axQ, fraction=0.046, pad=0.04)
+        cbar.set_label("Onset — metres from home (earlier → cooler)")
+
+        st.pyplot(figQ)
+
+        # Optional: download
+        bufQ = io.BytesIO()
+        figQ.savefig(bufQ, format="png", dpi=300, bbox_inches="tight", facecolor="white")
+        st.download_button("Download V-Profile Style Quadrant (PNG)",
+                           bufQ.getvalue(), file_name="vprofile_style_quadrant.png",
+                           mime="image/png", use_container_width=True)
+# ======================= /V-Profile — Style Quadrant (polished) =======================
 
 # ======================= xWin — Probability to Win (100-replay view) =======================
 st.markdown("## xWin — Probability to Win")
