@@ -1813,7 +1813,7 @@ else:
         ax.set_xlim(-lim,lim); ax.set_ylim(-lim,lim)
         ax.set_xlabel("Acceleration vs field (points) →")
         ax.set_ylabel(("Corrected " if USE_CG else "")+"Grind vs field (points) ↑")
-        ax.set_title("Quadrants: +X=Accel (400→200) · +Y="+("Corrected Grind" if USE_CG else "Grind")+" · Colour=tsSPIΔ")
+        ax.set_title("Quadrants: +X=Accel  · +Y="+("Corrected Grind" if USE_CG else "Grind")+" · Colour=tsSPIΔ")
         s_ex=[DOT_MIN,0.5*(DOT_MIN+DOT_MAX),DOT_MAX]
         h_ex=[Line2D([0],[0],marker='o',color='w',markerfacecolor='gray',
                      markersize=np.sqrt(s/np.pi),markeredgecolor='black') for s in s_ex]
