@@ -2332,7 +2332,7 @@ st.markdown("## V-Profile — Top Speed & Sustain")
 VP = metrics.copy()
 GR_COL = metrics.attrs.get("GR_COL", "Grind")
 STEP   = float(metrics.attrs.get("STEP", 100))        # metres per split (fallback)
-D_m    = float(race_distance_input)
+D_m    = float(race_distance_input) if pd.notna(race_distance_input) else np.nan
 RSI    = float(metrics.attrs.get("RSI", 0.0))
 SCI    = float(metrics.attrs.get("SCI", 0.0))
 GOING  = str(metrics.attrs.get("GOING", "Good"))      # Firm/Good/Soft/Heavy
@@ -2359,55 +2359,41 @@ def _ema(series, alpha=0.35):
 
 def _dist_weights(dm):
     # blend weight of TopSpeed (TSI) vs Sustain (SSI) → sum 1.0
+    if not np.isfinite(dm):
+        return 0.50, 0.50
     if dm <= 1200:    return 0.65, 0.35
     if dm >= 1800:    return 0.35, 0.65
-    # linear in between (1400–1600 midpoint → 0.50/0.50)
-    # piecewise interpolate 1200→1800
     t = _clip((dm-1200.0)/(1800.0-1200.0), 0.0, 1.0)
     w_tsi = 0.65*(1-t) + 0.35*t
     w_ssi = 1.0 - w_tsi
     return w_tsi, w_ssi
 
 def _going_nudge(go):
-    # tiny nudge to weighting philosophy
-    if go == "Firm":     return +0.02, -0.02  # a tad more TSI
-    if go in ("Soft","Heavy"): return -0.03, +0.03  # a tad more SSI
+    if go == "Firm":            return +0.02, -0.02
+    if go in ("Soft","Heavy"):  return -0.03, +0.03
     return 0.0, 0.0
 
 def _pace_legitimacy_trim(ts_med):
-    # if crawl mid, reduce Vmax impact (fake peaks)
     if np.isfinite(ts_med) and ts_med < 100.0:
         return _clip((100.0 - ts_med)/8.0, 0.0, 0.25)  # up to 25%
     return 0.0
 
-def _quad(x): 
-    x = float(x) if np.isfinite(x) else 0.0
-    return x*x
-
 def _percentile01(col):
     s = pd.to_numeric(col, errors="coerce")
     med = np.nanmedian(s)
-    mad = mad_std(s)
+    mad = np.nanmedian(np.abs(s - med))
     mad = mad if (np.isfinite(mad) and mad>0) else 1.0
     z = (s - med)/mad
-    # squash to 0..1 via logistic
     return (1.0/(1.0 + np.exp(-0.8*z))).clip(0.0, 1.0)
 
 # --------- collect available split times (…_Time columns) ----------
 time_cols = [c for c in VP.columns if isinstance(c, str) and c.endswith("_Time")]
-time_cols_sorted = []
-try:
-    # Sort by the numeric prefix if present (e.g., "300_Time","200_Time","100_Time")
-    def _key(c):
-        try:
-            return int(c.split("_")[0])
-        except:
-            return 9999
-    time_cols_sorted = sorted(time_cols, key=_key, reverse=False)  # early→late if numeric
-except:
-    time_cols_sorted = time_cols
-
-# if too few splits, we’ll gracefully degrade to proxies
+def _key(c):
+    try:
+        return int(c.split("_")[0])
+    except:
+        return 9999
+time_cols_sorted = sorted(time_cols, key=_key, reverse=False)  # early→late if numeric
 has_splits = len(time_cols_sorted) >= 3
 
 # --------- per-horse speed curve, Vmax, sustain metrics ----------
@@ -2415,16 +2401,13 @@ Vmax = []
 SustainDur = []   # seconds at near-top
 SustainDist = []  # metres at near-top
 AUC_90_100 = []   # area under (v/Vmax)^p over near-top window
-Onset_m = []      # where the longest stretch begins (m-from-home)
+Onset_m = []      # metres-from-home where the longest near-top stretch begins
 
 p_power = 2.5  # emphasise very-near-top
-
-# pace legitimacy guard
 ts_med = pd.to_numeric(VP.get("tsSPI"), errors="coerce").median(skipna=True)
 trim_V = _pace_legitimacy_trim(ts_med)
 
 for _, r in VP.iterrows():
-    # gather times (seconds) for this horse
     times = []
     for c in time_cols_sorted:
         v = r.get(c)
@@ -2435,21 +2418,16 @@ for _, r in VP.iterrows():
     times = np.array(times, dtype=float)
 
     if has_splits and np.isfinite(times).sum() >= 3:
-        # compute raw speeds for each split; assume each split covers ~STEP metres
         spd = np.where((times>0) & np.isfinite(times), STEP/ times, np.nan)
-
-        # light denoise: 3-pt median via EMA effect
         spd_s = pd.Series(spd).rolling(3, center=True, min_periods=1).median()
         spd_s = _ema(spd_s, alpha=0.35).to_numpy()
 
-        # Vmax & adaptive near-top threshold
         vmax = np.nanmax(spd_s) if np.isfinite(spd_s).any() else np.nan
         if np.isfinite(vmax) and vmax > 0:
             sigma = np.nanstd(spd_s[np.isfinite(spd_s)])
             thr = max(0.97*vmax, vmax - 0.6*(sigma if np.isfinite(sigma) else 0.0))
             near = (spd_s >= thr)
 
-            # longest consecutive near-top window
             best_len = 0; best_i0 = -1; cur_len = 0; cur_i0 = -1
             for i, ok in enumerate(near):
                 if ok:
@@ -2460,15 +2438,12 @@ for _, r in VP.iterrows():
                 else:
                     cur_len = 0
 
-            # duration & distance of longest window (use actual times where possible)
             if best_len > 0:
                 seg_times = times[best_i0:best_i0+best_len]
                 seg_speeds = spd_s[best_i0:best_i0+best_len]
                 dur = float(np.nansum(seg_times))
                 dist = float(np.nansum(np.where(np.isfinite(seg_times), STEP, 0.0)))
-                # AUC on near-top (weight closer to Vmax higher)
                 auc = float(np.nansum(((seg_speeds/ vmax)**p_power) * np.where(np.isfinite(seg_times), seg_times, 0.0)))
-                # onset as metres from home (approx): remaining splits * STEP
                 remain_splits = len(times) - (best_i0 + best_len)
                 onset = float(remain_splits * STEP)
             else:
@@ -2482,42 +2457,44 @@ for _, r in VP.iterrows():
         else:
             Vmax.append(np.nan); SustainDur.append(0.0); SustainDist.append(0.0); AUC_90_100.append(0.0); Onset_m.append(np.nan)
     else:
-        # degrade: use proxies when splits unavailable → we’ll score through percentiles later
         Vmax.append(np.nan); SustainDur.append(0.0); SustainDist.append(0.0); AUC_90_100.append(0.0); Onset_m.append(np.nan)
 
-# Store both m/s and km/h for display
-VP["Vmax_mps"] = Vmax
-VP["Vmax_kmph"] = np.where(
-    pd.notna(VP["Vmax_mps"]),
-    VP["Vmax_mps"] * 3.6,  # convert to km/h
-    np.nan
-)
-VP["Sustain_s"]    = SustainDur
-VP["Sustain_m"]    = SustainDist
-VP["AUC_90_100"]   = AUC_90_100
-VP["Onset_from_home_m"] = Onset_m
+# ---- store raw metrics
+VP["Vmax_mps"]             = Vmax
+VP["Sustain_s"]            = SustainDur
+VP["Sustain_m"]            = SustainDist
+VP["AUC_90_100"]           = AUC_90_100
+VP["Onset_from_home_m"]    = Onset_m
+
+# ---- CREATE RaceTime_s if missing (row-wise sum of *_Time; robust)  ✅ fix #1
+if "RaceTime_s" not in VP.columns:
+    if time_cols_sorted:
+        VP["RaceTime_s"] = VP[time_cols_sorted].sum(axis=1, min_count=1)
+    else:
+        # last resort: try attribute or set NaN (SSI will gracefully handle)
+        VP["RaceTime_s"] = float(metrics.attrs.get("RaceTime_s", np.nan))
 
 # --------- substitute proxies if splits are thin ----------
-# (keeps the module usable in any race)
-if not has_splits or np.nanmax(VP["Vmax_mps"]) <= 0:
-    # Vmax proxy: tsSPI level vs field (scale to m/s-ish just for ranking)
-    # We only need relative standing → percentiles below will handle scaling.
+if (not has_splits) or (not np.isfinite(np.nanmax(VP["Vmax_mps"])) or np.nanmax(VP["Vmax_mps"]) <= 0):
+    # Vmax proxy
     VP["Vmax_mps"] = pd.to_numeric(VP.get("tsSPI"), errors="coerce")
-
-    # Sustain proxies: Grind & Accel blend + AUC-like from sectionals
+    # Sustain proxies
     VP["Sustain_s"]  = (pd.to_numeric(VP.get(GR_COL), errors="coerce") - 98.0).clip(lower=0.0)
     VP["Sustain_m"]  = VP["Sustain_s"] * (STEP/10.0)
     VP["AUC_90_100"] = (0.6*pd.to_numeric(VP.get(GR_COL), errors="coerce") + 0.4*pd.to_numeric(VP.get("Accel"), errors="coerce")).fillna(0.0)
 
+# ---- compute km/h AFTER any proxy changes  ✅ fix #2
+VP["Vmax_kmph"] = pd.to_numeric(VP["Vmax_mps"], errors="coerce") * 3.6
+
 # --------- Top Speed Index (TSI) & Sustain Index (SSI) ----------
-# TSI: percentile of Vmax, with pace-legitimacy trim
 TSI_raw = _percentile01(VP["Vmax_mps"])
 TSI = (TSI_raw * (1.0 - trim_V)).clip(0.0, 1.0)
 
 # ---------- Improved SSI (core of V-Profile) ----------
 # Normalise sustain duration & distance by race scale
-dur_rel = np.nan_to_num(VP["Sustain_s"] / (VP["RaceTime_s"] + 1e-6))
-dst_rel = np.nan_to_num(VP["Sustain_m"] / D_m)
+rt = pd.to_numeric(VP["RaceTime_s"], errors="coerce")
+dur_rel = np.nan_to_num(VP["Sustain_s"] / (rt + 1e-6))
+dst_rel = np.nan_to_num(VP["Sustain_m"] / max(D_m, 1.0))
 
 dur01 = _percentile01(dur_rel)
 dst01 = _percentile01(dst_rel)
@@ -2529,8 +2506,9 @@ eff01 = _percentile01(eff)
 # Smoothness = steadiness across Accel/Grind
 acc = pd.to_numeric(VP.get("Accel"), errors="coerce")
 grd = pd.to_numeric(VP.get(GR_COL), errors="coerce")
-sm_raw = 1.0 - np.abs(acc - grd) / np.maximum(acc.add(grd, fill_value=0)/2, 1e-6)
-sm01 = _percentile01(sm_raw.fillna(sm_raw.median(skipna=True)))
+den = (acc.add(grd, fill_value=0)/2).replace(0, np.nan)
+sm_raw = 1.0 - (acc - grd).abs() / den
+sm01 = _percentile01(sm_raw.fillna(np.nanmedian(sm_raw)))
 
 # Onset = earlier sustain → higher score
 on_bonus = pd.Series(0.0, index=VP.index)
@@ -2538,14 +2516,13 @@ if np.isfinite(VP["Onset_from_home_m"]).any():
     on01 = 1.0 - _percentile01(VP["Onset_from_home_m"])
     on_bonus = 0.08 * on01
 
-# Weighted blend
 SSI = (0.38*dur01 + 0.25*dst01 + 0.20*eff01 + 0.12*sm01 + on_bonus).clip(0.0, 1.0)
 
-# Optional shape modulation (light touch)
+# Optional shape modulation
 if np.isfinite(RSI) and np.isfinite(SCI) and SCI >= 0.5:
     SSI *= (1.0 + 0.04 * np.sign(-RSI))
 
-# shape headwind/tailwind tiny modifier on SSI (reward sustain against fast-early)
+# Headwind/tailwind tiny modifier
 if RSI < -0.5 and SCI >= 0.6:
     SSI = (SSI * (1.00 + 0.04)).clip(0.0, 1.0)
 elif RSI > 0.5 and SCI >= 0.6:
@@ -2569,10 +2546,9 @@ def _flags_row(r):
     if float(r.get("TSI",0)) >= 85: f.append("Raw Pace Weapon")
     if float(r.get("SSI",0)) >= 85: f.append("True Sustainer")
     if float(r.get("TSI",0)) >= 80 and float(r.get("SSI",0)) >= 75: f.append("Dual Threat")
-    # risk/angles
-    if D_m >= 1600 and float(r.get("TSI",0)) >= 85 and float(r.get("SSI",0)) <= 50:
+    if np.isfinite(D_m) and D_m >= 1600 and float(r.get("TSI",0)) >= 85 and float(r.get("SSI",0)) <= 50:
         f.append("Flash Risk (needs pace or drop trip)")
-    if D_m <= 1200 and float(r.get("SSI",0)) >= float(r.get("TSI",0)) + 15:
+    if np.isfinite(D_m) and D_m <= 1200 and float(r.get("SSI",0)) >= float(r.get("TSI",0)) + 15:
         f.append("Wants Further")
     return " · ".join(f)
 
@@ -2598,20 +2574,18 @@ with st.expander("V-Profile — quick takes"):
         vp   = float(r.get("VProfile",0.0))
         tsi  = float(r.get("TSI",0.0))
         ssi  = float(r.get("SSI",0.0))
-        vmax = float(r.get("Vmax (m/s)", np.nan))
+        vmax = float(r.get("Vmax (km/h)", np.nan))   # ✅ fix #3 (unit label)
         sus  = float(r.get("Sustain (s ≥~95%)", 0.0))
         flag = str(r.get("Flags",""))
-        parts = [f"{name}: {vp:.2f}/10"]
-        parts.append(f"TSI {tsi:.0f}, SSI {ssi:.0f}")
+        parts = [f"{name}: {vp:.2f}/10", f"TSI {tsi:.0f}, SSI {ssi:.0f}"]
         if np.isfinite(vmax):
-            parts.append(f"Vmax ~{vmax:.2f} m/s")
+            parts.append(f"Vmax ~{vmax:.1f} km/h")
         if sus >= 0.4:
             parts.append(f"{sus:.1f}s near-top")
         if flag:
             parts.append(f"[{flag}]")
         st.write("• " + " — ".join(parts))
 
-# Footnote
 st.caption(
     "V-Profile = distance/going-aware blend of Top-Speed Index (TSI) and Sustain Index (SSI). "
     "TSI penalised if mid-race crawl; SSI rewards long, smooth time very near top speed and earlier onset. "
