@@ -1712,413 +1712,120 @@ from matplotlib.patches import Rectangle
 from matplotlib.colors import TwoSlopeNorm
 from matplotlib.lines import Line2D
 
-# ----- light, RAM-friendly labeler for scatter plots -----
-def _shorten_name(nm: str, maxlen: int = 14) -> str:
-    nm = str(nm or "").strip()
-    return (nm[:maxlen-1] + "…") if len(nm) > maxlen else nm
+# ----------------------- Label repel (built-in fallback) -----------------------
+def _repel_labels_builtin(ax, x, y, labels, *, init_shift=0.18, k_attract=0.006, k_repel=0.012, max_iter=250):
+    trans=ax.transData; renderer=ax.figure.canvas.get_renderer()
+    xy=np.column_stack([x,y]).astype(float); offs=np.zeros_like(xy)
+    for i,(xi,yi) in enumerate(xy):
+        offs[i]=[init_shift if xi>=0 else -init_shift, init_shift if yi>=0 else -init_shift]
+    texts,lines=[],[]
+    for (xi,yi),(dx,dy),lab in zip(xy,offs,labels):
+        t=ax.text(xi+dx, yi+dy, lab, fontsize=8.4, va="center", ha="left",
+                  bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.75))
+        texts.append(t)
+        ln=Line2D([xi,xi+dx],[yi,yi+dy], lw=0.75, color="black", alpha=0.9)
+        ax.add_line(ln); lines.append(ln)
+    inv=ax.transData.inverted()
+    for _ in range(max_iter):
+        moved=False
+        bbs=[t.get_window_extent(renderer=renderer).expanded(1.02,1.15) for t in texts]
+        for i in range(len(texts)):
+            for j in range(i+1,len(texts)):
+                if not bbs[i].overlaps(bbs[j]): continue
+                ci=((bbs[i].x0+bbs[i].x1)/2,(bbs[i].y0+bbs[i].y1)/2)
+                cj=((bbs[j].x0+bbs[j].x1)/2,(bbs[j].y0+bbs[j].y1)/2)
+                vx,vy=ci[0]-cj[0],ci[1]-cj[1]
+                if vx==0 and vy==0: vx=1.0
+                n=(vx**2+vy**2)**0.5; dx,dy=(vx/n)*k_repel*72,(vy/n)*k_repel*72
+                for t,s in ((texts[i],+1),(texts[j],-1)):
+                    tx,ty=t.get_position()
+                    px=trans.transform((tx,ty))+s*np.array([dx,dy])
+                    t.set_position(inv.transform(px)); moved=True
+        if not moved: break
+    for t,ln,(xi,yi) in zip(texts,lines,xy):
+        tx,ty=t.get_position(); ln.set_data([xi,tx],[yi,ty])
 
-def label_points_neatly_light(ax, x_vals, y_vals, names, *,
-                              dx=0.35, dy=0.35, grid=0.60,
-                              fontsize=8.8):
-    """
-    Places labels near points using a tiny grid-based de-overlap.
-    No canvas draws / no bbox measurements → very cheap.
-    """
-    import numpy as np
-    x = np.asarray(x_vals, dtype=float)
-    y = np.asarray(y_vals, dtype=float)
-    names = [_shorten_name(n) for n in names]
+def label_points_neatly(ax, x, y, names):
+    try:
+        from adjustText import adjust_text
+        texts=[ax.text(xi,yi,nm,fontsize=8.4,
+                       bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.75))
+               for xi,yi,nm in zip(x,y,names)]
+        adjust_text(texts, x=x, y=y, ax=ax,
+                    only_move={'points':'y','text':'xy'},
+                    force_points=0.6, force_text=0.7,
+                    expand_text=(1.05,1.15), expand_points=(1.05,1.15),
+                    arrowprops=dict(arrowstyle="->", lw=0.75, color="black", alpha=0.9,
+                                    shrinkA=0, shrinkB=3))
+    except Exception:
+        _repel_labels_builtin(ax, x, y, names)
 
-    # candidate offsets (data units), try nearest first
-    candidates = [(0, dy), (dx, 0), (0, -dy), (-dx, 0),
-                  (dx*0.8, dy*0.8), (-dx*0.8, dy*0.8),
-                  (dx*0.8, -dy*0.8), (-dx*0.8, -dy*0.8)]
-    occupied = set()
-
-    for xi, yi, nm in zip(x, y, names):
-        placed = False
-        for ox, oy in candidates:
-            gx = round((xi + ox) / grid)
-            gy = round((yi + oy) / grid)
-            key = (gx, gy)
-            if key in occupied:
-                continue
-            occupied.add(key)
-            # draw label
-            ax.text(
-                xi + ox, yi + oy, nm,
-                fontsize=fontsize, ha="center", va="center",
-                bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.85)
-            )
-            # leader line only if offset
-            if ox or oy:
-                ax.plot([xi, xi + ox], [yi, yi + oy], lw=0.6, color="gray", alpha=0.6, zorder=2)
-            placed = True
-            break
-
-        if not placed:
-            # last resort: on-point small label
-            ax.text(
-                xi, yi, nm,
-                fontsize=fontsize-1.0, ha="center", va="center",
-                bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.75)
-            )
-
-# ---------- ultra-light de-overlap labeler (bin + spiral stack) ----------
-def _short(nm: str, maxlen: int = 14) -> str:
-    nm = str(nm or "").strip()
-    return (nm[:maxlen-1] + "…") if len(nm) > maxlen else nm
-
-def label_points_bin_spiral(ax, x_vals, y_vals, names, *,
-                            base_dx=0.45, base_dy=0.45,
-                            cells=12, fontsize=9.0,
-                            max_per_cell=6):
-    """
-    RAM-friendly labeler:
-      1) bins points into a coarse grid (cells × cells)
-      2) within each bin, assigns labels on a small spiral (stacked offsets)
-      3) draws short leader lines
-    """
-    import numpy as np
-    x = np.asarray(x_vals, dtype=float)
-    y = np.asarray(y_vals, dtype=float)
-    names = [_short(n) for n in names]
-
-    # axis extents (in data units)
-    xmin, xmax = ax.get_xlim()
-    ymin, ymax = ax.get_ylim()
-    xr = max(1e-9, xmax - xmin)
-    yr = max(1e-9, ymax - ymin)
-
-    # grid size scales with axes
-    gx = xr / float(cells)
-    gy = yr / float(cells)
-
-    # spiral offsets (multiples of base_dx/base_dy)
-    spiral = [(0, 0), (1, 0), (0, 1), (-1, 0), (0, -1),
-              (2, 0), (1, 1), (0, 2), (-1, 1), (-2, 0), (-1, -1), (0, -2), (1, -1)]
-    # fallback if more needed
-    def _spiral_k(k):
-        if k < len(spiral): return spiral[k]
-        # simple ring expansion
-        r = int(np.ceil((k - len(spiral)) / 4)) + 2
-        dirs = [(r,0),(0,r),(-r,0),(0,-r)]
-        return dirs[(k - len(spiral)) % 4]
-
-    buckets = {}  # (ix,iy) -> list of indices
-    keys = []
-    for i, (xi, yi) in enumerate(zip(x, y)):
-        ix = int(np.floor((xi - xmin) / gx))
-        iy = int(np.floor((yi - ymin) / gy))
-        key = (ix, iy)
-        buckets.setdefault(key, []).append(i)
-        keys.append(key)
-
-    # label each point using its bin index in spiral order
-    for key, idxs in buckets.items():
-        for order, i in enumerate(idxs[:max_per_cell]):
-            sx, sy = _spiral_k(order)
-            ox = sx * base_dx
-            oy = sy * base_dy
-
-            xi, yi = x[i], y[i]
-            nm = names[i]
-
-            # draw label
-            ax.text(
-                xi + ox, yi + oy, nm,
-                fontsize=fontsize, ha="center", va="center",
-                bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.9), zorder=3
-            )
-            # leader line (skip if on-point)
-            if ox or oy:
-                ax.plot([xi, xi + ox], [yi, yi + oy], lw=0.7, color="gray", alpha=0.65, zorder=2)
-
-        # if the cell is *very* dense, mark remainder with a tiny dot
-        if len(idxs) > max_per_cell:
-            # small “+N” indicator at cell center (kept subtle)
-            # (Optional; comment out if you prefer none)
-            pass
-            
-# ======================= Visual 1: Sectional Shape Map (arrow labels, RAM-friendly) =======================
+# ======================= Visual 1: Sectional Shape Map =======================
 st.markdown("## Sectional Shape Map — Accel (home drive) vs Grind (finish)")
+shape_map_png = None
+GR_COL = metrics.attrs.get("GR_COL","Grind")
 
-GR_COL = metrics.attrs.get("GR_COL", "Grind")
-need = {"Horse", "Accel", GR_COL, "tsSPI", "PI"}
-
-if not need.issubset(metrics.columns):
-    st.warning("Shape Map: required columns missing: " + ", ".join(sorted(need - set(metrics.columns))))
+need_cols={"Horse","Accel",GR_COL,"tsSPI","PI"}
+if not need_cols.issubset(metrics.columns):
+    st.warning("Shape Map: required columns missing: " + ", ".join(sorted(need_cols - set(metrics.columns))))
 else:
-    dfm = metrics.loc[:, ["Horse", "Accel", GR_COL, "tsSPI", "PI"]].copy()
-    for c in ["Accel", GR_COL, "tsSPI", "PI"]:
+    dfm = metrics.loc[:, ["Horse","Accel",GR_COL,"tsSPI","PI"]].copy()
+    for c in ["Accel",GR_COL,"tsSPI","PI"]:
         dfm[c] = pd.to_numeric(dfm[c], errors="coerce")
-    dfm = dfm.dropna(subset=["Accel", GR_COL, "tsSPI"])
+    dfm = dfm.dropna(subset=["Accel",GR_COL,"tsSPI"])
     if dfm.empty:
         st.info("Not enough data to draw the shape map.")
     else:
-        # deltas vs field
-        dfm["x"] = dfm["Accel"] - 100.0
-        dfm["y"] = dfm[GR_COL] - 100.0
-        dfm["c"] = dfm["tsSPI"] - 100.0
+        dfm["AccelΔ"]=dfm["Accel"]-100.0
+        dfm["GrindΔ"]=dfm[GR_COL]-100.0
+        dfm["tsSPIΔ"]=dfm["tsSPI"]-100.0
+        names=dfm["Horse"].astype(str).to_list()
+        xv=dfm["AccelΔ"].to_numpy(); yv=dfm["GrindΔ"].to_numpy()
+        cv=dfm["tsSPIΔ"].to_numpy(); piv=dfm["PI"].fillna(0).to_numpy()
 
-        names = dfm["Horse"].astype(str).to_numpy()
-        xv = dfm["x"].to_numpy()
-        yv = dfm["y"].to_numpy()
-        cv = dfm["c"].to_numpy()
+        span=max(4.5,float(np.nanmax(np.abs(np.concatenate([xv,yv])))))
+        lim=np.ceil(span/1.5)*1.5
 
-        # sizes by PI (larger → more visible)
-        DOT_MIN, DOT_MAX = 90.0, 220.0
-        pmin, pmax = np.nanmin(dfm["PI"]), np.nanmax(dfm["PI"])
-        if not (np.isfinite(pmin) and np.isfinite(pmax) and pmax > pmin):
-            sizes = np.full_like(xv, DOT_MIN, dtype=float)
-        else:
-            sizes = DOT_MIN + (dfm["PI"].to_numpy() - pmin) / (pmax - pmin + 1e-9) * (DOT_MAX - DOT_MIN)
+        DOT_MIN, DOT_MAX = 40.0, 140.0
+        pmin,pmax=np.nanmin(piv),np.nanmax(piv)
+        sizes=np.full_like(xv,DOT_MIN) if not np.isfinite(pmin) or not np.isfinite(pmax) \
+               else DOT_MIN+(piv-pmin)/(pmax-pmin+1e-9)*(DOT_MAX-DOT_MIN)
 
-        # symmetric limits (robust to outliers)
-        span = np.percentile(np.abs(np.concatenate([xv, yv])), 95)
-        lim = float(max(6.0, min(12.0, np.ceil(span / 1.5) * 1.5)))
+        fig, ax = plt.subplots(figsize=(7.8,6.2))
+        # quadrant tint (stronger alpha)
+        TINT=0.12
+        ax.add_patch(Rectangle((0,0),lim,lim,facecolor="#4daf4a",alpha=TINT,zorder=0))
+        ax.add_patch(Rectangle((-lim,0),lim,lim,facecolor="#377eb8",alpha=TINT,zorder=0))
+        ax.add_patch(Rectangle((0,-lim),lim,lim,facecolor="#ff7f00",alpha=TINT,zorder=0))
+        ax.add_patch(Rectangle((-lim,-lim),lim,lim,facecolor="#984ea3",alpha=TINT,zorder=0))
+        ax.axvline(0,color="gray",lw=1.3,ls=(0,(3,3)),zorder=1)
+        ax.axhline(0,color="gray",lw=1.3,ls=(0,(3,3)),zorder=1)
 
-        # colour scaling
-        vmin = float(np.nanpercentile(cv, 10)) if np.isfinite(cv).any() else -1.0
-        vmax = float(np.nanpercentile(cv, 90)) if np.isfinite(cv).any() else 1.0
-        if not (np.isfinite(vmin) and np.isfinite(vmax) and vmin < vmax):
-            vmin, vmax = -1.0, 1.0
-        norm = TwoSlopeNorm(vcenter=0.0, vmin=vmin, vmax=vmax)
+        vmin,vmax=np.nanmin(cv),np.nanmax(cv)
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin==vmax:
+            vmin,vmax=-1.0,1.0
+        norm=TwoSlopeNorm(vcenter=0.0,vmin=vmin,vmax=vmax)
 
-        fig, ax = plt.subplots(figsize=(8.2, 6.2), layout="constrained")
+        sc=ax.scatter(xv,yv,s=sizes,c=cv,cmap="coolwarm",norm=norm,
+                      edgecolor="black",linewidth=0.6,alpha=0.95)
+        label_points_neatly(ax,xv,yv,names)
 
-        # quadrant tint (light)
-        tint = 0.08
-        ax.axvspan(0,  lim,  0, 1, color="#ff7f00", alpha=tint, zorder=0)  # +X (Accel)
-        ax.axvspan(-lim, 0,  0, 1, color="#377eb8", alpha=tint, zorder=0)  # -X
-        ax.axhspan(0,  lim,  0, 1, color="#4daf4a", alpha=tint, zorder=0)  # +Y (Grind/CG)
-        ax.axhspan(-lim, 0,  0, 1, color="#984ea3", alpha=tint, zorder=0)  # -Y
-
-        ax.axvline(0, color="gray", lw=1.0, ls=(0, (3, 3)), alpha=0.8, zorder=1)
-        ax.axhline(0, color="gray", lw=1.0, ls=(0, (3, 3)), alpha=0.8, zorder=1)
-        ax.set_xlim(-lim, lim)
-        ax.set_ylim(-lim, lim)
-
-        # SCATTER — keep it clearly visible
-        sc = ax.scatter(
-            xv, yv, s=sizes, c=cv, cmap="coolwarm", norm=norm,
-            edgecolor="black", linewidth=0.8, alpha=0.95, zorder=3
-        )
-
-        # ---------- Arrowed labels with soft bounds + light de-overlap ----------
-        n = len(xv)
-        angles = np.arctan2(yv, xv)  # direction from origin
-        # base offset & spiral (very light)
-        base_r = 0.12 * lim
-        spiral = (np.arange(n) % 7) * (0.010 * lim)
-
-        # Keep labels inside the axes box by a margin:
-        pad_x = 0.85   # points worth of padding scaled by lim (fraction of lim)
-        pad_y = 0.85
-        xmin, xmax = -lim + pad_x, lim - pad_x
-        ymin, ymax = -lim + pad_y, lim - pad_y
-
-        # Store chosen label positions to discourage overlaps
-        placed_xy = []
-
-        def _snap_inside(x, y):
-            # Snap to inner box so labels don’t cross axes/frame
-            return float(np.clip(x, xmin, xmax)), float(np.clip(y, ymin, ymax))
-
-        def _too_close(x, y, others, min_d):
-            for ox, oy in others:
-                if (x - ox)**2 + (y - oy)**2 < (min_d**2):
-                    return True
-            return False
-
-        for i in range(n):
-            ang = angles[i]
-            if not np.isfinite(ang):
-                ang = np.deg2rad(-35.0)
-
-            # try a few radial steps and a tiny wobble in angle until we find a free slot
-            found = False
-            min_d = 0.06 * lim          # min spacing between label centers
-            r_step = 0.018 * lim
-            wobble = np.deg2rad(7.0)    # tiny wobble off the ray
-
-            for k in range(18):  # very small, bounded search
-                r_try = base_r + spiral[i] + k * r_step
-                # alternate left/right wobble to break ties
-                ang_try = ang + ((-1)**k) * (k % 3) * wobble * 0.45
-
-                tx = xv[i] + r_try * np.cos(ang_try)
-                ty = yv[i] + r_try * np.sin(ang_try)
-                tx, ty = _snap_inside(tx, ty)
-
-                if not _too_close(tx, ty, placed_xy, min_d):
-                    placed_xy.append((tx, ty))
-                    found = True
-                    break
-
-            if not found:  # last resort: put it slightly above-right, still inside
-                tx, ty = _snap_inside(xv[i] + 0.10 * lim, yv[i] + 0.04 * lim)
-                placed_xy.append((tx, ty))
-
-            ax.annotate(
-                names[i],
-                xy=(xv[i], yv[i]),
-                xytext=(tx, ty),
-                textcoords="data",
-                fontsize=9.2,
-                bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="0.75", alpha=0.92),
-                arrowprops=dict(
-                    arrowstyle="-|>", lw=1.0, color="0.30",
-                    shrinkA=6, shrinkB=6, alpha=0.95
-                ),
-                ha="center", va="center",
-                zorder=5, clip_on=False
-            )
-        
+        ax.set_xlim(-lim,lim); ax.set_ylim(-lim,lim)
         ax.set_xlabel("Acceleration vs field (points) →")
-        ax.set_ylabel(("Corrected " if USE_CG else "") + "Grind vs field (points) ↑")
-        ax.set_title("Quadrants:  +X = Accel   ·  +Y = " +
-                     ("Corrected Grind" if USE_CG else "Grind") + "  ·  Colour = tsSPIΔ")
-        ax.grid(True, linestyle=":", alpha=0.25)
-
-        # size legend (cheap)
-        for s, lab in [(DOT_MIN, "PI low"), ((DOT_MIN + DOT_MAX)/2, "PI mid"), (DOT_MAX, "PI high")]:
-            ax.scatter([], [], s=s, color="gray", edgecolor="black", alpha=0.6, label=lab)
-        leg = ax.legend(loc="upper left", frameon=False, fontsize=8)
-        if leg: leg._legend_box.align = "left"
-
-        # compact colour bar
-        cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-        cbar.set_label("tsSPI − 100")
-
-        # ========== Presentation-friendly labelling (RAM-light) ==========
-
-        # --- Controls (cheap) ---
-        c1, c2, c3 = st.columns([1,1,1])
-        with c1:
-            max_labels = st.slider("Max text labels (rest numbered)", 6, 18, min(12, max(8, len(xv)//2)), 1)
-        with c2:
-            show_numbered_rest = st.checkbox("Number unlabeled horses", True)
-        with c3:
-            show_mapping_table = st.checkbox("Show number↔name table", True)
-
-        # --- Prepare arrays ---
-        x = np.asarray(xv, dtype=float)
-        y = np.asarray(yv, dtype=float)
-        ts = np.asarray(cv, dtype=float)  # colour metric
-        pi = np.asarray(piv, dtype=float)
-        N = len(x)
-        idx = np.arange(N)
-
-        # Normalise helpers (robust)
-        def _nz(a):
-            a = np.asarray(a, dtype=float)
-            f = np.isfinite(a)
-            if f.sum() == 0:
-                return np.zeros_like(a)
-            mn, mx = np.nanpercentile(a[f], [5, 95])
-            if mx <= mn: mx = mn + 1.0
-            out = (a - mn) / (mx - mn)
-            return np.clip(out, 0.0, 1.0)
-
-        # Priority score: extremes in x,y + colour deviation + PI
-        score = 0.45*_nz(np.abs(x)) + 0.45*_nz(np.abs(y)) + 0.20*_nz(np.abs(ts)) + 0.20*_nz(pi)
-        # Quadrant (ensure coverage)
-        q = (x >= 0).astype(int) + 2*(y >= 0).astype(int)  # 0=BL,1=BR,2=TL,3=TR
-        quota = max(2, max_labels // 4)
-
-        # First pass: take top per quadrant up to quota
-        label_ids = []
-        for qq in range(4):
-            sel = idx[q == qq]
-            if sel.size:
-                topq = sel[np.argsort(score[sel])[::-1][:quota]]
-                label_ids.extend(topq.tolist())
-
-        # Fill remaining label slots by global priority
-        if len(label_ids) < max_labels:
-            remaining = np.setdiff1d(idx, np.array(label_ids, dtype=int), assume_unique=False)
-            if remaining.size:
-                need = max_labels - len(label_ids)
-                fill = remaining[np.argsort(score[remaining])[::-1][:need]]
-                label_ids.extend(fill.tolist())
-
-        label_ids = np.array(sorted(set(label_ids)), dtype=int)
-
-        # ---- Draw tiny numeric tags on all points (optional) ----
-        num_tags = np.arange(1, N+1)  # 1-based
-        if show_numbered_rest:
-            for i in range(N):
-                # put number on the dot (small, high-contrast halo)
-                ax.text(
-                    x[i], y[i], str(num_tags[i]),
-                    ha="center", va="center", fontsize=7.6,
-                    color="white",
-                    path_effects=[mpl.patheffects.withStroke(linewidth=1.8, foreground="black", alpha=0.85)],
-                    zorder=4
-                )
-
-        # ---- Annotate text labels for selected (with arrows), de-overlap light ----
-        # Light, bounded de-overlap: radial steps + inner-box snap
-        import math
-        placed = []
-        pad = 0.9
-        xmin, xmax = -lim + pad, lim - pad
-        ymin, ymax = -lim + pad, lim - pad
-
-        def _snap(xp, yp):
-            return float(np.clip(xp, xmin, xmax)), float(np.clip(yp, ymin, ymax))
-
-        def _crowded(xp, yp, pts, mind):
-            for (ux, uy) in pts:
-                if (xp-ux)*(xp-ux) + (yp-uy)*(yp-uy) < mind*mind:
-                    return True
-            return False
-
-        base_r = 0.12 * lim
-        r_step = 0.020 * lim
-        min_d  = 0.065 * lim
-        wobble = math.radians(8.0)
-
-        for i in label_ids:
-            ang = math.atan2(y[i], x[i]) if (np.isfinite(x[i]) and np.isfinite(y[i])) else math.radians(-30.0)
-            ok = False
-            for k in range(20):
-                r_try = base_r + k*r_step
-                ang_try = ang + ((-1)**k) * (k % 3) * wobble * 0.5
-                tx = x[i] + r_try*math.cos(ang_try)
-                ty = y[i] + r_try*math.sin(ang_try)
-                tx, ty = _snap(tx, ty)
-                if not _crowded(tx, ty, placed, min_d):
-                    placed.append((tx, ty))
-                    ok = True
-                    break
-            if not ok:
-                tx, ty = _snap(x[i] + 0.10*lim, y[i] + 0.06*lim)
-
-            # draw the arrowed label (kept compact)
-            ax.annotate(
-                names[i],
-                xy=(x[i], y[i]), xytext=(tx, ty),
-                textcoords="data",
-                fontsize=9.3,
-                bbox=dict(boxstyle="round,pad=0.20", fc="white", ec="0.75", alpha=0.95),
-                arrowprops=dict(arrowstyle="-|>", lw=1.0, color="0.30", shrinkA=6, shrinkB=6, alpha=0.9),
-                ha="center", va="center", zorder=6, clip_on=False
-            )
-
+        ax.set_ylabel(("Corrected " if USE_CG else "")+"Grind vs field (points) ↑")
+        ax.set_title("Quadrants: +X=Accel (400→200) · +Y="+("Corrected Grind" if USE_CG else "Grind")+" · Colour=tsSPIΔ")
+        s_ex=[DOT_MIN,0.5*(DOT_MIN+DOT_MAX),DOT_MAX]
+        h_ex=[Line2D([0],[0],marker='o',color='w',markerfacecolor='gray',
+                     markersize=np.sqrt(s/np.pi),markeredgecolor='black') for s in s_ex]
+        ax.legend(h_ex,["PI low","PI mid","PI high"],loc="upper left",frameon=False,fontsize=8)
+        cbar=fig.colorbar(sc,ax=ax,fraction=0.046,pad=0.04); cbar.set_label("tsSPI − 100")
+        ax.grid(True,linestyle=":",alpha=0.25)
         st.pyplot(fig)
+        buf=io.BytesIO(); fig.savefig(buf,format="png",dpi=300,bbox_inches="tight")
+        shape_map_png=buf.getvalue()
+        st.download_button("Download shape map (PNG)",shape_map_png,file_name="shape_map.png",mime="image/png")
+        st.caption(("Y uses Corrected Grind (CG). " if USE_CG else "")+"Size=PI; X=Accel; Colour=tsSPIΔ.")
 
-        # on-demand PNG (saves RAM by default)
-        if st.toggle("Prepare high-res PNG for download (uses more memory)", value=False):
-            buf = io.BytesIO()
-            fig.savefig(buf, format="png", dpi=300, bbox_inches="tight", facecolor="white")
-            st.download_button("Download shape map (PNG)", buf.getvalue(),
-                               file_name="shape_map.png", mime="image/png", use_container_width=True)
-
-        st.caption(("Y uses Corrected Grind (CG). " if USE_CG else "") +
-                   "Size = PI · X = Accel · Colour = tsSPIΔ. Labels use single-pass arrow offsets (away from origin) with a light spiral to avoid overlaps.")
-# ======================= /Sectional Shape Map =======================
 
 # ======================= Pace Curve — field average (lean version) =======================
 st.markdown("## Pace Curve — field average (black) + Top 10 finishers")
