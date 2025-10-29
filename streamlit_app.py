@@ -1713,71 +1713,130 @@ def label_points_neatly(ax, x, y, names):
     except Exception:
         _repel_labels_builtin(ax, x, y, names)
 
-# ======================= Visual 1: Sectional Shape Map =======================
+# ======================= Visual 1: Sectional Shape Map (memory-lean) =======================
 st.markdown("## Sectional Shape Map — Accel (home drive) vs Grind (finish)")
-shape_map_png = None
-GR_COL = metrics.attrs.get("GR_COL","Grind")
 
-need_cols={"Horse","Accel",GR_COL,"tsSPI","PI"}
+# Optional: only build a PNG when explicitly requested (saves memory)
+prep_png = st.toggle("Prepare high-res PNG for download (uses more memory)", value=False)
+shape_map_png = None
+
+GR_COL = metrics.attrs.get("GR_COL", "Grind")
+need_cols = {"Horse", "Accel", GR_COL, "tsSPI", "PI"}
+
 if not need_cols.issubset(metrics.columns):
     st.warning("Shape Map: required columns missing: " + ", ".join(sorted(need_cols - set(metrics.columns))))
 else:
-    dfm = metrics.loc[:, ["Horse","Accel",GR_COL,"tsSPI","PI"]].copy()
-    for c in ["Accel",GR_COL,"tsSPI","PI"]:
-        dfm[c] = pd.to_numeric(dfm[c], errors="coerce")
-    dfm = dfm.dropna(subset=["Accel",GR_COL,"tsSPI"])
+    # Select only what we need; avoid .copy() unless necessary
+    dfm = metrics[["Horse", "Accel", GR_COL, "tsSPI", "PI"]].dropna(subset=["Accel", GR_COL, "tsSPI"])
+
     if dfm.empty:
         st.info("Not enough data to draw the shape map.")
     else:
-        dfm["AccelΔ"]=dfm["Accel"]-100.0
-        dfm["GrindΔ"]=dfm[GR_COL]-100.0
-        dfm["tsSPIΔ"]=dfm["tsSPI"]-100.0
-        names=dfm["Horse"].astype(str).to_list()
-        xv=dfm["AccelΔ"].to_numpy(); yv=dfm["GrindΔ"].to_numpy()
-        cv=dfm["tsSPIΔ"].to_numpy(); piv=dfm["PI"].fillna(0).to_numpy()
+        # Convert once → float32 (smaller footprint)
+        accel = pd.to_numeric(dfm["Accel"], errors="coerce").astype("float32")
+        grind = pd.to_numeric(dfm[GR_COL], errors="coerce").astype("float32")
+        tsspi = pd.to_numeric(dfm["tsSPI"], errors="coerce").astype("float32")
+        pi     = pd.to_numeric(dfm["PI"], errors="coerce").astype("float32")
+        names  = dfm["Horse"].astype(str).tolist()
 
-        span=max(4.5,float(np.nanmax(np.abs(np.concatenate([xv,yv])))))
-        lim=np.ceil(span/1.5)*1.5
+        # Deltas (center at 0) → float32
+        xv = (accel - 100.0).to_numpy(dtype="float32", copy=False)
+        yv = (grind - 100.0).to_numpy(dtype="float32", copy=False)
+        cv = (tsspi - 100.0).to_numpy(dtype="float32", copy=False)
+        piv = np.nan_to_num(pi.to_numpy(dtype="float32", copy=False), nan=0.0)
 
+        # Axis limits — keep your scaling approach, but operate on a single float
+        span = float(np.nanmax(np.abs(np.concatenate((xv, yv))))) if (xv.size and yv.size) else 5.0
+        span = max(4.5, span)
+        lim = float(np.ceil(span / 1.5) * 1.5)
+
+        # Point sizes with np.interp (no divisions/allocs); stable if all PIs equal
         DOT_MIN, DOT_MAX = 40.0, 140.0
-        pmin,pmax=np.nanmin(piv),np.nanmax(piv)
-        sizes=np.full_like(xv,DOT_MIN) if not np.isfinite(pmin) or not np.isfinite(pmax) \
-               else DOT_MIN+(piv-pmin)/(pmax-pmin+1e-9)*(DOT_MAX-DOT_MIN)
+        pmin, pmax = float(np.nanmin(piv)), float(np.nanmax(piv))
+        if not np.isfinite(pmin) or not np.isfinite(pmax) or pmin == pmax:
+            sizes = np.full_like(piv, DOT_MIN, dtype="float32")
+        else:
+            sizes = np.interp(piv, (pmin, pmax), (DOT_MIN, DOT_MAX)).astype("float32")
 
-        fig, ax = plt.subplots(figsize=(7.8,6.2))
-        # quadrant tint (stronger alpha)
-        TINT=0.12
-        ax.add_patch(Rectangle((0,0),lim,lim,facecolor="#4daf4a",alpha=TINT,zorder=0))
-        ax.add_patch(Rectangle((-lim,0),lim,lim,facecolor="#377eb8",alpha=TINT,zorder=0))
-        ax.add_patch(Rectangle((0,-lim),lim,lim,facecolor="#ff7f00",alpha=TINT,zorder=0))
-        ax.add_patch(Rectangle((-lim,-lim),lim,lim,facecolor="#984ea3",alpha=TINT,zorder=0))
-        ax.axvline(0,color="gray",lw=1.3,ls=(0,(3,3)),zorder=1)
-        ax.axhline(0,color="gray",lw=1.3,ls=(0,(3,3)),zorder=1)
+        # Colour normalisation around 0 with guards
+        vmin = float(np.nanmin(cv)) if np.isfinite(np.nanmin(cv)) else -1.0
+        vmax = float(np.nanmax(cv)) if np.isfinite(np.nanmax(cv)) else +1.0
+        if vmin == vmax:
+            vmin, vmax = -1.0, 1.0
+        norm = TwoSlopeNorm(vcenter=0.0, vmin=vmin, vmax=vmax)
 
-        vmin,vmax=np.nanmin(cv),np.nanmax(cv)
-        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin==vmax:
-            vmin,vmax=-1.0,1.0
-        norm=TwoSlopeNorm(vcenter=0.0,vmin=vmin,vmax=vmax)
+        # Build figure (smaller, no constrained layout); let Streamlit compress the image
+        fig, ax = plt.subplots(figsize=(7.2, 5.6))
 
-        sc=ax.scatter(xv,yv,s=sizes,c=cv,cmap="coolwarm",norm=norm,
-                      edgecolor="black",linewidth=0.6,alpha=0.95)
-        label_points_neatly(ax,xv,yv,names)
+        # Quadrant tint (light alpha)
+        TINT = 0.10
+        ax.add_patch(Rectangle((0,     0),    lim, lim, facecolor="#4daf4a", alpha=TINT, zorder=0))  # +X,+Y
+        ax.add_patch(Rectangle((-lim,  0),    lim, lim, facecolor="#377eb8", alpha=TINT, zorder=0))  # -X,+Y
+        ax.add_patch(Rectangle((0,    -lim),  lim, lim, facecolor="#ff7f00", alpha=TINT, zorder=0))  # +X,-Y
+        ax.add_patch(Rectangle((-lim, -lim),  lim, lim, facecolor="#984ea3", alpha=TINT, zorder=0))  # -X,-Y
 
-        ax.set_xlim(-lim,lim); ax.set_ylim(-lim,lim)
+        ax.axvline(0, color="gray", lw=1.0, ls=(0, (3, 3)), zorder=1)
+        ax.axhline(0, color="gray", lw=1.0, ls=(0, (3, 3)), zorder=1)
+
+        sc = ax.scatter(xv, yv, s=sizes, c=cv, cmap="coolwarm", norm=norm,
+                        edgecolor="black", linewidth=0.5, alpha=0.95)
+
+        # Label repelling can be expensive on big fields; try it, then degrade
+        try:
+            label_points_neatly(ax, xv, yv, names, max_iter=500)
+        except Exception:
+            # Lightweight fallback labels
+            for xi, yi, nm in zip(xv, yv, names):
+                ax.text(float(xi), float(yi), nm, fontsize=8.2,
+                        bbox=dict(boxstyle="round,pad=0.17", fc="white", ec="none", alpha=0.72))
+
+        ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
         ax.set_xlabel("Acceleration vs field (points) →")
-        ax.set_ylabel(("Corrected " if USE_CG else "")+"Grind vs field (points) ↑")
-        ax.set_title("Quadrants: +X=Accel (400→200) · +Y="+("Corrected Grind" if USE_CG else "Grind")+" · Colour=tsSPIΔ")
-        s_ex=[DOT_MIN,0.5*(DOT_MIN+DOT_MAX),DOT_MAX]
-        h_ex=[Line2D([0],[0],marker='o',color='w',markerfacecolor='gray',
-                     markersize=np.sqrt(s/np.pi),markeredgecolor='black') for s in s_ex]
-        ax.legend(h_ex,["PI low","PI mid","PI high"],loc="upper left",frameon=False,fontsize=8)
-        cbar=fig.colorbar(sc,ax=ax,fraction=0.046,pad=0.04); cbar.set_label("tsSPI − 100")
-        ax.grid(True,linestyle=":",alpha=0.25)
+        ax.set_ylabel(("Corrected " if USE_CG else "") + "Grind vs field (points) ↑")
+        ax.set_title("Quadrants: +X = Accel (400→200) · +Y = " + ("Corrected Grind" if USE_CG else "Grind") + " · Colour = tsSPIΔ")
+        ax.grid(True, linestyle=":", alpha=0.22)
+
+        # Tiny legend proxies for sizes (don’t add scatter points to figure memory)
+        s_ex = np.array([DOT_MIN, 0.5 * (DOT_MIN + DOT_MAX), DOT_MAX], dtype="float32")
+        handles = [Line2D([0], [0], marker='o', color='w', markerfacecolor='gray',
+                          markersize=float(np.sqrt(s / np.pi)), markeredgecolor='black') for s in s_ex]
+        leg = ax.legend(handles, ["PI low", "PI mid", "PI high"], loc="upper left", frameon=False, fontsize=8)
+        if leg: 
+            try: leg._legend_box.align = "left"
+            except Exception: pass
+
+        cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("tsSPI − 100")
+
         st.pyplot(fig)
-        buf=io.BytesIO(); fig.savefig(buf,format="png",dpi=300,bbox_inches="tight")
-        shape_map_png=buf.getvalue()
-        st.download_button("Download shape map (PNG)",shape_map_png,file_name="shape_map.png",mime="image/png")
-        st.caption(("Y uses Corrected Grind (CG). " if USE_CG else "")+"Size=PI; X=Accel; Colour=tsSPIΔ.")
+        plt.close(fig)  # <-- free the figure ASAP
+
+        # Only build/download PNG if requested (saves memory)
+        if prep_png:
+            buf = io.BytesIO()
+            # Lower DPI is kinder on memory but still crisp for docs
+            fig2, ax2 = plt.subplots(figsize=(7.2, 5.6))
+            # replot minimal copy (no labels to keep bytes small)
+            ax2.add_patch(Rectangle((0,     0),    lim, lim, facecolor="#4daf4a", alpha=TINT, zorder=0))
+            ax2.add_patch(Rectangle((-lim,  0),    lim, lim, facecolor="#377eb8", alpha=TINT, zorder=0))
+            ax2.add_patch(Rectangle((0,    -lim),  lim, lim, facecolor="#ff7f00", alpha=TINT, zorder=0))
+            ax2.add_patch(Rectangle((-lim, -lim),  lim, lim, facecolor="#984ea3", alpha=TINT, zorder=0))
+            ax2.axvline(0, color="gray", lw=1.0, ls=(0, (3, 3)), zorder=1)
+            ax2.axhline(0, color="gray", lw=1.0, ls=(0, (3, 3)), zorder=1)
+            sc2 = ax2.scatter(xv, yv, s=sizes, c=cv, cmap="coolwarm", norm=norm,
+                              edgecolor="black", linewidth=0.5, alpha=0.95)
+            ax2.set_xlim(-lim, lim); ax2.set_ylim(-lim, lim)
+            ax2.set_xlabel("Acceleration vs field (points) →")
+            ax2.set_ylabel(("Corrected " if USE_CG else "") + "Grind vs field (points) ↑")
+            ax2.set_title("Sectional Shape Map")
+            fig2.colorbar(sc2, ax=ax2, fraction=0.046, pad=0.04).set_label("tsSPI − 100")
+            fig2.savefig(buf, format="png", dpi=180, bbox_inches="tight", facecolor="white")
+            plt.close(fig2)
+            shape_map_png = buf.getvalue()
+            st.download_button("Download shape map (PNG)",
+                               shape_map_png, file_name="shape_map.png", mime="image/png")
+        st.caption(("Y uses Corrected Grind (CG). " if USE_CG else "") + "Size = PI; X = Accel; Colour = tsSPIΔ.")
+# ======================= /Visual 1: Sectional Shape Map (memory-lean) =======================
 
 # ======================= Pace Curve — field average (black) + Top 10 finishers =======================
 st.markdown("## Pace Curve — field average (black) + Top 10 finishers")
