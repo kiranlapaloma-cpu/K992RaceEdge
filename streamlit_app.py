@@ -1601,6 +1601,37 @@ st.caption("Rule of thumb: ~4.0L/PI at 1200m, ~5.0L/PI at 1600m, ~6.0L/PI at 200
 
 # ======================= /PI → Lengths Estimator =======================
 
+# ======================= KG ↔ PI Converter =======================
+st.markdown("## KG ↔ PI Converter — Estimate the impact of weight")
+
+st.caption("Estimate how much Performance Index (PI) a weight change might add or reduce, adjusted for distance.")
+
+col1, col2 = st.columns(2)
+with col1:
+    kg_change = st.number_input("Weight change (kg)", -10.0, 10.0, 1.0, 0.5)
+with col2:
+    dist_input = st.number_input("Race distance (m)", 800, 3200, int(race_distance_input))
+
+# distance scaling factors — drag effect stronger with distance
+def kg_to_pi_factor(dm):
+    if dm <= 1200:  return 0.30   # ~0.30 PI per kg (sprints)
+    if dm <= 1600:  return 0.35
+    if dm <= 2000:  return 0.40
+    if dm <= 2400:  return 0.45
+    return 0.50                   # marathons: ~0.5 PI per kg
+
+factor = kg_to_pi_factor(dist_input)
+pi_change = kg_change * factor
+
+col3, col4 = st.columns(2)
+with col3:
+    st.metric(label="Estimated PI Change", value=f"{pi_change:+.2f}")
+with col4:
+    st.caption(f"1 kg ≈ {factor:.2f} PI at {int(dist_input)} m")
+
+st.caption("⚖️ Rule of thumb: longer races magnify weight effect due to drag and endurance cost.")
+# ======================= /KG ↔ PI Converter =======================
+
 # ======================= Ahead of Handicap (Single-Race, Field-Aware) =======================
 st.markdown("## Ahead of Handicap — Single Race Field Context")
 
