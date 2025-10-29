@@ -1712,53 +1712,57 @@ from matplotlib.patches import Rectangle
 from matplotlib.colors import TwoSlopeNorm
 from matplotlib.lines import Line2D
 
-# ----------------------- Label repel (built-in fallback) -----------------------
-def _repel_labels_builtin(ax, x, y, labels, *, init_shift=0.18, k_attract=0.006, k_repel=0.012, max_iter=250):
-    trans=ax.transData; renderer=ax.figure.canvas.get_renderer()
-    xy=np.column_stack([x,y]).astype(float); offs=np.zeros_like(xy)
-    for i,(xi,yi) in enumerate(xy):
-        offs[i]=[init_shift if xi>=0 else -init_shift, init_shift if yi>=0 else -init_shift]
-    texts,lines=[],[]
-    for (xi,yi),(dx,dy),lab in zip(xy,offs,labels):
-        t=ax.text(xi+dx, yi+dy, lab, fontsize=8.4, va="center", ha="left",
-                  bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.75))
-        texts.append(t)
-        ln=Line2D([xi,xi+dx],[yi,yi+dy], lw=0.75, color="black", alpha=0.9)
-        ax.add_line(ln); lines.append(ln)
-    inv=ax.transData.inverted()
-    for _ in range(max_iter):
-        moved=False
-        bbs=[t.get_window_extent(renderer=renderer).expanded(1.02,1.15) for t in texts]
-        for i in range(len(texts)):
-            for j in range(i+1,len(texts)):
-                if not bbs[i].overlaps(bbs[j]): continue
-                ci=((bbs[i].x0+bbs[i].x1)/2,(bbs[i].y0+bbs[i].y1)/2)
-                cj=((bbs[j].x0+bbs[j].x1)/2,(bbs[j].y0+bbs[j].y1)/2)
-                vx,vy=ci[0]-cj[0],ci[1]-cj[1]
-                if vx==0 and vy==0: vx=1.0
-                n=(vx**2+vy**2)**0.5; dx,dy=(vx/n)*k_repel*72,(vy/n)*k_repel*72
-                for t,s in ((texts[i],+1),(texts[j],-1)):
-                    tx,ty=t.get_position()
-                    px=trans.transform((tx,ty))+s*np.array([dx,dy])
-                    t.set_position(inv.transform(px)); moved=True
-        if not moved: break
-    for t,ln,(xi,yi) in zip(texts,lines,xy):
-        tx,ty=t.get_position(); ln.set_data([xi,tx],[yi,ty])
+# ----- light, RAM-friendly labeler for scatter plots -----
+def _shorten_name(nm: str, maxlen: int = 14) -> str:
+    nm = str(nm or "").strip()
+    return (nm[:maxlen-1] + "…") if len(nm) > maxlen else nm
 
-def label_points_neatly(ax, x, y, names):
-    try:
-        from adjustText import adjust_text
-        texts=[ax.text(xi,yi,nm,fontsize=8.4,
-                       bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.75))
-               for xi,yi,nm in zip(x,y,names)]
-        adjust_text(texts, x=x, y=y, ax=ax,
-                    only_move={'points':'y','text':'xy'},
-                    force_points=0.6, force_text=0.7,
-                    expand_text=(1.05,1.15), expand_points=(1.05,1.15),
-                    arrowprops=dict(arrowstyle="->", lw=0.75, color="black", alpha=0.9,
-                                    shrinkA=0, shrinkB=3))
-    except Exception:
-        _repel_labels_builtin(ax, x, y, names)
+def label_points_neatly_light(ax, x_vals, y_vals, names, *,
+                              dx=0.35, dy=0.35, grid=0.60,
+                              fontsize=8.8):
+    """
+    Places labels near points using a tiny grid-based de-overlap.
+    No canvas draws / no bbox measurements → very cheap.
+    """
+    import numpy as np
+    x = np.asarray(x_vals, dtype=float)
+    y = np.asarray(y_vals, dtype=float)
+    names = [_shorten_name(n) for n in names]
+
+    # candidate offsets (data units), try nearest first
+    candidates = [(0, dy), (dx, 0), (0, -dy), (-dx, 0),
+                  (dx*0.8, dy*0.8), (-dx*0.8, dy*0.8),
+                  (dx*0.8, -dy*0.8), (-dx*0.8, -dy*0.8)]
+    occupied = set()
+
+    for xi, yi, nm in zip(x, y, names):
+        placed = False
+        for ox, oy in candidates:
+            gx = round((xi + ox) / grid)
+            gy = round((yi + oy) / grid)
+            key = (gx, gy)
+            if key in occupied:
+                continue
+            occupied.add(key)
+            # draw label
+            ax.text(
+                xi + ox, yi + oy, nm,
+                fontsize=fontsize, ha="center", va="center",
+                bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.85)
+            )
+            # leader line only if offset
+            if ox or oy:
+                ax.plot([xi, xi + ox], [yi, yi + oy], lw=0.6, color="gray", alpha=0.6, zorder=2)
+            placed = True
+            break
+
+        if not placed:
+            # last resort: on-point small label
+            ax.text(
+                xi, yi, nm,
+                fontsize=fontsize-1.0, ha="center", va="center",
+                bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.75)
+            )
 
 # ======================= Visual 1: Sectional Shape Map (memory-lean) =======================
 st.markdown("## Sectional Shape Map — Accel (home drive) vs Grind (finish)")
@@ -1830,7 +1834,7 @@ else:
 
         # Label repelling can be expensive on big fields; try it, then degrade
         try:
-            label_points_neatly(ax, xv, yv, names, max_iter=500)
+            label_points_neatly_light(ax, xv, yv, names, max_iter=500)
         except Exception:
             # Lightweight fallback labels
             for xi, yi, nm in zip(xv, yv, names):
