@@ -1905,25 +1905,60 @@ else:
             edgecolor="black", linewidth=0.8, alpha=0.95, zorder=3
         )
 
-        # ---------- Arrowed labels (cheap & clear) ----------
-        # One pass, no heavy collision solver.
-        # Label is pushed *away from the origin* to reduce pile-ups, with tiny spiral to de-overlap.
+        # ---------- Arrowed labels with soft bounds + light de-overlap ----------
         n = len(xv)
         angles = np.arctan2(yv, xv)  # direction from origin
-        # base radial offset relative to axis span (tune: 0.09–0.15)
-        base_r = 0.11 * lim
-        # small per-point spiral to separate nearby labels
-        spiral = (np.arange(n) % 6) * (0.012 * lim)
+        # base offset & spiral (very light)
+        base_r = 0.12 * lim
+        spiral = (np.arange(n) % 7) * (0.010 * lim)
+
+        # Keep labels inside the axes box by a margin:
+        pad_x = 0.85   # points worth of padding scaled by lim (fraction of lim)
+        pad_y = 0.85
+        xmin, xmax = -lim + pad_x, lim - pad_x
+        ymin, ymax = -lim + pad_y, lim - pad_y
+
+        # Store chosen label positions to discourage overlaps
+        placed_xy = []
+
+        def _snap_inside(x, y):
+            # Snap to inner box so labels don’t cross axes/frame
+            return float(np.clip(x, xmin, xmax)), float(np.clip(y, ymin, ymax))
+
+        def _too_close(x, y, others, min_d):
+            for ox, oy in others:
+                if (x - ox)**2 + (y - oy)**2 < (min_d**2):
+                    return True
+            return False
 
         for i in range(n):
             ang = angles[i]
-            # if a point is near origin (angle unstable), push down-right gently
             if not np.isfinite(ang):
                 ang = np.deg2rad(-35.0)
-            # offset target
-            r = base_r + spiral[i]
-            tx = xv[i] + r * np.cos(ang)
-            ty = yv[i] + r * np.sin(ang)
+
+            # try a few radial steps and a tiny wobble in angle until we find a free slot
+            found = False
+            min_d = 0.06 * lim          # min spacing between label centers
+            r_step = 0.018 * lim
+            wobble = np.deg2rad(7.0)    # tiny wobble off the ray
+
+            for k in range(18):  # very small, bounded search
+                r_try = base_r + spiral[i] + k * r_step
+                # alternate left/right wobble to break ties
+                ang_try = ang + ((-1)**k) * (k % 3) * wobble * 0.45
+
+                tx = xv[i] + r_try * np.cos(ang_try)
+                ty = yv[i] + r_try * np.sin(ang_try)
+                tx, ty = _snap_inside(tx, ty)
+
+                if not _too_close(tx, ty, placed_xy, min_d):
+                    placed_xy.append((tx, ty))
+                    found = True
+                    break
+
+            if not found:  # last resort: put it slightly above-right, still inside
+                tx, ty = _snap_inside(xv[i] + 0.10 * lim, yv[i] + 0.04 * lim)
+                placed_xy.append((tx, ty))
 
             ax.annotate(
                 names[i],
@@ -1931,19 +1966,18 @@ else:
                 xytext=(tx, ty),
                 textcoords="data",
                 fontsize=9.2,
-                bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="0.75", alpha=0.9),
+                bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="0.75", alpha=0.92),
                 arrowprops=dict(
-                    arrowstyle="-", lw=1.0, color="0.30",
-                    shrinkA=4, shrinkB=4,  # don’t cover the marker
-                    alpha=0.9
+                    arrowstyle="-|>", lw=1.0, color="0.30",
+                    shrinkA=6, shrinkB=6, alpha=0.95
                 ),
                 ha="center", va="center",
                 zorder=5, clip_on=False
             )
-
+        
         ax.set_xlabel("Acceleration vs field (points) →")
         ax.set_ylabel(("Corrected " if USE_CG else "") + "Grind vs field (points) ↑")
-        ax.set_title("Quadrants:  +X = Accel (400→200)  ·  +Y = " +
+        ax.set_title("Quadrants:  +X = Accel   ·  +Y = " +
                      ("Corrected Grind" if USE_CG else "Grind") + "  ·  Colour = tsSPIΔ")
         ax.grid(True, linestyle=":", alpha=0.25)
 
