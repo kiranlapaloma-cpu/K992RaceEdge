@@ -1838,107 +1838,111 @@ else:
         st.caption(("Y uses Corrected Grind (CG). " if USE_CG else "") + "Size = PI; X = Accel; Colour = tsSPIΔ.")
 # ======================= /Visual 1: Sectional Shape Map (memory-lean) =======================
 
-# ======================= Pace Curve — field average (black) + Top 10 finishers =======================
+# ======================= Pace Curve — field average (lean version) =======================
 st.markdown("## Pace Curve — field average (black) + Top 10 finishers")
+
+# Optional: toggle PNG export (saves memory if off)
+make_png = st.toggle("Prepare PNG for download (uses more memory)", value=False)
 pace_png = None
 
 step = int(metrics.attrs.get("STEP", 100))
-D    = float(race_distance_input)
+D = float(race_distance_input)
+marks = _collect_markers(work)
 
-# Build segments from the columns that actually exist.
-# Each segment is (label, length_m, src_col). We purposely give every segment a UNIQUE KEY.
-marks = _collect_markers(work)  # e.g. [1200,1100,1000,...] for a 1250 race (100m splits)
-
+# ---- Build segments ----
 segs = []
 if marks:
-    # First leg: D → first marker (e.g., 1250→1200 uses 1200_Time)
     m1 = int(marks[0])
-    L0 = max(1.0, D - m1)  # 50 for 1250→1200, 160 for 1160→1000, etc.
+    L0 = max(1.0, D - m1)
     if f"{m1}_Time" in work.columns:
         segs.append((f"{int(D)}→{m1}", float(L0), f"{m1}_Time"))
-
-    # Middle legs: marker_i → marker_{i+1}
-    # IMPORTANT: the time column for a→b is **b_Time** (the split ending at b).
     for a, b in zip(marks, marks[1:]):
         src = f"{int(b)}_Time"
         if src in work.columns:
             segs.append((f"{int(a)}→{int(b)}", float(a - b), src))
-
-# Finish leg: always add Finish_Time if present
 if "Finish_Time" in work.columns:
-    fin_len = 100.0 if step == 100 else 200.0
-    segs.append((f"{step}→0 (Finish)", fin_len, "Finish_Time"))
+    segs.append((f"{step}→0 (Finish)", float(step), "Finish_Time"))
 
-# Abort nicely if we still have nothing
 if not segs:
     st.info("Not enough *_Time columns to draw the pace curve.")
 else:
-    # Compute speeds per segment into columns with UNIQUE KEYS
-    seg_keys = [f"seg_{i}" for i in range(len(segs))]
-    speed_df = pd.DataFrame(index=work.index, columns=seg_keys, dtype=float)
+    # ---- Compute speeds efficiently ----
+    seg_keys = [f"s{i}" for i in range(len(segs))]
+    arr = np.full((len(work), len(segs)), np.nan, dtype="float32")
 
-    for key, (label, L, src_col) in zip(seg_keys, segs):
-        t = pd.to_numeric(work[src_col], errors="coerce")
-        t = t.mask((t <= 0) | (~np.isfinite(t)))
-        speed_df[key] = L / t  # NaN-safe; per-horse speed for this segment
+    for j, (_, L, col) in enumerate(segs):
+        if col in work.columns:
+            t = pd.to_numeric(work[col], errors="coerce").astype("float32")
+            t = np.where((t > 0) & np.isfinite(t), t, np.nan)
+            arr[:, j] = L / t
 
-    # Field average over horses for each segment (ignore all-NaN columns)
-    field_avg = speed_df.mean(axis=0, skipna=True).to_numpy()
+    # Field average once
+    field_avg = np.nanmean(arr, axis=0)
     if not np.isfinite(np.nanmean(field_avg)):
         st.info("Pace curve: all segments missing/invalid.")
     else:
-        # Choose which horses to plot
+        # ---- Pick Top 10 ----
         if "Finish_Pos" in metrics.columns and metrics["Finish_Pos"].notna().any():
-            top10 = metrics.sort_values("Finish_Pos").head(10)
-            top10_rule = "Top-10 by Finish_Pos"
+            top10 = metrics.nsmallest(10, "Finish_Pos")
+            rule = "Top-10 by Finish_Pos"
         else:
-            top10 = metrics.sort_values("PI", ascending=False).head(10)
-            top10_rule = "Top-10 by PI"
+            top10 = metrics.nlargest(10, "PI")
+            rule = "Top-10 by PI"
 
-        # X axis
-        x_idx    = list(range(len(segs)))
+        # ---- Build plot ----
+        x_idx = np.arange(len(segs))
         x_labels = [lbl for (lbl, _, _) in segs]
 
-        fig2, ax2 = plt.subplots(figsize=(8.8, 5.2), layout="constrained")
-        ax2.plot(x_idx, field_avg, linewidth=2.2, color="black",
-                 label="Field average", marker=None)
+        fig, ax = plt.subplots(figsize=(8.0, 5.0))
+        ax.plot(x_idx, field_avg, color="black", lw=2.0, label="Field average")
 
         palette = color_cycle(len(top10))
         for i, (_, r) in enumerate(top10.iterrows()):
-            # find the row in the raw table for this horse (for timing columns)
-            if "Horse" in work.columns and "Horse" in metrics.columns:
-                row0 = work[work["Horse"] == r.get("Horse")]
-                row_times = row0.iloc[0] if not row0.empty else r
-            else:
-                row_times = r
+            speeds = np.full(len(segs), np.nan, dtype="float32")
+            for j, (_, L, col) in enumerate(segs):
+                t = pd.to_numeric(r.get(col, np.nan), errors="coerce")
+                if np.isfinite(t) and t > 0:
+                    speeds[j] = L / float(t)
+            if np.any(np.isfinite(speeds)):
+                ax.plot(x_idx, speeds, lw=1.0, marker="o", ms=2.5,
+                        color=palette[i], label=str(r.get("Horse", "")))
 
-            y_vals = []
-            for (_, L, src_col) in segs:
-                t = pd.to_numeric(row_times.get(src_col, np.nan), errors="coerce")
-                y = (L / float(t)) if (pd.notna(t) and float(t) > 0.0) else np.nan
-                y_vals.append(y)
+        # ---- Axes and styling ----
+        ax.set_xticks(x_idx)
+        ax.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
+        ax.set_ylabel("Speed (m/s)")
+        ax.set_title("Pace over segments (left = early, right = home straight)")
+        ax.grid(True, ls="--", alpha=0.3)
+        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18),
+                  ncol=3, frameon=False, fontsize=8)
+        st.pyplot(fig)
+        plt.close(fig)
 
-            if not np.isfinite(np.nanmean(y_vals)):
-                continue
+        # ---- Optional PNG export ----
+        if make_png:
+            buf = io.BytesIO()
+            fig2, ax2 = plt.subplots(figsize=(8.0, 5.0))
+            ax2.plot(x_idx, field_avg, color="black", lw=2.0)
+            for i, (_, r) in enumerate(top10.iterrows()):
+                speeds = np.full(len(segs), np.nan, dtype="float32")
+                for j, (_, L, col) in enumerate(segs):
+                    t = pd.to_numeric(r.get(col, np.nan), errors="coerce")
+                    if np.isfinite(t) and t > 0:
+                        speeds[j] = L / float(t)
+                ax2.plot(x_idx, speeds, lw=1.0, color=palette[i])
+            ax2.set_xticks(x_idx)
+            ax2.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
+            ax2.set_ylabel("Speed (m/s)")
+            ax2.set_title("Pace Curve")
+            ax2.grid(True, ls="--", alpha=0.3)
+            fig2.savefig(buf, format="png", dpi=180, bbox_inches="tight", facecolor="white")
+            plt.close(fig2)
+            pace_png = buf.getvalue()
+            st.download_button("Download pace curve (PNG)",
+                               pace_png, file_name="pace_curve.png", mime="image/png")
 
-            ax2.plot(x_idx, y_vals, linewidth=1.1, marker="o", markersize=2.5,
-                     label=str(r.get("Horse", "")), color=palette[i])
-
-        ax2.set_xticks(x_idx)
-        ax2.set_xticklabels(x_labels, rotation=45, ha="right")
-        ax2.set_ylabel("Speed (m/s)")
-        ax2.set_title("Pace over segments (left = early; right = home straight; includes Finish)")
-        ax2.grid(True, linestyle="--", alpha=0.30)
-        ax2.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18),
-                   ncol=3, frameon=False, fontsize=9)
-
-        st.pyplot(fig2)
-        buf = io.BytesIO()
-        fig2.savefig(buf, format="png", dpi=300, bbox_inches="tight", facecolor="white")
-        pace_png = buf.getvalue()
-        st.download_button("Download pace curve (PNG)", pace_png,
-                           file_name="pace_curve.png", mime="image/png")
-        st.caption(f"Top-10 plotted: {top10_rule}. Finish segment included explicitly.")
+        st.caption(f"Top-10 plotted: {rule}. Finish segment included explicitly.")
+# ======================= /Pace Curve (lean version) =======================
 
 # ======================= Winning DNA Matrix — distance-aware & report cards =======================
 st.markdown("## Winning DNA Matrix")
