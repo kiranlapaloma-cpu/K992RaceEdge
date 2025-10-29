@@ -1570,16 +1570,40 @@ else:
     st.caption(f"Source: **{gci_col}** (pure stats; no class labels).")
 # =================== /Race Class Summary ===================
 
-# ======================= PI → Lengths Estimator (compact) =======================
+# ======================= PI ↔ Lengths + KG ↔ PI (consistent scale) =======================
 st.markdown("---")
-st.markdown("### PI → Lengths Estimator")
+st.markdown("### PI ↔ Lengths & KG ↔ PI — Consistent, distance-aware")
 
-# Formula: lengths per 1.0 PI at distance D (m)
+import numpy as np
+
+# ---- Shared distance → factor curves (anchors are realistic SA/UK handicapping heuristics) ----
+# Lengths per 1 PI point by trip (field/going agnostic baseline)
+_PI_LEN_ANCHORS_M   = np.array([1000, 1200, 1600, 2000, 2400, 2800, 3200], dtype=float)
+_PI_LEN_ANCHORS_LPI = np.array([ 3.8,  4.0,  5.0,  6.0,  6.8,  7.5,  8.2], dtype=float)  # L per 1 PI
+
+# Lengths per 1 kg by trip (stayers pay more for weight)
+_KG_LEN_ANCHORS_M   = _PI_LEN_ANCHORS_M
+_KG_LEN_ANCHORS_LKG = np.array([ 1.10, 1.20, 1.60, 2.00, 2.30, 2.50, 2.70], dtype=float)  # L per 1 kg
+
+def _interp(x, xp, fp):
+    x = float(x)
+    # allow gentle extrapolation beyond anchors
+    return float(np.interp(x, xp, fp, left=fp[0] + (x - xp[0]) * (fp[1]-fp[0])/(xp[1]-xp[0]),
+                               right=fp[-1] + (x - xp[-1]) * (fp[-1]-fp[-2])/(xp[-1]-xp[-2])))
+
 def lengths_per_pi(distance_m: float) -> float:
-    # Baseline 3.5L @1000m, ~4.0L @1200m, grows ~linearly with distance
-    L = 3.5 + 0.00125 * (float(distance_m) - 1000.0)
-    return float(np.clip(L, 2.5, 8.5))  # soft safety clamp
+    return max(2.5, _interp(distance_m, _PI_LEN_ANCHORS_M, _PI_LEN_ANCHORS_LPI))
 
+def lengths_per_kg(distance_m: float) -> float:
+    return max(0.8, _interp(distance_m, _KG_LEN_ANCHORS_M, _KG_LEN_ANCHORS_LKG))
+
+def pi_per_kg(distance_m: float) -> float:
+    # Fundamental consistency: (PI per kg) = (L/kg) / (L/PI)
+    lpi = lengths_per_pi(distance_m)
+    lkg = lengths_per_kg(distance_m)
+    return lkg / lpi
+
+# ---------- PI → Lengths ----------
 colA, colB = st.columns([1,1])
 with colA:
     D_for_pi = st.number_input("Distance for conversion (m)", min_value=800, max_value=3600,
@@ -1589,48 +1613,40 @@ with colB:
 
 L_per_PI = lengths_per_pi(D_for_pi)
 est_margin = dPI * L_per_PI
+st.metric("Estimated margin from PI gap", f"{abs(est_margin):.2f} lengths",
+          delta=f"{L_per_PI:.2f} L per 1.0 PI @ {int(D_for_pi)}m")
+st.caption("Heuristic anchors: ~4.0 L/PI @1200m · ~5.0 @1600m · ~6.0 @2000m · ~7.5 @2800m (smoothly interpolated).")
 
-# Friendly readout
-lead_word = "ahead" if est_margin >= 0 else "behind"
-st.metric(
-    label="Estimated margin from PI gap",
-    value=f"{abs(est_margin):.2f} lengths",
-    delta=f"{L_per_PI:.2f} L per 1.0 PI @ {D_for_pi}m"
-)
-st.caption("Rule of thumb: ~4.0L/PI at 1200m, ~5.0L/PI at 1600m, ~6.0L/PI at 2000m (scaled linearly).")
-
-# ======================= /PI → Lengths Estimator =======================
-
-# ======================= KG ↔ PI Converter =======================
-st.markdown("## KG ↔ PI Converter — Estimate the impact of weight")
-
-st.caption("Estimate how much Performance Index (PI) a weight change might add or reduce, adjusted for distance.")
+# ---------- KG ↔ PI Converter (consistent with above) ----------
+st.markdown("## KG ↔ PI Converter — distance-aware and consistent")
 
 col1, col2 = st.columns(2)
 with col1:
-    kg_change = st.number_input("Weight change (kg)", -10.0, 10.0, 1.0, 0.5)
+    kg_change = st.number_input("Weight change (kg)  (positive = more weight carried)", -10.0, 10.0, 1.0, 0.5)
 with col2:
-    dist_input = st.number_input("Race distance (m)", 800, 3200, int(race_distance_input))
+    dist_input = st.number_input("Race distance (m)", 800, 3600, int(race_distance_input), step=50)
 
-# distance scaling factors — drag effect stronger with distance
-def kg_to_pi_factor(dm):
-    if dm <= 1200:  return 0.30   # ~0.30 PI per kg (sprints)
-    if dm <= 1600:  return 0.35
-    if dm <= 2000:  return 0.40
-    if dm <= 2400:  return 0.45
-    return 0.50                   # marathons: ~0.5 PI per kg
+# PI effect is negative when weight increases
+pi_perkg = pi_per_kg(dist_input)
+pi_change = -kg_change * pi_perkg
 
-factor = kg_to_pi_factor(dist_input)
-pi_change = kg_change * factor
+# Also show the equivalent lengths impact for intuition
+L_per_KG = lengths_per_kg(dist_input)
+len_change = kg_change * L_per_KG
 
-col3, col4 = st.columns(2)
-with col3:
-    st.metric(label="Estimated PI Change", value=f"{pi_change:+.2f}")
-with col4:
-    st.caption(f"1 kg ≈ {factor:.2f} PI at {int(dist_input)} m")
+c3, c4 = st.columns(2)
+with c3:
+    st.metric("Estimated PI Change", f"{pi_change:+.2f}",
+              delta=f"{pi_perkg:.2f} PI per 1 kg @ {int(dist_input)}m")
+with c4:
+    st.metric("Estimated Lengths Change", f"{len_change:+.2f} L",
+              delta=f"{L_per_KG:.2f} L per 1 kg @ {int(dist_input)}m")
 
-st.caption("⚖️ Rule of thumb: longer races magnify weight effect due to drag and endurance cost.")
-# ======================= /KG ↔ PI Converter =======================
+st.caption(
+    "Consistency guarantee: PI/kg = (Lengths/kg) ÷ (Lengths/PI). "
+    "Example @2850m: ~7.5 L/PI and ~2.5 L/kg ⇒ ~0.33 PI/kg (1 kg adds ~2.5 L, costs ~0.33 PI)."
+)
+# ======================= /PI ↔ Lengths + KG ↔ PI =======================
 
 # ======================= Ahead of Handicap (Single-Race, Field-Aware) =======================
 st.markdown("## Ahead of Handicap — Single Race Field Context")
