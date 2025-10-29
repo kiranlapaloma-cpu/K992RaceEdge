@@ -1991,6 +1991,122 @@ else:
         cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
         cbar.set_label("tsSPI − 100")
 
+        # ========== Presentation-friendly labelling (RAM-light) ==========
+
+        # --- Controls (cheap) ---
+        c1, c2, c3 = st.columns([1,1,1])
+        with c1:
+            max_labels = st.slider("Max text labels (rest numbered)", 6, 18, min(12, max(8, len(xv)//2)), 1)
+        with c2:
+            show_numbered_rest = st.checkbox("Number unlabeled horses", True)
+        with c3:
+            show_mapping_table = st.checkbox("Show number↔name table", True)
+
+        # --- Prepare arrays ---
+        x = np.asarray(xv, dtype=float)
+        y = np.asarray(yv, dtype=float)
+        ts = np.asarray(cv, dtype=float)  # colour metric
+        pi = np.asarray(piv, dtype=float)
+        N = len(x)
+        idx = np.arange(N)
+
+        # Normalise helpers (robust)
+        def _nz(a):
+            a = np.asarray(a, dtype=float)
+            f = np.isfinite(a)
+            if f.sum() == 0:
+                return np.zeros_like(a)
+            mn, mx = np.nanpercentile(a[f], [5, 95])
+            if mx <= mn: mx = mn + 1.0
+            out = (a - mn) / (mx - mn)
+            return np.clip(out, 0.0, 1.0)
+
+        # Priority score: extremes in x,y + colour deviation + PI
+        score = 0.45*_nz(np.abs(x)) + 0.45*_nz(np.abs(y)) + 0.20*_nz(np.abs(ts)) + 0.20*_nz(pi)
+        # Quadrant (ensure coverage)
+        q = (x >= 0).astype(int) + 2*(y >= 0).astype(int)  # 0=BL,1=BR,2=TL,3=TR
+        quota = max(2, max_labels // 4)
+
+        # First pass: take top per quadrant up to quota
+        label_ids = []
+        for qq in range(4):
+            sel = idx[q == qq]
+            if sel.size:
+                topq = sel[np.argsort(score[sel])[::-1][:quota]]
+                label_ids.extend(topq.tolist())
+
+        # Fill remaining label slots by global priority
+        if len(label_ids) < max_labels:
+            remaining = np.setdiff1d(idx, np.array(label_ids, dtype=int), assume_unique=False)
+            if remaining.size:
+                need = max_labels - len(label_ids)
+                fill = remaining[np.argsort(score[remaining])[::-1][:need]]
+                label_ids.extend(fill.tolist())
+
+        label_ids = np.array(sorted(set(label_ids)), dtype=int)
+
+        # ---- Draw tiny numeric tags on all points (optional) ----
+        num_tags = np.arange(1, N+1)  # 1-based
+        if show_numbered_rest:
+            for i in range(N):
+                # put number on the dot (small, high-contrast halo)
+                ax.text(
+                    x[i], y[i], str(num_tags[i]),
+                    ha="center", va="center", fontsize=7.6,
+                    color="white",
+                    path_effects=[mpl.patheffects.withStroke(linewidth=1.8, foreground="black", alpha=0.85)],
+                    zorder=4
+                )
+
+        # ---- Annotate text labels for selected (with arrows), de-overlap light ----
+        # Light, bounded de-overlap: radial steps + inner-box snap
+        import math
+        placed = []
+        pad = 0.9
+        xmin, xmax = -lim + pad, lim - pad
+        ymin, ymax = -lim + pad, lim - pad
+
+        def _snap(xp, yp):
+            return float(np.clip(xp, xmin, xmax)), float(np.clip(yp, ymin, ymax))
+
+        def _crowded(xp, yp, pts, mind):
+            for (ux, uy) in pts:
+                if (xp-ux)*(xp-ux) + (yp-uy)*(yp-uy) < mind*mind:
+                    return True
+            return False
+
+        base_r = 0.12 * lim
+        r_step = 0.020 * lim
+        min_d  = 0.065 * lim
+        wobble = math.radians(8.0)
+
+        for i in label_ids:
+            ang = math.atan2(y[i], x[i]) if (np.isfinite(x[i]) and np.isfinite(y[i])) else math.radians(-30.0)
+            ok = False
+            for k in range(20):
+                r_try = base_r + k*r_step
+                ang_try = ang + ((-1)**k) * (k % 3) * wobble * 0.5
+                tx = x[i] + r_try*math.cos(ang_try)
+                ty = y[i] + r_try*math.sin(ang_try)
+                tx, ty = _snap(tx, ty)
+                if not _crowded(tx, ty, placed, min_d):
+                    placed.append((tx, ty))
+                    ok = True
+                    break
+            if not ok:
+                tx, ty = _snap(x[i] + 0.10*lim, y[i] + 0.06*lim)
+
+            # draw the arrowed label (kept compact)
+            ax.annotate(
+                names[i],
+                xy=(x[i], y[i]), xytext=(tx, ty),
+                textcoords="data",
+                fontsize=9.3,
+                bbox=dict(boxstyle="round,pad=0.20", fc="white", ec="0.75", alpha=0.95),
+                arrowprops=dict(arrowstyle="-|>", lw=1.0, color="0.30", shrinkA=6, shrinkB=6, alpha=0.9),
+                ha="center", va="center", zorder=6, clip_on=False
+            )
+
         st.pyplot(fig)
 
         # on-demand PNG (saves RAM by default)
