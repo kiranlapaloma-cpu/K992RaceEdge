@@ -1840,15 +1840,14 @@ def label_points_bin_spiral(ax, x_vals, y_vals, names, *,
             # (Optional; comment out if you prefer none)
             pass
             
-# ======================= Visual 1: Sectional Shape Map (RAM-friendly) =======================
+# ======================= Visual 1: Sectional Shape Map (arrow labels, RAM-friendly) =======================
 st.markdown("## Sectional Shape Map — Accel (home drive) vs Grind (finish)")
 
 GR_COL = metrics.attrs.get("GR_COL", "Grind")
-
 need = {"Horse", "Accel", GR_COL, "tsSPI", "PI"}
-missing = sorted(list(need - set(metrics.columns)))
-if missing:
-    st.warning("Shape Map: required columns missing: " + ", ".join(missing))
+
+if not need.issubset(metrics.columns):
+    st.warning("Shape Map: required columns missing: " + ", ".join(sorted(need - set(metrics.columns))))
 else:
     dfm = metrics.loc[:, ["Horse", "Accel", GR_COL, "tsSPI", "PI"]].copy()
     for c in ["Accel", GR_COL, "tsSPI", "PI"]:
@@ -1857,95 +1856,118 @@ else:
     if dfm.empty:
         st.info("Not enough data to draw the shape map.")
     else:
-        # Δ vs field (points)
-        dfm["AccelΔ"] = dfm["Accel"] - 100.0
-        dfm["GrindΔ"] = dfm[GR_COL] - 100.0
-        dfm["tsSPIΔ"] = dfm["tsSPI"] - 100.0
+        # deltas vs field
+        dfm["x"] = dfm["Accel"] - 100.0
+        dfm["y"] = dfm[GR_COL] - 100.0
+        dfm["c"] = dfm["tsSPI"] - 100.0
 
-        names = dfm["Horse"].astype(str).tolist()
-        xv = dfm["AccelΔ"].to_numpy()
-        yv = dfm["GrindΔ"].to_numpy()
-        cv = dfm["tsSPIΔ"].to_numpy()
+        names = dfm["Horse"].astype(str).to_numpy()
+        xv = dfm["x"].to_numpy()
+        yv = dfm["y"].to_numpy()
+        cv = dfm["c"].to_numpy()
 
-        # point sizes by PI (compact range to keep draw cheap)
-        DOT_MIN, DOT_MAX = 40.0, 140.0
+        # sizes by PI (larger → more visible)
+        DOT_MIN, DOT_MAX = 90.0, 220.0
         pmin, pmax = np.nanmin(dfm["PI"]), np.nanmax(dfm["PI"])
         if not (np.isfinite(pmin) and np.isfinite(pmax) and pmax > pmin):
             sizes = np.full_like(xv, DOT_MIN, dtype=float)
         else:
-            sizes = DOT_MIN + (dfm["PI"] - pmin) / (pmax - pmin + 1e-9) * (DOT_MAX - DOT_MIN)
-            sizes = sizes.to_numpy()
+            sizes = DOT_MIN + (dfm["PI"].to_numpy() - pmin) / (pmax - pmin + 1e-9) * (DOT_MAX - DOT_MIN)
 
-        # robust axis limits (symmetrical, rounded)
-        span = float(np.nanmax(np.abs(np.concatenate([xv, yv])))) if xv.size else 10.0
-        span = max(6.0, min(12.0, np.percentile(np.abs(np.concatenate([xv, yv])), 95)))
-        lim = float(np.ceil(span / 1.5) * 1.5)
+        # symmetric limits (robust to outliers)
+        span = np.percentile(np.abs(np.concatenate([xv, yv])), 95)
+        lim = float(max(6.0, min(12.0, np.ceil(span / 1.5) * 1.5)))
 
-        # robust colour scaling (avoid outliers)
+        # colour scaling
         vmin = float(np.nanpercentile(cv, 10)) if np.isfinite(cv).any() else -1.0
         vmax = float(np.nanpercentile(cv, 90)) if np.isfinite(cv).any() else 1.0
         if not (np.isfinite(vmin) and np.isfinite(vmax) and vmin < vmax):
             vmin, vmax = -1.0, 1.0
         norm = TwoSlopeNorm(vcenter=0.0, vmin=vmin, vmax=vmax)
 
-        fig, ax = plt.subplots(figsize=(7.8, 6.0), layout="constrained")
+        fig, ax = plt.subplots(figsize=(8.2, 6.2), layout="constrained")
 
-        # quadrant tint (ultra-light)
+        # quadrant tint (light)
         tint = 0.08
         ax.axvspan(0,  lim,  0, 1, color="#ff7f00", alpha=tint, zorder=0)  # +X (Accel)
         ax.axvspan(-lim, 0,  0, 1, color="#377eb8", alpha=tint, zorder=0)  # -X
         ax.axhspan(0,  lim,  0, 1, color="#4daf4a", alpha=tint, zorder=0)  # +Y (Grind/CG)
         ax.axhspan(-lim, 0,  0, 1, color="#984ea3", alpha=tint, zorder=0)  # -Y
 
-        # axes, grid
         ax.axvline(0, color="gray", lw=1.0, ls=(0, (3, 3)), alpha=0.8, zorder=1)
         ax.axhline(0, color="gray", lw=1.0, ls=(0, (3, 3)), alpha=0.8, zorder=1)
         ax.set_xlim(-lim, lim)
         ax.set_ylim(-lim, lim)
 
-        # scatter (single artist → efficient)
-        sc = ax.scatter(xv, yv, s=sizes, c=cv, cmap="coolwarm", norm=norm,
-                        edgecolor="black", linewidth=0.6, alpha=0.95, zorder=2)
-
-        # labels — RAM-friendly bin+spiral helper you added earlier
-        label_points_bin_spiral(
-            ax, xv, yv, names,
-            base_dx=0.55, base_dy=0.55,   # increase slightly if still tight
-            cells=14,                      # 12–16 is a good range
-            fontsize=9.2,
-            max_per_cell=6
+        # SCATTER — keep it clearly visible
+        sc = ax.scatter(
+            xv, yv, s=sizes, c=cv, cmap="coolwarm", norm=norm,
+            edgecolor="black", linewidth=0.8, alpha=0.95, zorder=3
         )
 
-        # axes text
+        # ---------- Arrowed labels (cheap & clear) ----------
+        # One pass, no heavy collision solver.
+        # Label is pushed *away from the origin* to reduce pile-ups, with tiny spiral to de-overlap.
+        n = len(xv)
+        angles = np.arctan2(yv, xv)  # direction from origin
+        # base radial offset relative to axis span (tune: 0.09–0.15)
+        base_r = 0.11 * lim
+        # small per-point spiral to separate nearby labels
+        spiral = (np.arange(n) % 6) * (0.012 * lim)
+
+        for i in range(n):
+            ang = angles[i]
+            # if a point is near origin (angle unstable), push down-right gently
+            if not np.isfinite(ang):
+                ang = np.deg2rad(-35.0)
+            # offset target
+            r = base_r + spiral[i]
+            tx = xv[i] + r * np.cos(ang)
+            ty = yv[i] + r * np.sin(ang)
+
+            ax.annotate(
+                names[i],
+                xy=(xv[i], yv[i]),
+                xytext=(tx, ty),
+                textcoords="data",
+                fontsize=9.2,
+                bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="0.75", alpha=0.9),
+                arrowprops=dict(
+                    arrowstyle="-", lw=1.0, color="0.30",
+                    shrinkA=4, shrinkB=4,  # don’t cover the marker
+                    alpha=0.9
+                ),
+                ha="center", va="center",
+                zorder=5, clip_on=False
+            )
+
         ax.set_xlabel("Acceleration vs field (points) →")
         ax.set_ylabel(("Corrected " if USE_CG else "") + "Grind vs field (points) ↑")
         ax.set_title("Quadrants:  +X = Accel (400→200)  ·  +Y = " +
                      ("Corrected Grind" if USE_CG else "Grind") + "  ·  Colour = tsSPIΔ")
         ax.grid(True, linestyle=":", alpha=0.25)
 
-        # point-size legend (drawn with empty handles to keep artists minimal)
-        for s, lab in [(DOT_MIN, "PI low"), ((DOT_MIN + DOT_MAX) / 2, "PI mid"), (DOT_MAX, "PI high")]:
+        # size legend (cheap)
+        for s, lab in [(DOT_MIN, "PI low"), ((DOT_MIN + DOT_MAX)/2, "PI mid"), (DOT_MAX, "PI high")]:
             ax.scatter([], [], s=s, color="gray", edgecolor="black", alpha=0.6, label=lab)
         leg = ax.legend(loc="upper left", frameon=False, fontsize=8)
-        if leg:
-            leg._legend_box.align = "left"
+        if leg: leg._legend_box.align = "left"
 
-        # colorbar (compact)
+        # compact colour bar
         cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
         cbar.set_label("tsSPI − 100")
 
         st.pyplot(fig)
 
-        # Optional high-res export (off by default to save RAM)
-        prep_png = st.toggle("Prepare high-res PNG for download (uses more memory)", value=False)
-        if prep_png:
+        # on-demand PNG (saves RAM by default)
+        if st.toggle("Prepare high-res PNG for download (uses more memory)", value=False):
             buf = io.BytesIO()
             fig.savefig(buf, format="png", dpi=300, bbox_inches="tight", facecolor="white")
             st.download_button("Download shape map (PNG)", buf.getvalue(),
                                file_name="shape_map.png", mime="image/png", use_container_width=True)
 
         st.caption(("Y uses Corrected Grind (CG). " if USE_CG else "") +
-                   "Size = PI · X = Accel · Colour = tsSPIΔ. Labels use a lightweight de-overlapper.")
+                   "Size = PI · X = Accel · Colour = tsSPIΔ. Labels use single-pass arrow offsets (away from origin) with a light spiral to avoid overlaps.")
 # ======================= /Sectional Shape Map =======================
 
 # ======================= Pace Curve — field average (lean version) =======================
