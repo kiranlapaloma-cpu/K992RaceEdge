@@ -2371,12 +2371,71 @@ def hh_note(r):
     return "; ".join(bits).capitalize()+"."
 hh["Note"] = hh.apply(hh_note, axis=1)
 
-cols_hh = ["Horse","Finish_Pos","PI","GCI","tsSPI","Accel",gr_col,"SOS","ASI2","TFS","UEI","HiddenScore","Tier","Note"]
+# ---- Build ranked, presentation-friendly Hidden Horses table ----
+cols_hh = ["Horse","Finish_Pos","PI","GCI","tsSPI","Accel",gr_col,
+           "SOS","ASI2","TFS","UEI","HiddenScore","Tier","Note"]
 for c in cols_hh:
-    if c not in hh.columns: hh[c] = np.nan
-hh_view = hh.sort_values(["Tier","HiddenScore","PI"], ascending=[True,False,False])[cols_hh]
-st.dataframe(hh_view, use_container_width=True)
-st.caption("Hidden Horses v2 — RS-aware tiering enabled · 🔥 ≥7.2/6.0 · 🟡 ≥6.2/5.0.")
+    if c not in hh.columns:
+        hh[c] = np.nan
+
+# numeric hygiene
+num_cols = ["PI","GCI","tsSPI","Accel",gr_col,"SOS","ASI2","TFS","UEI","HiddenScore"]
+for c in num_cols:
+    hh[c] = pd.to_numeric(hh[c], errors="coerce")
+
+# explicit tier ordering (for secondary sort / grouping)
+_tier_order = {"🔥 Top Hidden": 0, "🟡 Notable Hidden": 1, "": 2}
+hh["_tier_order"] = hh["Tier"].map(_tier_order).fillna(2)
+
+# primary sort = HiddenScore (desc), then Tier order, then PI (desc)
+hh_ranked = (
+    hh.sort_values(["HiddenScore", "_tier_order", "PI"],
+                   ascending=[False, True, False])
+      .reset_index(drop=True)
+)
+
+# rank column and tidy/rounding
+hh_ranked.insert(0, "#", hh_ranked.index + 1)
+view = hh_ranked.rename(columns={
+    gr_col: "Grind", "tsSPI": "tsSPI (%)"
+})
+view["HiddenScore"] = view["HiddenScore"].fillna(0.0).round(3)
+for c in ["PI","GCI","ASI2","SOS","TFS","UEI","Accel","Grind","tsSPI (%)"]:
+    if c in view.columns:
+        view[c] = pd.to_numeric(view[c], errors="coerce").round(2)
+
+# display
+st.dataframe(
+    view[["#", "Horse", "HiddenScore", "Tier", "Note",
+          "PI", "GCI", "tsSPI (%)", "Accel", "Grind"]],
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "HiddenScore": st.column_config.ProgressColumn(
+            "HiddenScore", help="Higher = stronger hidden performance signal",
+            min_value=float(np.nanmin(view["HiddenScore"])) if np.isfinite(np.nanmin(view["HiddenScore"])) else 0.0,
+            max_value=float(np.nanmax(view["HiddenScore"])) if np.isfinite(np.nanmax(view["HiddenScore"])) else 3.0,
+            format="%.3f"
+        ),
+        "tsSPI (%)": st.column_config.NumberColumn("tsSPI (%)", format="%.2f"),
+        "PI":        st.column_config.NumberColumn("PI", format="%.2f"),
+        "GCI":       st.column_config.NumberColumn("GCI", format="%.2f"),
+        "Accel":     st.column_config.NumberColumn("Accel", format="%.2f"),
+        "Grind":     st.column_config.NumberColumn("Grind", format="%.2f"),
+    }
+)
+
+# export
+st.download_button(
+    "Download Hidden Horses (ranked, CSV)",
+    view.to_csv(index=False).encode("utf-8"),
+    file_name="hidden_horses_ranked.csv",
+    mime="text/csv",
+    use_container_width=True
+)
+
+st.caption("Ranked by HiddenScore (desc). Tier badges: 🥇=Top Hidden, 🟡=Notable Hidden.\
+ Numbers rounded for readability; progress bar reflects HiddenScore scale.")
 
 # ======================= V-Profile — Top Speed & Sustain (0–10) =======================
 st.markdown("## V-Profile — Top Speed & Sustain")
