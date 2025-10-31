@@ -2394,55 +2394,38 @@ hh_ranked = (
       .reset_index(drop=True)
 )
 
-# --- safe numeric casting & rounding for view[...] columns ---
+# --- Build final table -------------------------------------------------
+cols_hh = ["Horse","Finish_Pos","PI","GCI","tsSPI","Accel",gr_col,"SOS","ASI2","TFS","UEI","HiddenScore","Tier","Note"]
+for c in cols_hh:
+    if c not in hh.columns:
+        hh[c] = np.nan
+
+# Tier order: Top first, then Notable, then blank
+tier_order = pd.CategoricalDtype(categories=["🔥 Top Hidden","🟡 Notable Hidden",""], ordered=True)
+hh["Tier"] = hh["Tier"].astype(tier_order)
+
+hh_view = hh[cols_hh].copy()
+hh_view = hh_view.sort_values(["Tier","HiddenScore","PI"], ascending=[True, False, False])
+
+# ---------- safe numeric casting & rounding (FIXES NameError) ----------
 def _to_num_series(col, idx):
-    # Ensure 1-D Series, aligned to DataFrame index
     if isinstance(col, pd.Series):
         s = col
     else:
         arr = np.asarray(col)
-        arr = np.squeeze(arr)           # drop (n,1) etc.
-        if arr.ndim == 0:               # scalar -> all NaN
+        arr = np.squeeze(arr)                   # drop (n,1)
+        if arr.ndim == 0:
             return pd.Series(np.nan, index=idx)
         s = pd.Series(arr, index=idx)
     return pd.to_numeric(s, errors="coerce")
 
-for c in ["PI","GCI","ASI2","SOS","TFS","UEI","Accel",gr_col,"tsSPI (%)"]:
+view = hh_view.copy()                           # <— define 'view' BEFORE using it
+for c in ["PI","GCI","ASI2","SOS","TFS","UEI","Accel",gr_col,"tsSPI"]:
     if c in view.columns:
         view[c] = _to_num_series(view[c], view.index).round(2)
-        
-# display
-st.dataframe(
-    view[["#", "Horse", "HiddenScore", "Tier", "Note",
-          "PI", "GCI", "tsSPI (%)", "Accel", "Grind"]],
-    use_container_width=True,
-    hide_index=True,
-    column_config={
-        "HiddenScore": st.column_config.ProgressColumn(
-            "HiddenScore", help="Higher = stronger hidden performance signal",
-            min_value=float(np.nanmin(view["HiddenScore"])) if np.isfinite(np.nanmin(view["HiddenScore"])) else 0.0,
-            max_value=float(np.nanmax(view["HiddenScore"])) if np.isfinite(np.nanmax(view["HiddenScore"])) else 3.0,
-            format="%.3f"
-        ),
-        "tsSPI (%)": st.column_config.NumberColumn("tsSPI (%)", format="%.2f"),
-        "PI":        st.column_config.NumberColumn("PI", format="%.2f"),
-        "GCI":       st.column_config.NumberColumn("GCI", format="%.2f"),
-        "Accel":     st.column_config.NumberColumn("Accel", format="%.2f"),
-        "Grind":     st.column_config.NumberColumn("Grind", format="%.2f"),
-    }
-)
 
-# export
-st.download_button(
-    "Download Hidden Horses (ranked, CSV)",
-    view.to_csv(index=False).encode("utf-8"),
-    file_name="hidden_horses_ranked.csv",
-    mime="text/csv",
-    use_container_width=True
-)
-
-st.caption("Ranked by HiddenScore (desc). Tier badges: 🥇=Top Hidden, 🟡=Notable Hidden.\
- Numbers rounded for readability; progress bar reflects HiddenScore scale.")
+st.dataframe(view, use_container_width=True)
+st.caption("Hidden Horses v2 — sorted by Tier, HiddenScore, then PI (Top first).")
 
 # ======================= V-Profile — Top Speed & Sustain (0–10) =======================
 st.markdown("## V-Profile — Top Speed & Sustain")
