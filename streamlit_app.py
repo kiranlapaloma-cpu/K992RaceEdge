@@ -2394,17 +2394,23 @@ hh_ranked = (
       .reset_index(drop=True)
 )
 
-# rank column and tidy/rounding
-hh_ranked.insert(0, "#", hh_ranked.index + 1)
-view = hh_ranked.rename(columns={
-    gr_col: "Grind", "tsSPI": "tsSPI (%)"
-})
-view["HiddenScore"] = view["HiddenScore"].fillna(0.0).round(3)
-for c in ["PI","GCI","ASI2","SOS","TFS","UEI","Accel","Grind","tsSPI (%)"]:
-    if c in view.columns:
-        s = pd.Series(view[c]) if not isinstance(view[c], (pd.Series, np.ndarray, list)) else view[c]
-        view[c] = pd.to_numeric(s, errors="coerce").round(2)
+# --- safe numeric casting & rounding for view[...] columns ---
+def _to_num_series(col, idx):
+    # Ensure 1-D Series, aligned to DataFrame index
+    if isinstance(col, pd.Series):
+        s = col
+    else:
+        arr = np.asarray(col)
+        arr = np.squeeze(arr)           # drop (n,1) etc.
+        if arr.ndim == 0:               # scalar -> all NaN
+            return pd.Series(np.nan, index=idx)
+        s = pd.Series(arr, index=idx)
+    return pd.to_numeric(s, errors="coerce")
 
+for c in ["PI","GCI","ASI2","SOS","TFS","UEI","Accel",gr_col,"tsSPI (%)"]:
+    if c in view.columns:
+        view[c] = _to_num_series(view[c], view.index).round(2)
+        
 # display
 st.dataframe(
     view[["#", "Horse", "HiddenScore", "Tier", "Note",
