@@ -2402,7 +2402,8 @@ view = hh_ranked.rename(columns={
 view["HiddenScore"] = view["HiddenScore"].fillna(0.0).round(3)
 for c in ["PI","GCI","ASI2","SOS","TFS","UEI","Accel","Grind","tsSPI (%)"]:
     if c in view.columns:
-        view[c] = pd.to_numeric(view[c], errors="coerce").round(2)
+        s = pd.Series(view[c]) if not isinstance(view[c], (pd.Series, np.ndarray, list)) else view[c]
+        view[c] = pd.to_numeric(s, errors="coerce").round(2)
 
 # display
 st.dataframe(
