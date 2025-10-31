@@ -2736,121 +2736,159 @@ else:
         plt.close(figQ)
 # ======================= /V-Profile — Style Quadrant (economy & crisp) =======================
 
-# ======================= Power Index (PWX) — burst per kg (0–10) =======================
-st.markdown("## Power Index (PWX) — explosiveness adjusted for weight")
+# ======================= PWX + EFI (calibrated 0..10) =======================
+st.markdown("## PWX + EFI — Burst vs. Efficiency (field-calibrated)")
 
-GR_COL = metrics.attrs.get("GR_COL", "Grind")
+import numpy as np
+import pandas as pd
 
-need_cols = {"Horse", "Accel"}
-missing = [c for c in need_cols if c not in metrics.columns]
-if missing:
-    st.info("PWX: missing required columns — " + ", ".join(missing))
+# ---------- small helpers (robust & light) ----------
+def _nz_num(s):
+    s = pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    return s
+
+def _mad(x):
+    x = np.asarray(x, float)
+    med = np.nanmedian(x)
+    return 1.4826 * np.nanmedian(np.abs(x - med))
+
+def _percentile_rank(x):
+    x = np.asarray(x, float)
+    order = x.argsort(kind="mergesort")
+    ranks = np.empty_like(order, dtype=float)
+    ranks[order] = np.arange(1, len(x) + 1)
+    pr = (ranks - 0.5) / max(len(x), 1)
+    pr[~np.isfinite(x)] = 0.5
+    return pr
+
+def _calibrate_0_10(series, target_knots=None, shrink_small_fields=True):
+    """
+    Field-calibrated scaler → 0..10 with believable tails.
+    ~10% end up ≥8 by default; ~2% ≥9.5 (unless the field is truly exceptional).
+    """
+    s = _nz_num(series).copy()
+    n = s.size
+
+    # robust z → sigmoid 0..1 (distance-from-median info)
+    med = np.nanmedian(s)
+    mad = _mad(s)
+    if not np.isfinite(mad) or mad <= 1e-8:
+        mad = 1.0
+    z = (s - med) / mad
+    sig = 1.0 / (1.0 + np.exp(-0.85 * z))  # 0..1
+
+    # percentile rank 0..1 (stable ordering even when spread is tiny)
+    pr = _percentile_rank(s)
+
+    # blend rank + distance info
+    q = 0.6 * pr + 0.4 * sig
+    q[~np.isfinite(q)] = 0.5
+
+    # default quantile→score curve (tight top end)
+    if target_knots is None:
+        q_src = np.array([0.01, 0.05, 0.25, 0.50, 0.75, 0.90, 0.98, 0.995])
+        y_tgt = np.array([0.5,  1.5,  3.5,  5.0,  6.5,  8.0,  9.5,  9.9])
+    else:
+        q_src, y_tgt = target_knots
+
+    score = np.interp(q, q_src, y_tgt).clip(0.0, 10.0)
+
+    # small-field shrink toward neutral (reduces false elites)
+    if shrink_small_fields and n < 10:
+        w = max(0.0, min(0.5, (10 - n) / 10.0))  # up to 0.5 shrink
+        score = (1 - w) * score + w * 5.0
+
+    # auto-tighten if too many high scores (anti-inflation)
+    if np.mean(score >= 8.0) > 0.30:
+        y_tgt2 = y_tgt.copy()
+        y_tgt2[-3:] = [7.8, 9.0, 9.6]  # compress tail
+        score = np.interp(q, q_src, y_tgt2).clip(0.0, 10.0)
+
+    return pd.Series(score, index=series.index)
+
+# ---------- inputs ----------
+GR_COL   = metrics.attrs.get("GR_COL", "Grind")
+use_cols = ["Horse", "Accel", GR_COL, "tsSPI", "PI"]
+have = [c for c in use_cols if c in metrics.columns]
+if len(have) < 4:  # need at least Accel/Grind/tsSPI + Horse
+    st.warning("PWX/EFI: required columns missing. Need Horse, Accel, Grind/CG, tsSPI.")
 else:
-    df = metrics.loc[:, ["Horse", "Accel"]].copy()
+    df = metrics.loc[:, list(set(have))].copy()
+    df["Horse"] = df["Horse"].astype(str)
 
-    # Optional enhancers if present
-    if "tsSPI" in metrics.columns:
-        df["tsSPI"] = pd.to_numeric(metrics["tsSPI"], errors="coerce")
+    # Optionally enrich with V-Profile features if present (nice but not required)
+    # Look for TSI/Onset from your V-Profile block (if ran earlier in the script).
+    if "TSI" in globals() or ("TSI" in metrics.columns):
+        # Prefer VP table if you stored it as VP; else pull from metrics if it exists there
+        try:
+            source_TSI  = VP["TSI"]
+            source_ON   = VP.get("Onset_from_home_m", pd.Series(index=df.index))
+        except Exception:
+            source_TSI  = metrics.get("TSI", pd.Series(index=df.index))
+            source_ON   = metrics.get("Onset_from_home_m", pd.Series(index=df.index))
+        # align by Horse name
+        df = df.merge(
+            pd.DataFrame({
+                "Horse": getattr(source_TSI, "index", df.index) if "Horse" not in source_TSI.index.names else source_TSI.index,
+                "TSI_tmp": np.array(source_TSI),
+                "Onset_tmp": np.array(source_ON) if source_ON is not None else np.nan
+            }),
+            on="Horse", how="left"
+        )
     else:
-        df["tsSPI"] = np.nan
+        df["TSI_tmp"]   = np.nan
+        df["Onset_tmp"] = np.nan
 
-    # Prefer a real Vmax if your V-Profile block added it to metrics/VP and merged back.
-    # If not present, we’ll proxy from tsSPI.
-    if "Vmax_mps" in metrics.columns:
-        df["Vmax_mps"] = pd.to_numeric(metrics["Vmax_mps"], errors="coerce")
-    else:
-        df["Vmax_mps"] = np.nan
+    # Numeric clean
+    for c in [ "Accel", GR_COL, "tsSPI", "TSI_tmp", "Onset_tmp" ]:
+        if c in df.columns:
+            df[c] = _nz_num(df[c])
 
-    # Weight carried (optional; fall back to 60 kg if absent)
-    if "Weight Allocated" in metrics.columns:
-        w = pd.to_numeric(metrics["Weight Allocated"], errors="coerce").clip(lower=40, upper=65)
-    else:
-        w = pd.Series(60.0, index=df.index)
+    # ---------- RAW SIGNALS ----------
+    # Burst (PWX_raw): “how hard can you hit?”
+    # Components: Accel (burst), TSI (top-gear potential if available), earlier onset bonus
+    # All components auto-center using robust z before weighting.
+    def _robust_z(s):
+        s = _nz_num(s)
+        med = np.nanmedian(s); mad = _mad(s)
+        mad = mad if (np.isfinite(mad) and mad > 1e-8) else 1.0
+        return (s - med) / mad
 
-    # Core components (vectorised, no big copies)
-    accel = pd.to_numeric(df["Accel"], errors="coerce")
-    accel_delta = (accel - 100.0).clip(lower=0.0)              # only positive burst counts
+    z_acc   = _robust_z(df["Accel"])
+    z_tsi   = _robust_z(df["TSI_tmp"]) if "TSI_tmp" in df else 0.0
+    # Earlier onset (bigger metres-from-home) is better → use negative z to flip
+    z_onset = -_robust_z(df["Onset_tmp"]) if "Onset_tmp" in df else 0.0
 
-    # Speed ratio: prefer true Vmax vs field; else a light proxy via tsSPI (100 ~ field)
-    if df["Vmax_mps"].notna().any():
-        field_vmax = np.nanmedian(df["Vmax_mps"])
-        field_vmax = field_vmax if np.isfinite(field_vmax) and field_vmax > 0 else 1.0
-        speed_ratio = (df["Vmax_mps"] / field_vmax).clip(lower=0.85, upper=1.20)
-    else:
-        speed_ratio = (df["tsSPI"] / 100.0).clip(lower=0.85, upper=1.20).fillna(1.00)
+    # Weights: Accel carries most, TSI helpful when present, onset subtle
+    PWX_raw = 0.65*z_acc + 0.30*(z_tsi if np.isfinite(np.nanmean(z_tsi)) else 0.0) + 0.05*(z_onset if np.isfinite(np.nanmean(z_onset)) else 0.0)
 
-    # Weight normaliser — heavier weight damps burst; 60kg baseline
-    weight_norm = (60.0 / w).clip(lower=0.90, upper=1.30)
+    # Efficiency (EFI_raw): “how well do you travel for the speed you show?”
+    # Components: tsSPI (mid-race quality), Grind (late ability), smoothness (low |Accel-Grind|).
+    z_tsspi = _robust_z(df["tsSPI"])
+    z_gr    = _robust_z(df[GR_COL])
+    # smoothness: high when Accel≈Grind
+    sm_raw  = 1.0 - (df["Accel"] - df[GR_COL]).abs() / ( (df["Accel"] + df[GR_COL]).replace(0, np.nan) / 2.0 )
+    z_sm    = _robust_z(sm_raw)
 
-    # Raw PWX (unitless), then squash to 0..10 via robust percentile → logistic
-    pwx_raw = accel_delta * speed_ratio * weight_norm
+    EFI_raw = 0.45*z_tsspi + 0.35*z_gr + 0.20*z_sm
 
-    def _p01(x):
-        x = pd.to_numeric(x, errors="coerce")
-        med = np.nanmedian(x)
-        mad = np.nanmedian(np.abs(x - med))
-        mad = mad if (np.isfinite(mad) and mad > 0) else 1.0
-        z = (x - med) / mad
-        return (1.0 / (1.0 + np.exp(-0.9*z))).clip(0.0, 1.0)
+    # ---------- CALIBRATION to 0..10 ----------
+    df["PWX"] = _calibrate_0_10(PWX_raw)
+    df["EFI"] = _calibrate_0_10(EFI_raw)
 
-    df["PWX"] = (10.0 * _p01(pwx_raw)).round(2)
+    # ---------- tidy view ----------
+    out = df.loc[:, ["Horse", "PWX", "EFI"]].copy()
+    out = out.sort_values(["PWX","EFI"], ascending=[False, False]).reset_index(drop=True)
 
-    # Minimal view
-    st.dataframe(
-        df.loc[:, ["Horse", "PWX"]].sort_values("PWX", ascending=False).reset_index(drop=True),
-        use_container_width=True
-    )
+    st.dataframe(out, use_container_width=True)
 
-    st.caption("PWX ≈ (positive Accel above field) × (speed ratio) × (weight normaliser), then scaled 0–10.")
-# ======================= /Power Index (PWX) =======================
-
-# ======================= Energy Fade Index (EFI) — resilience of speed (0–10) =======================
-st.markdown("## Energy Fade Index (EFI) — early/late resilience")
-
-GR_COL = metrics.attrs.get("GR_COL", "Grind")
-
-need_cols = {"Horse", "Accel", GR_COL}
-missing = [c for c in need_cols if c not in metrics.columns]
-if missing:
-    st.info("EFI: missing required columns — " + ", ".join(missing))
-else:
-    df = metrics.loc[:, ["Horse", "Accel", GR_COL]].copy()
-    acc = pd.to_numeric(df["Accel"], errors="coerce")
-    grd = pd.to_numeric(df[GR_COL], errors="coerce")
-
-    # Positive efforts relative to field baseline (100)
-    e = (acc - 100.0).clip(lower=0.0)
-    l = (grd - 100.0).clip(lower=0.0)
-
-    # Fade ratio in [0, 1+]: how much the horse drops from early to late
-    # (higher fade = worse). If l >= e, fade can be 0 or negative → clamp at 0.
-    fade = ((e - l) / (e + l + 1e-6)).clip(lower=0.0)  # 0 = no fade / stronger late; →1 = total fade
-
-    # Convert to resilience (higher better), then scale 0..10 via robust percentile
-    resilience = 1.0 - fade  # 1 means perfect no-fade / late stronger
-    # Tiny tactical guard: if you have RSI/SCI, reduce penalty for proven fast-early races
-    RSI = float(metrics.attrs.get("RSI", 0.0))
-    SCI = float(metrics.attrs.get("SCI", 0.0))
-    if np.isfinite(RSI) and np.isfinite(SCI) and RSI < -0.6 and SCI >= 0.6:
-        resilience = (resilience * 1.03).clip(0.0, 1.2)  # small relief in brutal early pace
-
-    def _p01(x):
-        x = pd.to_numeric(x, errors="coerce")
-        med = np.nanmedian(x)
-        mad = np.nanmedian(np.abs(x - med))
-        mad = mad if (np.isfinite(mad) and mad > 0) else 1.0
-        z = (x - med) / mad
-        return (1.0 / (1.0 + np.exp(-0.9*z))).clip(0.0, 1.0)
-
-    df["EFI"] = (10.0 * _p01(resilience)).round(2)
-
-    st.dataframe(
-        df.loc[:, ["Horse", "EFI"]].sort_values("EFI", ascending=False).reset_index(drop=True),
-        use_container_width=True
-    )
-
-    st.caption("EFI ≈ 1 − fade, where fade measures early→late drop relative to field. Higher EFI = deeper tank / late strength.")
-# ======================= /Energy Fade Index (EFI) =======================
+    with st.expander("What these mean"):
+        st.write(
+            "- **PWX (burst/peak)**: field-calibrated measure of short-range punch (Accel-led), "
+            "optionally boosted by TSI (top speed potential) and earlier ‘onset’ of top speed.\n"
+            "- **EFI (sustain/efficiency)**: ability to travel efficiently for a long time — strong tsSPI, solid Grind, and smooth Accel↔Grind profile."
+        )
+# ======================= /PWX + EFI =======================
 
 # ======================= xWin — Probability to Win (100-replay view) =======================
 st.markdown("## xWin — Probability to Win")
