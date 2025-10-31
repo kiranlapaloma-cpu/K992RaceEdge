@@ -2400,32 +2400,26 @@ for c in cols_hh:
     if c not in hh.columns:
         hh[c] = np.nan
 
-# Tier order: Top first, then Notable, then blank
+# Tier order: put the best at the top
 tier_order = pd.CategoricalDtype(categories=["🔥 Top Hidden","🟡 Notable Hidden",""], ordered=True)
 hh["Tier"] = hh["Tier"].astype(tier_order)
 
 hh_view = hh[cols_hh].copy()
 hh_view = hh_view.sort_values(["Tier","HiddenScore","PI"], ascending=[True, False, False])
 
-# ---------- safe numeric casting & rounding (FIXES NameError) ----------
-def _to_num_series(col, idx):
-    if isinstance(col, pd.Series):
-        s = col
-    else:
-        arr = np.asarray(col)
-        arr = np.squeeze(arr)                   # drop (n,1)
-        if arr.ndim == 0:
-            return pd.Series(np.nan, index=idx)
-        s = pd.Series(arr, index=idx)
-    return pd.to_numeric(s, errors="coerce")
+# ---- Safe numeric casting & rounding (no helper, no NameError) ----
+def _cast_round(df, col):
+    if col not in df.columns:
+        return
+    # Make a 1-D Series aligned to df.index regardless of the source shape/type
+    s = pd.Series(np.ravel(df[col].values), index=df.index)
+    df[col] = pd.to_numeric(s, errors="coerce").round(2)
 
-view = hh_view.copy()                           # <— define 'view' BEFORE using it
-for c in ["PI","GCI","ASI2","SOS","TFS","UEI","Accel",gr_col,"tsSPI"]:
-    if c in view.columns:
-        view[c] = _to_num_series(view[c], view.index).round(2)
+for c in ["PI","GCI","ASI2","SOS","TFS","UEI","Accel",gr_col,"tsSPI","HiddenScore"]:
+    _cast_round(hh_view, c)
 
-st.dataframe(view, use_container_width=True)
-st.caption("Hidden Horses v2 — sorted by Tier, HiddenScore, then PI (Top first).")
+st.dataframe(hh_view, use_container_width=True)
+st.caption("Hidden Horses v2 — sorted by Tier, then HiddenScore, then PI (Top first).")
 
 # ======================= V-Profile — Top Speed & Sustain (0–10) =======================
 st.markdown("## V-Profile — Top Speed & Sustain")
