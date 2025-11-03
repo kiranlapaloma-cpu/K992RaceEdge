@@ -2452,14 +2452,69 @@ def _ema(series, alpha=0.35):
         out.append(prev)
     return pd.Series(out, index=series.index)
 
-def _dist_weights(dm):
-    # blend weight of TopSpeed (TSI) vs Sustain (SSI) → sum 1.0
-    if not np.isfinite(dm):
-        return 0.50, 0.50
-    if dm <= 1200:    return 0.65, 0.35
-    if dm >= 1800:    return 0.35, 0.65
-    t = _clip((dm-1200.0)/(1800.0-1200.0), 0.0, 1.0)
-    w_tsi = 0.65*(1-t) + 0.35*t
+def _dist_weights(dm, rsi=None, sci=None, straight_frac=None):
+    """
+    Blend weights for Top-Speed (TSI) vs Sustain (SSI). Returns (w_tsi, w_ssi) summing to 1.0.
+    - dm: race distance in metres.
+    - rsi: Race Shape Index (+ = early tailwind / front-biased; − = late-biased). Use your app's RSI.
+    - sci: Shape Clarity Index in [0..1] (how confident the shape is). Use 0.5 if unknown.
+    - straight_frac: fraction of race that is 'home straight' (e.g., 0.28 for ~340m of a 1200m).
+                     Use None if unknown.
+    """
+    def _clip(x, lo=0.0, hi=1.0):
+        return hi if x>hi else (lo if x<lo else x)
+
+    # ---------- 1) Base distance curve (piecewise, monotone) ----------
+    # Knots reflect that the shift from TSI→SSI is quickest 1400–1800, then tapers.
+    #        dist :   1000  1200  1400  1600  1800  2000  2200  2400  2800+
+    #   base wTSI :   0.72  0.68  0.58  0.50  0.44  0.40  0.37  0.35   0.32
+    if not (isinstance(dm, (int, float)) and dm>0):
+        w_tsi = 0.50
+    elif dm <= 1000:
+        w_tsi = 0.72
+    elif dm <= 1200:
+        t = (dm-1000)/(1200-1000); w_tsi = 0.72*(1-t) + 0.68*t
+    elif dm <= 1400:
+        t = (dm-1200)/(1400-1200); w_tsi = 0.68*(1-t) + 0.58*t
+    elif dm <= 1600:
+        t = (dm-1400)/(1600-1400); w_tsi = 0.58*(1-t) + 0.50*t
+    elif dm <= 1800:
+        t = (dm-1600)/(1800-1600); w_tsi = 0.50*(1-t) + 0.44*t
+    elif dm <= 2000:
+        t = (dm-1800)/(2000-1800); w_tsi = 0.44*(1-t) + 0.40*t
+    elif dm <= 2200:
+        t = (dm-2000)/(2200-2000); w_tsi = 0.40*(1-t) + 0.37*t
+    elif dm <= 2400:
+        t = (dm-2200)/(2400-2200); w_tsi = 0.37*(1-t) + 0.35*t
+    elif dm <= 2800:
+        t = (dm-2400)/(2800-2400); w_tsi = 0.35*(1-t) + 0.32*t
+    else:
+        w_tsi = 0.32
+
+    # ---------- 2) Race shape nudge (bounded, symmetric) ----------
+    # Strong fast-early (RSI<<0 with clear SCI) → shift toward SSI.
+    # Crawl/slow-early (RSI>>0 with clear SCI) → shift toward TSI.
+    # Nudges are small so they don’t overwhelm distance.
+    sci = 0.5 if (sci is None or not np.isfinite(sci)) else float(_clip(sci, 0.0, 1.0))
+    if rsi is None or not np.isfinite(rsi) or abs(rsi) < 1e-6:
+        shape_nudge = 0.0
+    else:
+        # Scale RSI into [-1, +1] softly; cap the effect.
+        r = float(np.tanh(rsi/2.0))     # smooth compression
+        max_nudge = 0.06 * (0.5 + 0.5*sci)  # up to ±6% when clarity is high
+        shape_nudge = (-r) * max_nudge      # negative RSI (late/fast-early) → reduce w_tsi
+
+    # ---------- 3) Configuration nudge (home-straight fraction) ----------
+    # Short home straight → slightly more SSI (harder to launch late).
+    # Long home straight → slightly more TSI (top gear matters a touch more).
+    cfg_nudge = 0.0
+    if straight_frac is not None and np.isfinite(straight_frac):
+        s = float(_clip(straight_frac, 0.15, 0.45))   # most courses sit ~0.20–0.40
+        # Center at 0.30, shallow slope, small cap ±3%
+        cfg_nudge = (s - 0.30) * 0.20   # ≈ ±0.02–0.03 typical
+
+    # ---------- 4) Combine & renormalize ----------
+    w_tsi = _clip(w_tsi + shape_nudge + cfg_nudge, 0.20, 0.80)
     w_ssi = 1.0 - w_tsi
     return w_tsi, w_ssi
 
