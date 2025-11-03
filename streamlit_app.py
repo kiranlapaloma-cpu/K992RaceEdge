@@ -2585,33 +2585,226 @@ VP["Vmax_kmph"] = pd.to_numeric(VP["Vmax_mps"], errors="coerce") * 3.6
 TSI_raw = _percentile01(VP["Vmax_mps"])
 TSI = (TSI_raw * (1.0 - trim_V)).clip(0.0, 1.0)
 
-# ---------- Improved SSI (core of V-Profile) ----------
-# Normalise sustain duration & distance by race scale
-rt = pd.to_numeric(VP["RaceTime_s"], errors="coerce")
-dur_rel = np.nan_to_num(VP["Sustain_s"] / (rt + 1e-6))
-dst_rel = np.nan_to_num(VP["Sustain_m"] / max(D_m, 1.0))
+# ---------- SSI (shape-aware) — drop-in replacement ----------
 
-dur01 = _percentile01(dur_rel)
-dst01 = _percentile01(dst_rel)
+# --- tiny helpers (local-only; RAM-friendly) ---
+def _mad(x):
+    x = pd.to_numeric(x, errors="coerce").to_numpy(dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size == 0: return np.nan
+    med = np.median(x)
+    return np.median(np.abs(x - med))
 
-# Efficiency = how much "AUC" per second (not total AUC)
-eff = np.nan_to_num(VP["AUC_90_100"] / (VP["Sustain_s"] + 1e-6))
-eff01 = _percentile01(eff)
+def _p(vec, q):
+    v = pd.to_numeric(vec, errors="coerce").to_numpy(dtype=float)
+    v = v[np.isfinite(v)]
+    return float(np.percentile(v, q)) if v.size else np.nan
 
-# Smoothness = steadiness across Accel/Grind
-acc = pd.to_numeric(VP.get("Accel"), errors="coerce")
-grd = pd.to_numeric(VP.get(GR_COL), errors="coerce")
-den = (acc.add(grd, fill_value=0)/2).replace(0, np.nan)
-sm_raw = 1.0 - (acc - grd).abs() / den
-sm01 = _percentile01(sm_raw.fillna(np.nanmedian(sm_raw)))
+def _rz(series):
+    s = pd.to_numeric(series, errors="coerce")
+    mu = np.nanmedian(s)
+    mad = _mad(s)
+    sd = 1.4826*mad if (np.isfinite(mad) and mad>0) else np.nanstd(s)
+    if not np.isfinite(sd) or sd <= 0: sd = 1.0
+    return (s - mu) / sd
 
-# Onset = earlier sustain → higher score
-on_bonus = pd.Series(0.0, index=VP.index)
-if np.isfinite(VP["Onset_from_home_m"]).any():
-    on01 = 1.0 - _percentile01(VP["Onset_from_home_m"])
-    on_bonus = 0.08 * on01
+def _percentile01(series):
+    s = pd.to_numeric(series, errors="coerce")
+    med = np.nanmedian(s)
+    mad = _mad(s)
+    mad = mad if (np.isfinite(mad) and mad>0) else 1.0
+    z = (s - med)/(1.4826*mad)
+    # squash to 0..1
+    return (1.0/(1.0 + np.exp(-0.8*z))).clip(0.0, 1.0)
 
-SSI = (0.38*dur01 + 0.25*dst01 + 0.20*eff01 + 0.12*sm01 + on_bonus).clip(0.0, 1.0)
+# --- collect split-time columns in *forward* (early→late) order ---
+time_cols = [c for c in VP.columns if isinstance(c, str) and c.endswith("_Time")]
+def _key(c):
+    try: return int(c.split("_")[0])
+    except: return 10**9
+time_cols = sorted(time_cols, key=_key)   # e.g., 1400_Time, 1300_Time, ..., Finish_Time handled below
+
+# Always add Finish if present
+if "Finish_Time" in VP.columns and "Finish_Time" not in time_cols:
+    time_cols.append("Finish_Time")
+
+if len(time_cols) < 3:
+    # fallback to your existing SSI (keep your old few lines here if you want)
+    # to avoid breaking when splits are too thin
+    dur_rel = np.nan_to_num(VP["Sustain_s"] / (pd.to_numeric(VP["RaceTime_s"], errors="coerce") + 1e-6))
+    dst_rel = np.nan_to_num(VP["Sustain_m"] / max(float(D_m), 1.0))
+    eff     = np.nan_to_num(VP["AUC_90_100"] / (VP["Sustain_s"] + 1e-6))
+    SSI = (0.38*_percentile01(dur_rel) + 0.25*_percentile01(dst_rel)
+           + 0.20*_percentile01(eff) + 0.12*_percentile01(1.0) ).clip(0.0,1.0)
+else:
+    # --- build per-segment speeds (m/s) & field bands (median, P75) ---
+    seg_len = []
+    for i in range(len(time_cols)):
+        # segment length: STEP for normal splits; if first seg is shorter (non-200/100 race), infer from labels if you have it
+        seg_len.append(float(STEP if time_cols[i] != "Finish_Time" else STEP))
+
+    # speed matrix (rows = horses, cols = segments)
+    spd = np.full((len(VP), len(time_cols)), np.nan, dtype=float)
+    for j, col in enumerate(time_cols):
+        t = pd.to_numeric(VP[col], errors="coerce").to_numpy(dtype=float)
+        t = np.where((t>0) & np.isfinite(t), t, np.nan)
+        L = seg_len[j]
+        spd[:, j] = np.where(np.isfinite(t), L / t, np.nan)
+
+    # light smoothing (3-pt median) to quell one-tick spikes — vectorized
+    sm = pd.DataFrame(spd).rolling(3, axis=1, center=True, min_periods=1).median().to_numpy()
+
+    # field bands per segment
+    field_med = np.nanmedian(sm, axis=0)
+    field_p75 = np.nanpercentile(sm, 75, axis=0)
+
+    # --- shape detection (RSI/SCI or proxy) ---
+    RSI_val = float(RSI) if pd.notna(RSI) else np.nan
+    SCI_val = float(SCI) if pd.notna(SCI) else np.nan
+    if not np.isfinite(RSI_val) or not np.isfinite(SCI_val):
+        # proxy from early vs late averages
+        mid_ix = len(time_cols)//2
+        early_blk = sm[:, max(0, mid_ix-3):mid_ix]     # a few splits before trough
+        late_blk  = sm[:, mid_ix:min(len(time_cols), mid_ix+3)]
+        RSI_val = float(np.nanmean(np.nanmean(early_blk,axis=1) - np.nanmean(late_blk,axis=1)))  # >0 = early tilt
+        SCI_val = 0.5
+
+    dir_sign = 0 if (not np.isfinite(RSI_val) or abs(RSI_val) < 1e-6) else (1 if RSI_val > 0 else -1)
+    FS = 0.0 if dir_sign == 0 else (0.6 + 0.4 * max(0.0, min(1.0, SCI_val))) * min(1.0, abs(RSI_val)/2.0)
+
+    # --- dynamic thresholds by segment (tau) ---
+    # base tau per window (fast-early lowers early threshold; slow-early lowers home threshold)
+    n = len(time_cols)
+    thirds = [range(0, n//3), range(n//3, 2*n//3), range(2*n//3, n)]   # EARLY, MID, HOME indices
+
+    tau = np.full(n, 0.95, dtype=float)  # default 95%
+    if dir_sign == 1:        # fast-early
+        for k in thirds[0]: tau[k] = 0.92
+        for k in thirds[1]: tau[k] = 0.94
+        for k in thirds[2]: tau[k] = 0.96
+    elif dir_sign == -1:     # slow-early / sprint-home
+        for k in thirds[0]: tau[k] = 0.95
+        for k in thirds[1]: tau[k] = 0.95
+        for k in thirds[2]: tau[k] = 0.93
+
+    # bend-aware nudge: the middle third is often turn-heavy on around-the-bend trips
+    if D_m >= 1200:
+        for k in thirds[1]: tau[k] = max(0.90, tau[k] - 0.01)  # slightly easier to “count” sustain on the turn
+
+    # late-collapse guard: if field late P10 << mid median, cap HOME impact later
+    late_band = np.nanpercentile(sm[:, thirds[2]], 10)
+    mid_band  = np.nanmedian(sm[:, thirds[1]])
+    collapse_guard = 1.0
+    if np.isfinite(late_band) and np.isfinite(mid_band) and (late_band < 0.94 * mid_band):
+        collapse_guard = 0.85  # dampen home overweighting in true collapses
+
+    # --- per-horse sustain windows using field-relative band ---
+    # A segment counts as "near-top" if: speed >= tau_seg * max(own_vmax_seg, field_p75_seg)
+    vmax = np.nanmax(sm, axis=1)  # per-horse overall vmax (smoothed)
+    vmax = np.where(np.isfinite(vmax) & (vmax>0), vmax, np.nan)
+
+    # compute “qualify” matrix (bool) with hysteresis (1 split forgiveness)
+    qualify = np.zeros_like(sm, dtype=bool)
+    for i in range(len(VP)):
+        vi = vmax[i]
+        if not np.isfinite(vi) or vi <= 0: 
+            continue
+        thresh = tau * np.maximum(vi, field_p75)  # race-aware threshold
+        qualify[i, :] = sm[i, :] >= thresh
+
+        # hysteresis: allow one-gap stitches
+        q = qualify[i, :].copy()
+        for j in range(1, n-1):
+            if not q[j] and q[j-1] and q[j+1]:
+                q[j] = True
+        qualify[i, :] = q
+
+    # measure Depth (max uninterrupted seconds), Breadth (total seconds; sqrt diminishing returns),
+    # Smoothness (1 - CV) within the longest window, and Onset vs MoveZone
+    depth_s = np.zeros(len(VP)); breadth_s = np.zeros(len(VP))
+    smooth_s = np.zeros(len(VP)); onset_bonus = np.zeros(len(VP))
+
+    # Move Zone: where field median begins a sustained rise after its trough
+    med_curve = field_med
+    # simple trough->rise detector
+    trough_k = int(np.nanargmin(med_curve)) if np.isfinite(np.nanmin(med_curve)) else n//2
+    rise_start = trough_k
+    for j in range(trough_k+1, n):
+        if np.isfinite(med_curve[j]) and np.isfinite(med_curve[j-1]) and (med_curve[j] > med_curve[j-1]*1.01):
+            rise_start = j; break
+
+    # window weights by shape (soft, renormalized below)
+    w_seg = np.ones(n, dtype=float)
+    if dir_sign != 0:
+        for k in thirds[0]: w_seg[k] *= (1.0 - 0.2*FS)     # early de-emphasis with stronger shape
+        for k in thirds[2]: w_seg[k] *= (1.0 + 0.3*FS)*collapse_guard
+    # normalize
+    w_seg /= max(1e-9, np.nansum(w_seg))
+
+    for i in range(len(VP)):
+        q = qualify[i, :]
+        if not q.any():
+            depth_s[i] = 0.0; breadth_s[i] = 0.0; smooth_s[i] = 0.0; onset_bonus[i] = 0.0
+            continue
+
+        # contiguous runs
+        best_len = 0; best_i0 = -1; cur_len = 0; cur_i0 = -1
+        total_len = 0.0
+        for j in range(n):
+            if q[j]:
+                if cur_len == 0: cur_i0 = j
+                cur_len += 1
+                total_len += seg_len[j]
+                if cur_len > best_len:
+                    best_len = cur_len; best_i0 = cur_i0
+            else:
+                cur_len = 0
+
+        # seconds & diminishing returns for breadth
+        depth_sec   = float(np.nansum([seg_len[j] for j in range(best_i0, best_i0+best_len)]) if best_len>0 else 0.0)
+        breadth_sec = float(np.nansum([seg_len[j] for j in range(n) if q[j]]))
+        depth_s[i]   = depth_sec
+        breadth_s[i] = np.sqrt(max(0.0, breadth_sec))    # diminishing returns
+
+        # smoothness inside longest window (1 - CV)
+        if best_len > 0:
+            w_slice = sm[i, best_i0:best_i0+best_len]
+            mu = np.nanmean(w_slice)
+            sd = np.nanstd(w_slice)
+            cv = (sd/mu) if (np.isfinite(mu) and mu>0) else 0.0
+            smooth_s[i] = max(0.0, 1.0 - cv)
+        else:
+            smooth_s[i] = 0.0
+
+        # onset vs Move Zone (earlier than rise_start gets a modest bonus in slow-early; 
+        # later than rise_start that *bridges to home* gets modest bonus in fast-early)
+        if best_len > 0:
+            start_idx = best_i0
+            if dir_sign == -1:     # sprint-home shape
+                onset_bonus[i] = 0.08 * max(0.0, (rise_start - start_idx) / max(1, n))
+            elif dir_sign == 1:    # fast-early shape
+                # reward windows starting around/after rise_start and extending into HOME
+                reach_home = (best_i0 + best_len - 1) >= thirds[2].start
+                onset_bonus[i] = 0.08 * (1.0 if reach_home and start_idx >= rise_start-1 else 0.0)
+            else:
+                onset_bonus[i] = 0.04 * max(0.0, (rise_start - start_idx) / max(1, n))
+
+    # normalize depth/breadth/smoothness race-locally to 0..1 with robust scaling
+    depth01   = _percentile01(depth_s)
+    breadth01 = _percentile01(breadth_s)
+    smooth01  = _percentile01(smooth_s)
+
+    # distance-aware emphasis
+    if D_m <= 1200:    w_depth, w_breadth = 0.55, 0.30
+    elif D_m <= 1800:  w_depth, w_breadth = 0.45, 0.40
+    else:              w_depth, w_breadth = 0.35, 0.50
+
+    # final SSI in 0..1
+    SSI = (w_depth*depth01 + w_breadth*breadth01 + 0.15*smooth01 + onset_bonus).clip(0.0, 1.0)
+
+# Persist back into VP the scaled/rounded SSI (0..100)
+VP["SSI"] = (100.0 * SSI).round(1)
+# ---------- /SSI (shape-aware) ----------
 
 # Optional shape modulation
 if np.isfinite(RSI) and np.isfinite(SCI) and SCI >= 0.5:
