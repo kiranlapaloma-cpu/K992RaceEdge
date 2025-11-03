@@ -1733,9 +1733,7 @@ else:
         df["RanAbove_lb"] = df["RanAbove_kg"] * 2.20462262
         # --- Convert RanAbove to Merit Rating scale ---
         df["RanAbove_MR"] = df["RanAbove_lb"] * 0.908
-        # optional rounding
-        df["RanAbove_MR"] = df["RanAbove_MR"].round(2)
-
+        
         # 6) Friendly view
         view = df.copy()
         view = view.rename(columns={
