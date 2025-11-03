@@ -2942,27 +2942,6 @@ for c in cols:
 vp_view = VP[cols].sort_values("VComposite_Power", ascending=False)
 st.dataframe(vp_view, use_container_width=True)
 st.caption("V-Composite: 0.70×TSI + 0.30×SSI · Power-aware version boosts SSI by Vmax/median(Vmax).")
-st.dataframe(VP_view, use_container_width=True)
-
-# --------- concise per-horse lines ----------
-with st.expander("V-Profile — quick takes"):
-    for _, r in VP_view.iterrows():
-        name = str(r.get("Horse","")).strip()
-        vp   = float(r.get("VProfile",0.0))
-        tsi  = float(r.get("TSI",0.0))
-        ssi  = float(r.get("SSI",0.0))
-        vmax = float(r.get("Vmax (km/h)", np.nan))   # ✅ fix #3 (unit label)
-        sus  = float(r.get("Sustain (s ≥~95%)", 0.0))
-        flag = str(r.get("Flags",""))
-        parts = [f"{name}: {vp:.2f}/10", f"TSI {tsi:.0f}, SSI {ssi:.0f}"]
-        if np.isfinite(vmax):
-            parts.append(f"Vmax ~{vmax:.1f} km/h")
-        if sus >= 0.4:
-            parts.append(f"{sus:.1f}s near-top")
-        if flag:
-            parts.append(f"[{flag}]")
-        st.write("• " + " — ".join(parts))
-
 
 st.caption(
     "V-Profile = distance/going-aware blend of Top-Speed Index (TSI) and Sustain Index (SSI). "
