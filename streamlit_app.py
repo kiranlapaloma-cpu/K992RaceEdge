@@ -1648,63 +1648,127 @@ st.caption(
 )
 # ======================= /PI ↔ Lengths + KG ↔ PI =======================
 
-# ======================= Ahead of Handicap (Single-Race, Field-Aware) =======================
-st.markdown("## Ahead of Handicap — Single Race Field Context")
+# ======================= Ahead of the Handicap — One-Run Weight Intelligence =======================
+st.markdown("## Ahead of the Handicap — One-Run (Race-local)")
 
-AH = metrics.copy()
-# Safety: ensure required columns exist
-for c in ["PI","Accel",GR_COL,"Finish_Pos","Horse"]:
-    if c not in AH.columns:
-        AH[c] = np.nan
+# ---- Safe helpers (local, conflict-free) ----
+def _as_num(s):
+    return pd.to_numeric(s, errors="coerce")
 
-pi_rs = AH["PI"].clip(lower=0.0, upper=10.0)
-med   = float(np.nanmedian(pi_rs))
-sigma = mad_std(pi_rs - med)
-sigma = 0.90 if (not np.isfinite(sigma) or sigma < 0.90) else sigma
+def _field_corr(x, y):
+    x = _as_num(x); y = _as_num(y)
+    df = pd.DataFrame({"x": x, "y": y}).dropna()
+    if len(df) < 6:  # tiny fields → correlation not reliable
+        return np.nan
+    c = df["x"].corr(df["y"])
+    try:
+        return float(c) if np.isfinite(c) else np.nan
+    except Exception:
+        return np.nan
 
-# 2) Sample-size shrink for small/odd fields
-N     = int(pi_rs.notna().sum())
-alpha = N / (N + 6.0)  # → ~0.63 at N=10; ~0.4 at N=4
+def _beta_base(distance_m: float) -> float:
+    """Baseline PI-per-kg by trip; conservative, race-agnostic."""
+    d = float(distance_m)
+    if d <= 1200: return 0.30
+    if d <= 1600: return 0.35
+    if d <= 2000: return 0.40
+    if d <= 2400: return 0.45
+    return 0.50
 
-# 3) Field-shape influence (devoid of weight/handicap; uses only this race)
-#    Reward balance late; softly reduce if very skewed (helps dampen fluky “shape gifts”).
-bal          = 100.0 - (pd.to_numeric(AH["Accel"], errors="coerce") - pd.to_numeric(AH[GR_COL], errors="coerce")).abs() / 2.0
-AH["_BAL"]   = bal
-# Map BAL to a small multiplier in [0.92, 1.05]
-AH["_FSI"]   = (0.92 + (AH["_BAL"] - 95.0) / 100.0).clip(0.92, 1.05)
+def _shape_adjust(beta: float, rsi: float, sci: float) -> float:
+    """Light-touch modulation by race shape (one-run safe)."""
+    if np.isfinite(rsi) and np.isfinite(sci) and sci >= 0.5:
+        if rsi < -0.6:  # fast-early
+            beta *= 1.10
+        elif rsi > 0.6: # slow-early
+            beta *= 0.90
+    return beta
 
-# 4) z’s and final AHS 0–10 scale
-z_raw        = (pi_rs - med) / sigma
-AH["z_clean"]= alpha * z_raw
-AH["z_FA"]   = AH["z_clean"] * AH["_FSI"]
-AH["AHS"]    = (5.0 + 2.2 * AH["z_FA"]).clip(0.0, 10.0).round(2)
+# ---- Inputs / guards ----
+weight_col_candidates = ["Weight Allocated", "Weight", "Carried", "Carried_kg"]
+weight_col = next((c for c in weight_col_candidates if c in metrics.columns), None)
 
-# 5) Tiers + Confidence (field size)
-def ah_tier(v):
-    if not np.isfinite(v): return ""
-    if v >= 7.20: return "🏆 Dominant"
-    if v >= 6.20: return "🔥 Clear Ahead"
-    if v >= 5.40: return "🟢 Ahead"
-    if v <= 4.60: return "🔻 Behind"
-    return "⚪ Neutral"
+need_cols = {"Horse", "PI"}
+if weight_col: need_cols.add(weight_col)
+missing = [c for c in need_cols if c not in metrics.columns]
 
-def ah_conf(n):
-    if n >= 12: return "High"
-    if n >= 8:  return "Med"
-    return "Low"
+if missing:
+    st.warning("Ahead of the Handicap: missing columns → " + ", ".join(missing))
+else:
+    df = metrics.loc[:, ["Horse", "PI", weight_col]].copy()
+    df["PI"] = _as_num(df["PI"])
+    df[weight_col] = _as_num(df[weight_col])
+    df = df.dropna(subset=["PI", weight_col])
+    if df.empty:
+        st.info("No valid PI/weight rows to evaluate.")
+    else:
+        # Distance & shape inputs (safe defaults)
+        D_m  = float(race_distance_input)
+        RSI  = float(metrics.attrs.get("RSI", np.nan))
+        SCI  = float(metrics.attrs.get("SCI", np.nan))
 
-AH["AH_Tier"]       = AH["AHS"].map(ah_tier)
-AH["AH_Confidence"] = ah_conf(N)
+        # 1) Baseline slope (PI per kg)
+        beta0 = _beta_base(D_m)
 
-# 6) Display table (sorted by AHS then finish)
-ah_cols = ["Horse","Finish_Pos","PI","AHS","AH_Tier","AH_Confidence","z_FA","_FSI"]
-for c in ah_cols:
-    if c not in AH.columns: AH[c] = np.nan
+        # 2) Race-local realism: how much did weight correlate with performance here?
+        #    Use magnitude of correlation as a realism knob, damped for tiny fields.
+        corr_w_pi = _field_corr(df[weight_col], df["PI"])
+        n = df["PI"].notna().sum()
+        tiny_dampen = 0.0 if n < 6 else min(1.0, (n - 5) / 7.0)  # ramps in from n=6 to ~n=12
+        corr_mag = 0.0 if not np.isfinite(corr_w_pi) else abs(corr_w_pi)
 
-AH_view = AH.sort_values(["AHS","Finish_Pos"], ascending=[False, True])[ah_cols]
-st.dataframe(AH_view, use_container_width=True)
-st.caption("AH = Ahead-of-Handicap (single race). Centre = trimmed median PI; spread = MAD σ; FSI mildly rewards late balance.")
-# ======================= End Ahead of Handicap =======================
+        # Blend: mostly baseline, plus up to +40% from race-local signal (scaled by field size)
+        beta_local = beta0 * (1.0 + 0.40 * corr_mag * tiny_dampen)
+
+        # 3) Shape modulation (light touch)
+        beta_eff = _shape_adjust(beta_local, RSI, SCI)
+
+        # 4) Safety rails (avoid crazy kg if β too tiny or huge)
+        beta_eff = float(np.clip(beta_eff, 0.22, 0.70))  # keep within realistic PI/kg bounds
+
+        # 5) Convert each horse’s PI to ΔPI vs field median, then to kg & lb
+        PI_med = float(np.nanmedian(df["PI"]))
+        df["ΔPI_vs_med"] = df["PI"] - PI_med
+        df["RanAbove_kg"] = df["ΔPI_vs_med"] / beta_eff
+        df["RanAbove_lb"] = df["RanAbove_kg"] * 2.20462262
+
+        # 6) Friendly view
+        view = df.copy()
+        view = view.rename(columns={
+            weight_col: "Wt (kg)"
+        })
+        view["β_eff (PI/kg)"] = beta_eff
+        view = view[["Horse", "Wt (kg)", "PI", "ΔPI_vs_med", "RanAbove_kg", "RanAbove_lb", "β_eff (PI/kg)"]]
+        view = view.sort_values("RanAbove_kg", ascending=False)
+
+        # Round for display only (keep raw in df if you need later)
+        for c in ["Wt (kg)", "PI", "ΔPI_vs_med", "RanAbove_kg", "RanAbove_lb", "β_eff (PI/kg)"]:
+            view[c] = pd.to_numeric(view[c], errors="coerce").round(2)
+
+        st.dataframe(view, use_container_width=True)
+
+        # Key readout + tiny legend
+        colA, colB, colC = st.columns([1,1,1])
+        with colA:
+            st.metric("Field median PI", f"{PI_med:.2f}")
+        with colB:
+            corr_str = "n/a" if not np.isfinite(corr_w_pi) else f"{corr_w_pi:+.2f}"
+            st.metric("Weight↔PI correlation (|r| used)", corr_str)
+        with colC:
+            st.metric("β_eff (this race)", f"{beta_eff:.2f} PI per kg")
+
+        st.caption(
+            "Interpretation: **RanAbove (kg)** estimates how many kilograms a horse effectively ran above/below the "
+            "field median, *within this single race*. Positive = ran as if it could carry more and still match median. "
+            "Slope (β_eff) is distance-based, gently adjusted by (i) how weight correlated with PI in this field and "
+            "(ii) race shape (fast-early increases weight bite; slow-early reduces it)."
+        )
+
+        # Optional CSV download (small footprint)
+        csv_bytes = view.to_csv(index=False).encode("utf-8")
+        st.download_button("Download Ahead-of-Handicap table (CSV)", csv_bytes,
+                           file_name="ahead_of_handicap_one_run.csv", mime="text/csv", use_container_width=True)
+# ======================= /Ahead of the Handicap =======================
 # ======================= End of Batch 2 =======================
 
 # ======================= Batch 3 — Visuals + Hidden v2 + Ability v2 =======================
