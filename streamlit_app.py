@@ -3101,203 +3101,188 @@ else:
     st.dataframe(out,use_container_width=True)
 # ======================= /PWX + EFI =======================
 
-# ======================= R&V — Repeatability & Volatility (within-race) =======================
-st.markdown("## Repeatability & Volatility (R&V) — Reliability of the run")
+# ======================= R&V (CAR) — Context-Aware Reliability =======================
+st.markdown("## R&V — Context-Aware Reliability (CAR)")
 
-# --------- Small local helpers (robust & lightweight) ----------
-def _as_num(x):
+import numpy as np
+import pandas as pd
+
+df = metrics.copy()
+
+# ---------- Small robust helpers ----------
+def _nz(x, alt=0.0):
     try:
         v = float(x)
-        return v if np.isfinite(v) else np.nan
+        return v if np.isfinite(v) else alt
     except Exception:
-        return np.nan
+        return alt
 
-def _mad_std(x):
-    """MAD→sigma (robust). x is 1D array-like."""
+def _winsor(s: pd.Series, q: float = 0.02):
+    s = pd.to_numeric(s, errors="coerce")
+    lo, hi = s.quantile(q), s.quantile(1 - q)
+    return s.clip(lo, hi)
+
+def _mad(x: np.ndarray):
     x = np.asarray(x, dtype=float)
     x = x[np.isfinite(x)]
-    if x.size == 0:
-        return np.nan
+    if x.size == 0: return np.nan
     med = np.median(x)
     mad = np.median(np.abs(x - med))
-    return 1.4826 * mad if mad > 0 else (np.std(x) if x.size > 1 else np.nan)
+    return 1.4826 * mad
 
-def _collect_split_cols(df):
-    """Find *_Time columns, return sorted numeric markers (e.g., [1200,1100,...]) and has_finish flag."""
-    cols = [c for c in df.columns if isinstance(c, str) and c.endswith("_Time")]
-    marks = []
-    for c in cols:
-        head = c.split("_")[0]
+def _robust01(s: pd.Series):
+    """Percentile rank 0–1 using median/MAD for stability."""
+    s = pd.to_numeric(s, errors="coerce")
+    finite = s[np.isfinite(s)]
+    if finite.empty:
+        return pd.Series(0.5, index=s.index)
+    # rank to 0..1
+    r = finite.rank(method="average", pct=True)
+    out = pd.Series(np.nan, index=s.index)
+    out.loc[finite.index] = r
+    return out.fillna(0.5)
+
+# ---------- If MV / RC not present, compute light versions from splits (exclude first) ----------
+have_MV = "MV" in df.columns
+have_RC = "RC" in df.columns
+
+def _collect_time_cols(_work: pd.DataFrame):
+    # Any '*_Time' plus optional 'Finish_Time'
+    tcols = [c for c in _work.columns if c.endswith("_Time")]
+    # order columns by numeric end marker; keep Finish at the end
+    def _key(c):
+        if c == "Finish_Time": return (10**9)
         try:
-            m = int(head)
-            marks.append(m)
+            return int(c.split("_")[0])
         except Exception:
-            pass
-    marks = sorted(set(marks), reverse=True)  # e.g., [1500,1400,...,100]
-    return marks, ("Finish_Time" in df.columns)
+            return 10**8
+    tcols = sorted([c for c in tcols if c != "Finish_Time"], key=_key) + (["Finish_Time"] if "Finish_Time" in _work.columns else [])
+    return tcols
 
-def _build_segments(df, distance_m, step_m):
-    """Create segment list [(label, length_m, source_col)] from available columns."""
-    marks, has_fin = _collect_split_cols(df)
-    segs = []
-    if marks:
-        m1 = int(marks[0])
-        L0 = max(1.0, float(distance_m) - float(m1))
-        if f"{m1}_Time" in df.columns:
-            segs.append((f"{int(distance_m)}→{m1}", L0, f"{m1}_Time"))
-        for a, b in zip(marks, marks[1:]):
-            src = f"{int(b)}_Time"
-            if src in df.columns:
-                segs.append((f"{int(a)}→{int(b)}", float(a - b), src))
-    if has_fin:
-        fin_len = 100.0 if int(step_m) == 100 else 200.0
-        segs.append((f"{int(step_m)}→0 (Finish)", fin_len, "Finish_Time"))
-    return segs
+if not (have_MV and have_RC):
+    # Build per-horse segment speeds (m/s) from times.
+    step = int(metrics.attrs.get("STEP", 100))
+    tcols = _collect_time_cols(work)
+    # exclude the first split to avoid start noise
+    seg_cols = tcols[1:] if len(tcols) > 1 else tcols[:]
+    # guard
+    if len(seg_cols) >= 3:
+        # Compute speeds per segment length
+        seg_lens = []
+        for c in seg_cols:
+            if c == "Finish_Time":
+                seg_lens.append(float(step))
+            else:
+                # infer length from column gap; safe default = step
+                seg_lens.append(float(step))
+        seg_lens = np.asarray(seg_lens, dtype=float)
 
-# --------- Preconditions ----------
-if ("Horse" not in work.columns) or (len(work) == 0):
-    st.info("R&V: no horses to evaluate.")
+        # Make a small speed matrix (rows=horses, cols=segments)
+        # Join by horse where possible
+        w = work.copy()
+        if "Horse" in w.columns and "Horse" in df.columns:
+            w = w.set_index("Horse").reindex(df["Horse"]).reset_index()
+
+        spd = []
+        for _, r in w.iterrows():
+            times = pd.to_numeric(r[seg_cols], errors="coerce").to_numpy()
+            with np.errstate(divide="ignore", invalid="ignore"):
+                v = seg_lens / times
+            # ignore 0/neg/inf
+            v[~np.isfinite(v)] = np.nan
+            spd.append(v)
+        spd = np.asarray(spd, dtype=float)  # shape (N_horse, N_seg)
+
+        # Trim to segments that have at least some data
+        valid_mask = np.isfinite(spd).sum(axis=0) >= 2
+        spd = spd[:, valid_mask]
+        # After trim, require at least 3 segments
+        if spd.shape[1] >= 3:
+            # Fill nan per row with row-median to keep variability meaningful
+            row_med = np.nanmedian(spd, axis=1, keepdims=True)
+            spd_f = np.where(np.isfinite(spd), spd, row_med)
+
+            # MV_raw: variability across segments (lower = steadier).
+            # use coefficient of variation via MAD for robustness.
+            med = np.nanmedian(spd_f, axis=1)
+            mad = np.array([_mad(spd_f[i, :]) for i in range(spd_f.shape[0])])
+            with np.errstate(divide="ignore", invalid="ignore"):
+                mv_raw = mad / np.where(med > 0, med, np.nan)
+            mv_raw = pd.Series(mv_raw, index=df.index)
+
+            # RC_raw: rebound coefficient — late strength vs late trough.
+            # Find trough over the last ~half of race, compare to mean of final 2 segments.
+            H, S = spd_f.shape
+            late_start = max(1, S // 2)
+            trough = np.nanargmin(np.nanmedian(spd_f[:, late_start:], axis=0)) + late_start  # index in [late_start..S-1]
+            tail = np.nanmean(spd_f[:, max(S-2, 0):S], axis=1)
+            base = spd_f[:, trough]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                rc_raw = tail / np.where(base > 0, base, np.nan)
+            rc_raw = pd.Series(rc_raw, index=df.index)
+
+            if not have_MV: df["MV"] = mv_raw
+            if not have_RC: df["RC"] = rc_raw
+
+# ---------- Core normalisations ----------
+mv = _winsor(df.get("MV", pd.Series(np.nan, index=df.index)), q=0.02)
+rc = _winsor(df.get("RC", pd.Series(np.nan, index=df.index)), q=0.02)
+
+# Lower MV is better -> invert after normalising; Higher RC is better.
+mv01 = 1.0 - _robust01(mv)     # steadiness (0..1, higher = steadier)
+rc01 = _robust01(rc)           # rebound (0..1, higher = more kick late)
+
+# Class lens: use PI if available, else GCI
+if "PI" in df.columns and pd.to_numeric(df["PI"], errors="coerce").notna().any():
+    cls = _winsor(pd.to_numeric(df["PI"], errors="coerce"), q=0.02)
 else:
-    STEP = int(metrics.attrs.get("STEP", 100))
-    D    = float(race_distance_input)
+    cls = _winsor(pd.to_numeric(df.get("GCI", np.nan), errors="coerce"), q=0.02)
 
-    segs = _build_segments(work, D, STEP)
-    if not segs:
-        st.info("R&V: not enough *_Time columns to compute segment speeds.")
-    else:
-        # --------- Build per-segment speeds (m/s), NaN-safe, minimal memory ----------
-        seg_keys = [f"seg_{i}" for i in range(len(segs))]
-        spd = pd.DataFrame(index=work.index, columns=seg_keys, dtype=float)
-        for key, (_, L, src_col) in zip(seg_keys, segs):
-            t = pd.to_numeric(work[src_col], errors="coerce")
-            t = t.mask((t <= 0) | (~np.isfinite(t)))
-            spd[key] = L / t
+cls01 = _robust01(cls)
 
-        # Drop segments that are all-NaN to avoid z-divide issues
-        valid_cols = [c for c in spd.columns if spd[c].notna().any()]
-        spd = spd[valid_cols]
-        if spd.shape[1] < 2:
-            st.info("R&V: need at least two valid segments to assess stability.")
-        else:
-            # --------- Field-standardize each segment (robust z) ----------
-            z_spd = pd.DataFrame(index=spd.index, columns=spd.columns, dtype=float)
-            for c in spd.columns:
-                col = spd[c].to_numpy()
-                mu = np.nanmedian(col)
-                sd = _mad_std(col)
-                if not np.isfinite(sd) or sd <= 0:
-                    sd = np.nanstd(col)
-                    if not np.isfinite(sd) or sd <= 1e-12:
-                        # fallback avoid division by zero
-                        z_spd[c] = np.nan
-                        continue
-                z_spd[c] = (col - mu) / sd
+# ---------- Class-aware blending (CAR) ----------
+# More tolerance for variability when class is high
+mv_term = np.power(mv01, 1.0 - 0.35*cls01)            # elite horses keep more of their steadiness score
+rc_term = rc01 * (1.0 + 0.25*cls01)                   # elite kick counts a bit extra
 
-            # Exclude the very first segment from stability (start-noise guard)
-            cols_eval = z_spd.columns[1:] if len(z_spd.columns) > 1 else z_spd.columns
+CAR = 10.0 * (0.45*mv_term + 0.35*rc_term + 0.20*cls01)
+CAR = np.clip(CAR, 0.0, 10.0)
 
-            # --------- Micro-Volatility (MV): robust dispersion across segments ----------
-            MV = []
-            for i in range(len(z_spd)):
-                row = z_spd.iloc[i][cols_eval].to_numpy(dtype=float)
-                row = row[np.isfinite(row)]
-                if row.size >= 2:
-                    MV.append(_mad_std(row))  # robust volatility
-                else:
-                    MV.append(np.nan)
-            MV = pd.Series(MV, index=work.index, name="MV")
+# ---------- Risk tag ----------
+def _risk_tag(car):
+    if not np.isfinite(car): return "None"
+    if car >= 8.0:  return "Reliable"
+    if car >= 6.0:  return "Mostly reliable"
+    if car >= 4.0:  return "Variable"
+    return "Fragile"
 
-            # --------- Recovery Control (RC): rebound after worst dip ----------
-            # Worst dip = minimum z. Recovery = max uplift within next k segments (k=3 default).
-            k_ahead = 3
-            RC = []
-            for i in range(len(z_spd)):
-                row = z_spd.iloc[i][cols_eval].to_numpy(dtype=float)
-                if not np.isfinite(row).any():
-                    RC.append(np.nan); continue
-                # find dip index
-                idxs = np.where(np.isfinite(row))[0]
-                if idxs.size == 0:
-                    RC.append(np.nan); continue
-                dip_idx = idxs[np.argmin(row[idxs])]
-                dip_val = row[dip_idx]
-                hi_after = np.nan
-                if dip_idx < row.size - 1:
-                    hi_after = np.nanmax(row[dip_idx+1 : min(row.size, dip_idx+1+k_ahead)])
-                if np.isfinite(dip_val) and np.isfinite(hi_after):
-                    RC.append(max(0.0, hi_after - dip_val))
-                else:
-                    RC.append(np.nan)
-            RC = pd.Series(RC, index=work.index, name="RC")
+tags = [ _risk_tag(v) for v in CAR ]
 
-            # --------- Normalise MV (lower is better) and RC (higher is better) to 0..1 ----------
-            def _robust_01(s, invert=False):
-                v = pd.to_numeric(s, errors="coerce")
-                lo, hi = np.nanpercentile(v, 10), np.nanpercentile(v, 90)
-                if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-                    # degenerate fallback
-                    out = (v - np.nanmin(v)) / (np.nanmax(v) - np.nanmin(v) + 1e-12)
-                else:
-                    out = (v - lo) / (hi - lo)
-                out = out.clip(0.0, 1.0)
-                return 1.0 - out if invert else out
+# ---------- Output table ----------
+out = pd.DataFrame({
+    "Horse": df["Horse"],
+    "R&V": np.round(CAR, 2),
+    "Risk Tag": tags,
+    "MV (↓ steadier)": np.round(pd.to_numeric(df.get("MV", np.nan), errors="coerce"), 3),
+    "RC (↑ better rebound)": np.round(pd.to_numeric(df.get("RC", np.nan), errors="coerce"), 3),
+})
 
-            MV01 = _robust_01(MV, invert=True)   # lower volatility → higher score
-            RC01 = _robust_01(RC, invert=False)  # higher rebound → higher score
+# Add PI for context if present
+if "PI" in df.columns:
+    out["PI"] = np.round(pd.to_numeric(df["PI"], errors="coerce"), 2)
+elif "GCI" in df.columns:
+    out["GCI"] = np.round(pd.to_numeric(df["GCI"], errors="coerce"), 2)
 
-            # Weight blend (tuned to emphasise stability first, then resilience)
-            RnV01 = (0.65 * MV01 + 0.35 * RC01).clip(0.0, 1.0)
-            RnV10 = (10.0 * RnV01).round(2)
+# Sort by most reliable first, then strongest class
+sort_cols = ["R&V"]
+if "PI" in out.columns: sort_cols += ["PI"]
+elif "GCI" in out.columns: sort_cols += ["GCI"]
+out = out.sort_values(sort_cols, ascending=[False] + [False]*(len(sort_cols)-1), kind="mergesort").reset_index(drop=True)
 
-            # --------- Risk Tagging ----------
-            def _tag(rnv):
-                if not np.isfinite(rnv): return ""
-                if rnv >= 7.5: return "Reliable"
-                if rnv >= 5.5: return "Variable"
-                return "Fragile"
-
-            # Build view
-            out = pd.DataFrame({
-                "Horse": work["Horse"].astype(str).values,
-                "R&V": RnV10,
-                "MV (↓ steadier)": MV.round(3),
-                "RC (↑ better rebound)": RC.round(3),
-            })
-
-            # Join a small context column (optional): PI for sorting tie-breaks
-            if "PI" in metrics.columns:
-                out = out.merge(metrics[["Horse","PI"]], on="Horse", how="left")
-
-            out["Risk Tag"] = out["R&V"].apply(_tag)
-
-            # Sort: most reliable first; tie-break by PI desc, then RC desc
-            sort_cols = ["R&V", "PI" if "PI" in out.columns else "RC (↑ better rebound)", "RC (↑ better rebound)"]
-            sort_cols = [c for c in sort_cols if c in out.columns]
-            out = out.sort_values(sort_cols, ascending=[False, False, False]).reset_index(drop=True)
-
-            # Present
-            st.dataframe(
-                out[["Horse","R&V","Risk Tag","MV (↓ steadier)","RC (↑ better rebound)"] + (["PI"] if "PI" in out.columns else [])],
-                use_container_width=True
-            )
-            st.caption("R&V = 0–10 reliability (higher = steadier + good recovery). MV uses robust dispersion of field-z speeds across segments (excl. first). RC measures rebound after the worst dip within the next ~3 segments.")
-
-            # Optional, RAM-light scatter (off by default)
-            with st.expander("Show reliability map (MV vs RC)"):
-                fig, ax = plt.subplots(figsize=(6.4, 4.6))
-                x = out["MV (↓ steadier)"].to_numpy(dtype=float)
-                y = out["RC (↑ better rebound)"].to_numpy(dtype=float)
-                ax.scatter(x, y, s=30, edgecolor="black", linewidth=0.4, alpha=0.9)
-                for xi, yi, nm in zip(x, y, out["Horse"]):
-                    if np.isfinite(xi) and np.isfinite(yi):
-                        ax.text(xi, yi, str(nm), fontsize=8,
-                                bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.7))
-                ax.set_xlabel("Micro-Volatility (lower is better)")
-                ax.set_ylabel("Recovery Control (higher is better)")
-                ax.set_title("R&V Reliability Map")
-                ax.grid(True, linestyle=":", alpha=0.3)
-                st.pyplot(fig)
-# ======================= /R&V =======================
+st.dataframe(out, use_container_width=True)
+st.caption("CAR = class-aware reliability: blends Steadiness (MV), Rebound (RC) and Class (PI/GCI). "
+           "High CAR → repeatable pattern you can trust; low CAR → fragile/shape-dependent.")
+# ======================= /R&V (CAR) =======================
 
 # ======================= xWin — Probability to Win (100-replay view) =======================
 st.markdown("## xWin — Probability to Win")
