@@ -3101,252 +3101,198 @@ else:
     st.dataframe(out,use_container_width=True)
 # ======================= /PWX + EFI =======================
 
-# ======================= RSB — Rhythm Stability (0–10) =======================
-st.markdown("## RSB — Rhythm Stability (0–10)")
+# ======================= RSB — Rhythm & Smoothness Balance (compact, RAM-light) =======================
+st.markdown("## RSB — Rhythm & Smoothness Balance")
 
-# ---- small helpers (local, no heavy deps) -----------------------------------
-def _as_num(s): return pd.to_numeric(s, errors="coerce")
+# ---------- tiny local helpers (nan-safe, light) ----------
+import re
 
-def _winsor(x, lo=0.10, hi=0.90):
-    x = pd.to_numeric(x, errors="coerce")
-    ql, qh = np.nanpercentile(x, lo*100), np.nanpercentile(x, hi*100)
-    return np.clip(x, ql, qh)
+def _percentile01(x):
+    x = pd.to_numeric(pd.Series(x), errors="coerce")
+    valid = x.dropna()
+    if valid.empty:
+        return pd.Series(np.nan, index=x.index)
+    r = valid.rank(method="average", pct=True)
+    out = pd.Series(np.nan, index=x.index)
+    out.loc[valid.index] = r.values
+    return out
 
-def _mad_std(x):
-    x = pd.to_numeric(x, errors="coerce").to_numpy()
-    x = x[np.isfinite(x)]
-    if x.size == 0: return np.nan
-    med = np.nanmedian(x)
-    mad = np.nanmedian(np.abs(x - med))
-    return 1.4826 * mad if mad > 0 else np.nanstd(x)
+def _collect_time_cols(df):
+    """Return ordered list of '(start)->(end)' segment definitions from *_Time columns.
+       Uses your STEP (100/200) if present; excludes the *first* leg by spec; includes Finish."""
+    step = int(metrics.attrs.get("STEP", 100))
+    # find all numeric *_Time cols
+    nums = []
+    for c in df.columns:
+        m = re.fullmatch(r"(\d+)_Time", str(c).strip())
+        if m:
+            nums.append(int(m.group(1)))
+    nums = sorted(set(nums), reverse=True)  # e.g., [1400,1300,...]
+    D = float(metrics.attrs.get("RaceDistance", 0) or 0) or float(race_distance_input)
 
-def _spark(values):
-    # tiny text spark: maps 0..1 to blocks
-    chars = "▁▂▃▄▅▆▇█"
-    out = []
-    for v in values:
-        v = 0.0 if not np.isfinite(v) else float(np.clip(v, 0.0, 1.0))
-        idx = min(len(chars)-1, int(round(v*(len(chars)-1))))
-        out.append(chars[idx])
-    return "".join(out)
+    segs = []
+    if nums:
+        # first leg = D -> nums[0]  (we will build it but drop it later)
+        first_len = max(1.0, D - float(nums[0]))
+        if f"{nums[0]}_Time" in df.columns:
+            segs.append((f"{int(D)}→{nums[0]}", first_len, f"{nums[0]}_Time"))
+        # middle legs: a->b uses b_Time
+        for a, b in zip(nums, nums[1:]):
+            col = f"{int(b)}_Time"
+            if col in df.columns:
+                segs.append((f"{int(a)}→{int(b)}", float(a - b), col))
+    # finish leg
+    fin_col = "Finish_Time" if "Finish_Time" in df.columns else ("Finish" if "Finish" in df.columns else None)
+    if fin_col:
+        fin_len = 100.0 if step == 100 else 200.0
+        segs.append((f"{step}→0 (Finish)", fin_len, fin_col))
+    return segs
 
-def _first_split_colnames(df):
-    # Given split *_Time columns (e.g., 1400_Time, 1200_Time, ..., Finish_Time),
-    # return the first timing column (post-jump split) if we can infer it.
-    tcols = [c for c in df.columns if isinstance(c, str) and c.endswith("_Time")]
-    if not tcols: return None
-    # sort numerically where possible, 'Finish_Time' last
-    def _key(c):
-        if c == "Finish_Time": return (10**9)
-        try:
-            return int(c.split("_")[0])
-        except:
-            return (10**8)
-    tcols = sorted(tcols, key=_key, reverse=False)
-    return tcols[0] if tcols else None
+def _row_speeds(row, segs):
+    ys = []
+    for (_, L, src) in segs:
+        t = pd.to_numeric(row.get(src, np.nan), errors="coerce")
+        ys.append((L / float(t)) if (pd.notna(t) and float(t) > 0.0) else np.nan)
+    return np.array(ys, dtype=float)
 
-# ---- choose source for raw splits (prefer 'work', else 'metrics') -----------
-_src_df = None
-try:
-    if 'work' in globals() and isinstance(work, pd.DataFrame):
-        _src_df = work
-except Exception:
-    _src_df = None
-if _src_df is None:
-    _src_df = metrics  # best-effort
+def _clean_series(a):
+    a = np.asarray(a, dtype=float)
+    if np.all(~np.isfinite(a)):
+        return np.array([], dtype=float)
+    # simple nan fill by forward/backward (cheap) to stabilise CV/jerk
+    s = pd.Series(a)
+    s = s.interpolate(limit_direction="both")
+    return s.to_numpy(dtype=float)
 
-STEP = int(metrics.attrs.get("STEP", 100))  # 100 or 200
-RSI  = float(metrics.attrs.get("RSI", np.nan)) if metrics.attrs.get("RSI", None) is not None else np.nan
-SCI  = float(metrics.attrs.get("SCI", np.nan)) if metrics.attrs.get("SCI", None) is not None else np.nan
-COLL = float(metrics.attrs.get("CollapseSeverity", 0.0) or 0.0)
+def _late_window_len(n):
+    # last ~30% of usable segments, at least 3
+    return max(3, int(round(0.30 * n)))
 
-# Thresholds scale by STEP so 100m vs 200m compare fairly
-if STEP <= 120:
-    TAU_CV   = 0.18
-    TAU_JERK = 0.12
+# ---------- build segment list and speeds ----------
+segs_all = _collect_time_cols(work)
+if not segs_all:
+    st.info("RSB: no *_Time columns to compute splits.")
 else:
-    TAU_CV   = 0.12
-    TAU_JERK = 0.08
-
-# ---- build per-segment speeds (m/s), excluding the first split ---------------
-# Collect *_Time columns, infer segment lengths
-time_cols = [c for c in _src_df.columns if isinstance(c, str) and c.endswith("_Time")]
-if not time_cols:
-    st.info("RSB: no *_Time columns found.")
-else:
-    # Sort columns so early→late (Finish last)
-    def _key(c):
-        if c == "Finish_Time": return (10**9)
-        try: return int(c.split("_")[0])
-        except: return (10**8)
-    time_cols = sorted(time_cols, key=_key, reverse=False)
-
-    # Drop the first split (post-jump) from consideration
-    first_col = _first_split_colnames(_src_df)
-    if first_col in time_cols:
-        used_cols = [c for c in time_cols if c != first_col]
+    # Drop the *first* leg per your spec
+    segs = segs_all[1:] if len(segs_all) >= 2 else []
+    if not segs:
+        st.info("RSB: not enough segments after excluding the first leg.")
     else:
-        used_cols = time_cols[:]  # fallback
+        # Precompute field speeds per segment (row-wise on demand to save RAM)
+        rows = []
+        for _, r in work.iterrows():
+            s = _row_speeds(r, segs)
+            s = _clean_series(s)
+            rows.append(s)
 
-    # If almost nothing remains, we will proxy later
-    # Create per-horse speed matrix over 'used_cols'
-    L_default = float(STEP)
-    seg_lengths = []
-    for c in used_cols:
-        if c == "Finish_Time":
-            seg_lengths.append(L_default)  # 100 or 200 by STEP
+        # If nobody has usable speeds, stop
+        if all(len(s) == 0 for s in rows):
+            st.info("RSB: all rows missing/invalid segment times.")
         else:
-            # For numeric "{m}_Time" assume 100/200m, but keep STEP-consistent
-            seg_lengths.append(L_default)
+            # Field-wide references for normalisation (CV, jerk, flips)
+            # Compute per-horse raw features
+            cv_list, jerk_list, flip_list = [], [], []
+            cvL_list, jerkL_list, flipL_list = [], [], []
+            r10_list, spark_list = [], []
 
-    if len(used_cols) < 2:
-        # too thin; will do proxy
-        speed_mat = None
-    else:
-        times = _src_df.loc[:, used_cols].apply(_as_num)
-        times = times.mask((times <= 0) | (~np.isfinite(times)))
-        # speed = length / time
-        L_vec = np.array(seg_lengths, dtype=float)
-        speed_mat = (L_vec / times.to_numpy(dtype=float))  # shape: (n_horses, n_segs)
-
-    # ---- compute RSB per horse ------------------------------------------------
-    df_horses = _src_df[["Horse"]].copy() if "Horse" in _src_df.columns else pd.DataFrame({"Horse": np.arange(len(_src_df))})
-    rsb_core = np.full(len(df_horses), np.nan, dtype=float)
-    rsb_late = np.full(len(df_horses), np.nan, dtype=float)
-    flags    = np.full(len(df_horses), "", dtype=object)
-
-    # Late window ~ last 600m (6×100m or 3×200m), capped by available segs
-    late_seg_count = 6 if STEP <= 120 else 3
-
-    if speed_mat is not None:
-        med_speed = np.nanmedian(speed_mat, axis=1)
-        # For jerk & flips, we need diffs along segments
-        diff_mat = np.diff(speed_mat, axis=1)
-        med_speed_safe = np.where(np.isfinite(med_speed) & (med_speed > 0), med_speed, np.nan)
-
-        for i in range(speed_mat.shape[0]):
-            v = speed_mat[i, :]
-            v = v[np.isfinite(v)]
-            if v.size < 4:
-                flags[i] = "⚠️ proxy"
-                continue
-
-            # Core components
-            v_med = np.nanmedian(v)
-            v_std = np.nanstd(v)
-            cv = (v_std / v_med) if (np.isfinite(v_std) and np.isfinite(v_med) and v_med > 0) else np.nan
-            CVs = 1.0 - min((0.0 if not np.isfinite(cv) else cv) / TAU_CV, 1.0)
-
-            dv = np.diff(v)
-            if dv.size == 0 or not np.isfinite(v_med) or v_med <= 0:
-                J = np.nan
-            else:
-                j_vals = np.abs(dv) / v_med
-                # trimmed mean via winsorization
-                j_vals = _winsor(j_vals, 0.10, 0.90)
-                j_bar = np.nanmean(j_vals)
-                J = 1.0 - min((0.0 if not np.isfinite(j_bar) else j_bar) / TAU_JERK, 1.0)
-
-            if dv.size == 0:
-                O = np.nan
-            else:
-                flips = 0
-                for k in range(1, dv.size):
-                    if np.isfinite(dv[k-1]) and np.isfinite(dv[k]) and (dv[k-1] == 0 or dv[k] == 0):
-                        continue
-                    if np.sign(dv[k-1]) != np.sign(dv[k]):
-                        flips += 1
-                # scale flips tolerance to #segments (about 1 flip per 3 segments is "okay")
-                tol = max(1, int(round(v.size / 3)))
-                O = 1.0 - min(flips / tol, 1.0)
-
-            core = np.nanmean([0.40*CVs, 0.40*J, 0.20*O])
-
-            # Late components
-            v_late = v[-late_seg_count:] if v.size >= 2 else v
-            if v_late.size >= 2 and np.isfinite(np.nanmedian(v_late)):
-                v_med_l = np.nanmedian(v_late)
-                v_std_l = np.nanstd(v_late)
-                cv_l = (v_std_l / v_med_l) if (np.isfinite(v_std_l) and v_med_l > 0) else np.nan
-                CVs_l = 1.0 - min((0.0 if not np.isfinite(cv_l) else cv_l) / TAU_CV, 1.0)
-
-                dv_l = np.diff(v_late)
-                if dv_l.size == 0 or not np.isfinite(v_med_l) or v_med_l <= 0:
-                    J_l = np.nan
+            for s in rows:
+                if len(s) == 0 or not np.isfinite(np.nanmean(s)):
+                    cv = jerk = flips = np.nan
+                    cvL = jerkL = flipsL = np.nan
+                    r10 = spark = np.nan
                 else:
-                    j_vals_l = np.abs(dv_l) / v_med_l
-                    j_vals_l = _winsor(j_vals_l, 0.10, 0.90)
-                    j_bar_l = np.nanmean(j_vals_l)
-                    J_l = 1.0 - min((0.0 if not np.isfinite(j_bar_l) else j_bar_l) / TAU_JERK, 1.0)
+                    # Core window = all available
+                    m = np.nanmean(s)
+                    sd = np.nanstd(s)
+                    cv  = (sd / m) if (np.isfinite(m) and m > 0) else np.nan
+                    ds  = np.diff(s, prepend=np.nan)
+                    # jerk: mean |Δspeed| excluding the synthetic first diff
+                    jerk = np.nanmean(np.abs(ds[1:])) if len(ds) > 1 else np.nan
+                    # flips: sign changes of Δspeed (ignore near-zero noise)
+                    d = ds[1:]
+                    d = d[np.isfinite(d)]
+                    flips = 0
+                    if d.size >= 2:
+                        # small dead-band to avoid micro-noise
+                        eps = max(0.005, 0.02*np.nanstd(s))  # 0.5% abs or 2% of s-std
+                        sdv = np.sign(np.where(np.abs(d) < eps, 0.0, d))
+                        flips = np.sum((sdv[1:] * sdv[:-1]) < 0)
 
-                if dv_l.size == 0:
-                    O_l = np.nan
-                else:
-                    flips_l = 0
-                    for k in range(1, dv_l.size):
-                        if np.isfinite(dv_l[k-1]) and np.isfinite(dv_l[k]) and (dv_l[k-1] == 0 or dv_l[k] == 0):
-                            continue
-                        if np.sign(dv_l[k-1]) != np.sign(dv_l[k]):
-                            flips_l += 1
-                    tol_l = max(1, int(round(v_late.size / 3)))
-                    O_l = 1.0 - min(flips_l / tol_l, 1.0)
+                    # Late window
+                    k = _late_window_len(len(s))
+                    sl = s[-k:]
+                    mL = np.nanmean(sl)
+                    sdL = np.nanstd(sl)
+                    cvL  = (sdL / mL) if (np.isfinite(mL) and mL > 0) else np.nan
+                    dL   = np.diff(sl)
+                    jerkL = np.nanmean(np.abs(dL)) if dL.size > 0 else np.nan
+                    if dL.size >= 2:
+                        epsL = max(0.005, 0.02*np.nanstd(sl))
+                        sdvL = np.sign(np.where(np.abs(dL) < epsL, 0.0, dL))
+                        flipsL = np.sum((sdvL[1:] * sdvL[:-1]) < 0)
+                    else:
+                        flipsL = np.nan
 
-                late = np.nanmean([0.40*CVs_l, 0.40*J_l, 0.20*O_l])
-            else:
-                late = np.nan
+                    # RSB_10 (finish quality): mean of last ~10% vs own mean, then field percentile
+                    n10 = max(1, int(np.ceil(0.10 * len(s))))
+                    tail = s[-n10:]
+                    r10 = (np.nanmean(tail) / m) if (np.isfinite(m) and m > 0) else np.nan
 
-            # Shape-aware nudges (gentle)
-            r_core, r_late = core, late
-            if np.isfinite(SCI) and SCI >= 0.6 and np.isfinite(RSI) and abs(RSI) > 0.3:
-                # allow a touch more instability in harsh shapes
-                r_core = min(1.0, r_core * 1.03)
-                r_late = min(1.0, r_late * 1.03)
-                if COLL >= 3.0:
-                    # collapse guard: reduce the extra forgiveness
-                    r_core = min(1.0, r_core * 0.99)
-                    r_late = min(1.0, r_late * 0.99)
+                    # Spark: max positive kick in last ~400 m (≈ last 2–4 segs)
+                    wnd = max(2, min(4, int(round(400.0 / float(metrics.attrs.get("STEP", 100))))))
+                    tail_d = np.diff(s[-(wnd+1):]) if len(s) >= wnd+1 else np.diff(s)
+                    spark = np.nanmax(tail_d) if tail_d.size > 0 else np.nan
 
-            rsb_core[i] = np.clip(r_core, 0.0, 1.0) if np.isfinite(r_core) else np.nan
-            rsb_late[i] = np.clip(r_late, 0.0, 1.0) if np.isfinite(r_late) else np.nan
+                cv_list.append(cv);      jerk_list.append(jerk);      flip_list.append(flips)
+                cvL_list.append(cvL);    jerkL_list.append(jerkL);    flipL_list.append(flipsL)
+                r10_list.append(r10);    spark_list.append(spark)
 
-    # ---- fallbacks (proxy via Accel/Grind when splits too thin) ---------------
-    GR_COL = metrics.attrs.get("GR_COL", "Grind")
-    acc = _as_num(metrics.get("Accel", np.nan))
-    grd = _as_num(metrics.get(GR_COL, np.nan))
-    denom = (acc.add(grd, fill_value=0)/2).replace(0, np.nan)
+            # ---------- normalise, invert penalties, and blend ----------
+            # Core (higher = smoother/better)
+            cv01   = _percentile01(cv_list)      # higher = more volatile (worse)
+            jerk01 = _percentile01(jerk_list)    # higher = jerkier (worse)
+            flip01 = _percentile01(flip_list)    # higher = choppier (worse)
+            cv_good, jerk_good, flip_good = 1.0 - cv01, 1.0 - jerk01, 1.0 - flip01
+            RSB_Core01 = (0.50*cv_good + 0.35*jerk_good + 0.15*flip_good).clip(0.0, 1.0)
 
-    for i in range(len(df_horses)):
-        if not np.isfinite(rsb_core[i]):
-            # proxy RSB in [0..1]
-            proxy = 1.0 - np.clip(np.abs(acc.iloc[i] - grd.iloc[i]) / (denom.iloc[i] if np.isfinite(denom.iloc[i]) and denom.iloc[i] > 0 else 1.0), 0.0, 1.0)
-            rsb_core[i] = float(np.clip(proxy, 0.0, 1.0))
-            rsb_late[i] = rsb_core[i]
-            flags[i] = "⚠️ proxy"
+            # Late window version
+            cvL01   = _percentile01(cvL_list)
+            jerkL01 = _percentile01(jerkL_list)
+            flipL01 = _percentile01(flipL_list)
+            RSB_Late01 = (0.50*(1.0-cvL01) + 0.35*(1.0-jerkL01) + 0.15*(1.0-flipL01)).clip(0.0, 1.0)
 
-    # ---- final score & compact view ------------------------------------------
-    rsb10 = 10.0 * (0.60 * rsb_core + 0.40 * rsb_late)
-    rsb10 = np.clip(rsb10, 0.0, 10.0)
+            # Finish quality vs own mean, then field-normalise
+            RSB_10 = _percentile01(r10_list).fillna(0.0)  # 0..1
 
-    # tiny spark (Core / Late / Score normalized)
-    sparks = []
-    for c, l, s in zip(rsb_core, rsb_late, rsb10/10.0):
-        vals = [np.nan_to_num(c), np.nan_to_num(l), np.nan_to_num(s)]
-        sparks.append(_spark(vals))
+            # Spark (field-normalised burst)
+            Spark = _percentile01(spark_list).fillna(0.0)  # 0..1
 
-    out = pd.DataFrame({
-        "Horse": df_horses["Horse"].astype(str).values,
-        "RSB_Core": np.round(rsb_core*10.0, 2),
-        "RSB_Late": np.round(rsb_late*10.0, 2),
-        "RSB_10":   np.round(rsb10, 2),
-        "Spark":    sparks,
-        "Flag":     flags
-    })
+            # ---------- assemble table ----------
+            out = pd.DataFrame({
+                "Horse": work.get("Horse", metrics.get("Horse", pd.Series(range(len(rows))))),
+                "RSB_Core": np.round(RSB_Core01 * 10.0, 2),
+                "RSB_Late": np.round(RSB_Late01 * 10.0, 2),
+                "RSB_10":   np.round(RSB_10, 2),
+                "Spark":    np.round(Spark, 2),
+            })
 
-    # Order: best rhythm first, then late, then name
-    out = out.sort_values(["RSB_10","RSB_Late","Horse"], ascending=[False, False, True], kind="mergesort").reset_index(drop=True)
-    st.dataframe(out, use_container_width=True)
-    st.caption("RSB = 0–10 (higher = smoother rhythm). Spark = Core • Late • Score. ⚠️ = proxy used due to thin splits.")
-# ======================= /RSB — Rhythm Stability =======================
+            # Simple flagging for readability (no extra memory)
+            def _flag(r):
+                f = []
+                if r["RSB_Core"] >= 8.0: f.append("Core♟")
+                if r["RSB_Late"] >= 8.0: f.append("Late♟")
+                if r["RSB_10"] >= 0.80:  f.append("Finish↑")
+                if r["Spark"]  >= 0.80:  f.append("Kick↑")
+                return " • ".join(f)
+            out["Flag"] = out.apply(_flag, axis=1)
+
+            # Sort by Core then Late, desc
+            out = out.sort_values(["RSB_Core","RSB_Late","RSB_10"], ascending=[False, False, False], ignore_index=True)
+
+            st.dataframe(out, use_container_width=True)
+            st.caption("RSB_Core & RSB_Late: 0–10 (higher = smoother, more even rhythm).  RSB_10 & Spark: 0–1 field ranks.")
+
+# ======================= /RSB =======================
 
 # ======================= xWin — Probability to Win (100-replay view) =======================
 st.markdown("## xWin — Probability to Win")
