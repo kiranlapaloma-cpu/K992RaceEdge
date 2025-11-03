@@ -2589,11 +2589,18 @@ TSI = (TSI_raw * (1.0 - trim_V)).clip(0.0, 1.0)
 
 # --- tiny helpers (local-only; RAM-friendly) ---
 def _mad(x):
-    x = pd.to_numeric(x, errors="coerce").to_numpy(dtype=float)
-    x = x[np.isfinite(x)]
-    if x.size == 0: return np.nan
-    med = np.median(x)
-    return np.median(np.abs(x - med))
+    import numpy as np
+    import pandas as pd
+    # Safely handle Series, arrays, or lists
+    if isinstance(x, (pd.Series, pd.Index)):
+        vals = pd.to_numeric(x, errors="coerce").to_numpy(dtype=float)
+    else:
+        vals = np.asarray(x, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return np.nan
+    med = np.median(vals)
+    return np.median(np.abs(vals - med))
 
 def _p(vec, q):
     v = pd.to_numeric(vec, errors="coerce").to_numpy(dtype=float)
