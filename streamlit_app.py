@@ -2936,12 +2936,6 @@ with st.expander("V-Profile — quick takes"):
             parts.append(f"[{flag}]")
         st.write("• " + " — ".join(parts))
 
-st.caption(
-    "V-Profile = distance/going-aware blend of Top-Speed Index (TSI) and Sustain Index (SSI). "
-    "TSI penalised if mid-race crawl; SSI rewards long, smooth time very near top speed and earlier onset. "
-    "Flags: Raw Pace Weapon / True Sustainer / Dual Threat / Flash Risk / Wants Further."
-)
-
 # ======================= V-Profile — Speed × Sustain Grade (one-run) =======================
 # Safe local helpers (won't clash with your globals)
 def _as_num(s):
@@ -3046,6 +3040,13 @@ VP["OnBonus"]  = OnBonus.round(3)
 # present_cols = [c for c in order_cols if c in VP.columns]
 # st.dataframe(VP[present_cols].sort_values("Grade10", ascending=False), use_container_width=True)
 # ======================= /end grade drop-in =======================
+
+st.caption(
+    "V-Profile = distance/going-aware blend of Top-Speed Index (TSI) and Sustain Index (SSI). "
+    "TSI penalised if mid-race crawl; SSI rewards long, smooth time very near top speed and earlier onset. "
+    "Flags: Raw Pace Weapon / True Sustainer / Dual Threat / Flash Risk / Wants Further."
+)
+
 # ======================= /V-Profile =======================
 
 # ======================= V-Profile — Style Quadrant (economy & crisp) =======================
