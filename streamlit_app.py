@@ -1731,6 +1731,10 @@ else:
         df["ΔPI_vs_med"] = df["PI"] - PI_med
         df["RanAbove_kg"] = df["ΔPI_vs_med"] / beta_eff
         df["RanAbove_lb"] = df["RanAbove_kg"] * 2.20462262
+        # --- Convert RanAbove to Merit Rating scale ---
+        df["RanAbove_MR"] = df["RanAbove_lb"] * 0.908
+        # optional rounding
+        df["RanAbove_MR"] = df["RanAbove_MR"].round(2)
 
         # 6) Friendly view
         view = df.copy()
@@ -1742,7 +1746,7 @@ else:
         view = view.sort_values("RanAbove_kg", ascending=False)
 
         # Round for display only (keep raw in df if you need later)
-        for c in ["Wt (kg)", "PI", "ΔPI_vs_med", "RanAbove_kg", "RanAbove_lb", "β_eff (PI/kg)"]:
+        for c in ["Wt (kg)", "PI", "ΔPI_vs_med", "RanAbove_kg", "RanAbove_MR", "β_eff (PI/kg)"]:
             view[c] = pd.to_numeric(view[c], errors="coerce").round(2)
 
         st.dataframe(view, use_container_width=True)
