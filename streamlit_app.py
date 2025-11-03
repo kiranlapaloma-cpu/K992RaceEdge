@@ -3101,206 +3101,203 @@ else:
     st.dataframe(out,use_container_width=True)
 # ======================= /PWX + EFI =======================
 
-# ======================= RSB_fn — Rhythm & Smooth Balance (field-normalised) =======================
-st.markdown("## RSB — Rhythm & Smooth Balance (field-normalised)")
+# ======================= R&V — Repeatability & Volatility (within-race) =======================
+st.markdown("## Repeatability & Volatility (R&V) — Reliability of the run")
 
-import numpy as np
-import pandas as pd
+# --------- Small local helpers (robust & lightweight) ----------
+def _as_num(x):
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else np.nan
+    except Exception:
+        return np.nan
 
-STEP = int(metrics.attrs.get("STEP", 100))
-D_m  = float(race_distance_input)
-
-# ---- tiny helpers (robust & light) ---------------------------------------------------
-def _mad(x):
+def _mad_std(x):
+    """MAD→sigma (robust). x is 1D array-like."""
     x = np.asarray(x, dtype=float)
     x = x[np.isfinite(x)]
-    if x.size == 0: return np.nan
+    if x.size == 0:
+        return np.nan
     med = np.median(x)
-    return np.median(np.abs(x - med))
+    mad = np.median(np.abs(x - med))
+    return 1.4826 * mad if mad > 0 else (np.std(x) if x.size > 1 else np.nan)
 
-def _percentile01(s):
-    s = pd.to_numeric(pd.Series(s), errors="coerce")
-    q = s.rank(pct=True, method="average")
-    return q.fillna(0.5).to_numpy()  # 0..1
-
-def _collect_markers_fallback(df):
-    # Parse all *_Time numeric heads, exclude Finish_Time
+def _collect_split_cols(df):
+    """Find *_Time columns, return sorted numeric markers (e.g., [1200,1100,...]) and has_finish flag."""
+    cols = [c for c in df.columns if isinstance(c, str) and c.endswith("_Time")]
     marks = []
-    for c in df.columns:
-        if c.endswith("_Time") and c != "Finish_Time":
-            head = c[:-5]  # strip '_Time'
-            if head.isdigit():
-                marks.append(int(head))
-    # sort high→low (e.g., 1400, 1300, …)
-    marks = sorted(set(marks), reverse=True)
-    return marks
+    for c in cols:
+        head = c.split("_")[0]
+        try:
+            m = int(head)
+            marks.append(m)
+        except Exception:
+            pass
+    marks = sorted(set(marks), reverse=True)  # e.g., [1500,1400,...,100]
+    return marks, ("Finish_Time" in df.columns)
 
-# Prefer your existing helper if present
-try:
-    marks = _collect_markers(work)
-except Exception:
-    marks = _collect_markers_fallback(work)
+def _build_segments(df, distance_m, step_m):
+    """Create segment list [(label, length_m, source_col)] from available columns."""
+    marks, has_fin = _collect_split_cols(df)
+    segs = []
+    if marks:
+        m1 = int(marks[0])
+        L0 = max(1.0, float(distance_m) - float(m1))
+        if f"{m1}_Time" in df.columns:
+            segs.append((f"{int(distance_m)}→{m1}", L0, f"{m1}_Time"))
+        for a, b in zip(marks, marks[1:]):
+            src = f"{int(b)}_Time"
+            if src in df.columns:
+                segs.append((f"{int(a)}→{int(b)}", float(a - b), src))
+    if has_fin:
+        fin_len = 100.0 if int(step_m) == 100 else 200.0
+        segs.append((f"{int(step_m)}→0 (Finish)", fin_len, "Finish_Time"))
+    return segs
 
-segs = []
-if marks:
-    m1 = int(marks[0])
-    L0 = max(1.0, D_m - m1)
-    if f"{m1}_Time" in work.columns:
-        segs.append((f"{int(D_m)}→{m1}", float(L0), f"{m1}_Time"))
-    for a, b in zip(marks, marks[1:]):
-        src = f"{int(b)}_Time"
-        if src in work.columns:
-            segs.append((f"{int(a)}→{int(b)}", float(a - b), src))
-if "Finish_Time" in work.columns:
-    fin_len = 100.0 if STEP == 100 else 200.0
-    segs.append((f"{STEP}→0 (Finish)", fin_len, "Finish_Time"))
-
-if not segs:
-    st.info("RSB: Not enough *_Time columns to compute rhythm.")
+# --------- Preconditions ----------
+if ("Horse" not in work.columns) or (len(work) == 0):
+    st.info("R&V: no horses to evaluate.")
 else:
-    horses = work.get("Horse", pd.Series(np.arange(len(work)), name="Horse")).astype(str).to_numpy()
-    nH = len(horses)
-    nS = len(segs)
+    STEP = int(metrics.attrs.get("STEP", 100))
+    D    = float(race_distance_input)
 
-    # ---- speeds matrix (horses × segments), NaN-safe --------------------------------
-    V = np.full((nH, nS), np.nan, dtype=float)
-    seg_len = np.fromiter((L for (_, L, _) in segs), dtype=float, count=nS)
-
-    for j, (_, L, src) in enumerate(segs):
-        t = pd.to_numeric(work.get(src), errors="coerce").to_numpy(dtype=float, copy=False)
-        good = np.isfinite(t) & (t > 0)
-        V[good, j] = L / t[good]
-
-    # ---- field baseline per segment (robust) -----------------------------------------
-    mu = np.nanmedian(V, axis=0)                # shape (nS,)
-    mad = np.apply_along_axis(_mad, 0, V)       # MAD per segment
-    # Avoid zero / NaN baselines
-    mu = np.where(np.isfinite(mu) & (mu > 0), mu, np.nan)
-    # Residuals: % above/below field baseline at that segment
-    R = (V - mu) / mu                           # shape (nH, nS)
-    # Clip extreme residuals to ±15% to reduce outlier explosion
-    np.clip(R, -0.15, 0.15, out=R)
-
-    # ---- exclude first segment from rhythm calc --------------------------------------
-    if nS >= 2:
-        R_core = R[:, 1:].copy()
-        L_core = seg_len[1:].copy()
+    segs = _build_segments(work, D, STEP)
+    if not segs:
+        st.info("R&V: not enough *_Time columns to compute segment speeds.")
     else:
-        R_core = R[:, :0].copy()
-        L_core = seg_len[:0].copy()
+        # --------- Build per-segment speeds (m/s), NaN-safe, minimal memory ----------
+        seg_keys = [f"seg_{i}" for i in range(len(segs))]
+        spd = pd.DataFrame(index=work.index, columns=seg_keys, dtype=float)
+        for key, (_, L, src_col) in zip(seg_keys, segs):
+            t = pd.to_numeric(work[src_col], errors="coerce")
+            t = t.mask((t <= 0) | (~np.isfinite(t)))
+            spd[key] = L / t
 
-    # require at least 3 residual segments for core metrics
-    def _valid_mask(row):
-        return np.isfinite(row)
-
-    # weights per segment: more reliable (low MAD) segments get slightly more weight
-    # w_s = 1 / (1 + sigma); if MAD==0/NaN → treat as 1.0 (neutral)
-    sigma = 1.4826 * mad
-    w = 1.0 / (1.0 + np.where(np.isfinite(sigma), sigma, 0.0))
-    w_core = w[1:] if nS >= 2 else w[:0]
-
-    # ---- per-horse rhythm & smoothness on residuals ----------------------------------
-    def _row_stats(r_row, w_row):
-        m = np.isfinite(r_row)
-        if m.sum() < 3:
-            return np.nan, np.nan, np.nan, np.nan  # cv, jerk, flips, mean_late
-        r = r_row[m]
-        ww = w_row[m]
-        ww = ww / (ww.sum() + 1e-9)
-
-        mean = np.sum(r * ww)
-        var  = np.sum(((r - mean) ** 2) * ww)
-        sd   = np.sqrt(max(var, 0.0))
-        cv   = sd / (abs(mean) + 1e-6)            # lower is smoother
-
-        # jerk = mean absolute change between consecutive residuals (weighted midpoints)
-        if r.size >= 2:
-            dr   = np.abs(np.diff(r))
-            wmid = (ww[:-1] + ww[1:]) * 0.5
-            jerk = float(np.sum(dr * wmid) / (wmid.sum() + 1e-9))
-            flips = float(np.sum(np.sign(r[1:]) != np.sign(r[:-1])) / (r.size - 1))
+        # Drop segments that are all-NaN to avoid z-divide issues
+        valid_cols = [c for c in spd.columns if spd[c].notna().any()]
+        spd = spd[valid_cols]
+        if spd.shape[1] < 2:
+            st.info("R&V: need at least two valid segments to assess stability.")
         else:
-            jerk, flips = np.nan, np.nan
+            # --------- Field-standardize each segment (robust z) ----------
+            z_spd = pd.DataFrame(index=spd.index, columns=spd.columns, dtype=float)
+            for c in spd.columns:
+                col = spd[c].to_numpy()
+                mu = np.nanmedian(col)
+                sd = _mad_std(col)
+                if not np.isfinite(sd) or sd <= 0:
+                    sd = np.nanstd(col)
+                    if not np.isfinite(sd) or sd <= 1e-12:
+                        # fallback avoid division by zero
+                        z_spd[c] = np.nan
+                        continue
+                z_spd[c] = (col - mu) / sd
 
-        # late mean: last third of core segments
-        k = max(2, int(np.ceil(r.size / 3)))
-        mean_late = float(np.nanmean(r[-k:]))     # relative late energy
+            # Exclude the very first segment from stability (start-noise guard)
+            cols_eval = z_spd.columns[1:] if len(z_spd.columns) > 1 else z_spd.columns
 
-        return float(cv), float(jerk), float(flips), mean_late
+            # --------- Micro-Volatility (MV): robust dispersion across segments ----------
+            MV = []
+            for i in range(len(z_spd)):
+                row = z_spd.iloc[i][cols_eval].to_numpy(dtype=float)
+                row = row[np.isfinite(row)]
+                if row.size >= 2:
+                    MV.append(_mad_std(row))  # robust volatility
+                else:
+                    MV.append(np.nan)
+            MV = pd.Series(MV, index=work.index, name="MV")
 
-    CV  = np.empty(nH); JERK = np.empty(nH); FLIP = np.empty(nH); LATE = np.empty(nH)
-    for i in range(nH):
-        cv, jk, fp, lt = _row_stats(R_core[i, :], w_core)
-        CV[i], JERK[i], FLIP[i], LATE[i] = cv, jk, fp, lt
+            # --------- Recovery Control (RC): rebound after worst dip ----------
+            # Worst dip = minimum z. Recovery = max uplift within next k segments (k=3 default).
+            k_ahead = 3
+            RC = []
+            for i in range(len(z_spd)):
+                row = z_spd.iloc[i][cols_eval].to_numpy(dtype=float)
+                if not np.isfinite(row).any():
+                    RC.append(np.nan); continue
+                # find dip index
+                idxs = np.where(np.isfinite(row))[0]
+                if idxs.size == 0:
+                    RC.append(np.nan); continue
+                dip_idx = idxs[np.argmin(row[idxs])]
+                dip_val = row[dip_idx]
+                hi_after = np.nan
+                if dip_idx < row.size - 1:
+                    hi_after = np.nanmax(row[dip_idx+1 : min(row.size, dip_idx+1+k_ahead)])
+                if np.isfinite(dip_val) and np.isfinite(hi_after):
+                    RC.append(max(0.0, hi_after - dip_val))
+                else:
+                    RC.append(np.nan)
+            RC = pd.Series(RC, index=work.index, name="RC")
 
-    # RSB_10: average residual over last ~10% distance (>=2 segments)
-    # figure how many segments ≈ 10% of race distance
-    last_m = max(200.0, 0.10 * D_m)
-    take = 0
-    acc = 0.0
-    for j in range(nS - 1, -1, -1):
-        acc += seg_len[j]
-        take += 1
-        if acc >= last_m: break
-    take = max(2, min(take, nS))
-    RSB10 = np.nanmean(R[:, -take:], axis=1)
+            # --------- Normalise MV (lower is better) and RC (higher is better) to 0..1 ----------
+            def _robust_01(s, invert=False):
+                v = pd.to_numeric(s, errors="coerce")
+                lo, hi = np.nanpercentile(v, 10), np.nanpercentile(v, 90)
+                if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                    # degenerate fallback
+                    out = (v - np.nanmin(v)) / (np.nanmax(v) - np.nanmin(v) + 1e-12)
+                else:
+                    out = (v - lo) / (hi - lo)
+                out = out.clip(0.0, 1.0)
+                return 1.0 - out if invert else out
 
-    # Spark: max positive jump in residuals within last 400 m (or last 2 segments)
-    win_m = max(200.0, 400.0)
-    take2 = 0; acc2 = 0.0
-    for j in range(nS - 1, -1, -1):
-        acc2 += seg_len[j]
-        take2 += 1
-        if acc2 >= win_m: break
-    take2 = max(2, min(take2, nS))
-    # compute Δr in that tail
-    tail = R[:, -take2:]
-    d_tail = np.diff(tail, axis=1)
-    Spark = np.nanmax(np.where(np.isfinite(d_tail), d_tail, -np.inf), axis=1)
-    Spark[~np.isfinite(Spark)] = 0.0
+            MV01 = _robust_01(MV, invert=True)   # lower volatility → higher score
+            RC01 = _robust_01(RC, invert=False)  # higher rebound → higher score
 
-    # ---- Turn raw stats into race-relative 0..10 scores (lower CV/JERK/FLIP = higher) --
-    cv_rank   = 1.0 - _percentile01(CV)           # invert
-    jerk_rank = 1.0 - _percentile01(JERK)
-    flip_rank = 1.0 - _percentile01(FLIP)
-    late_rank = _percentile01(LATE)
-    ten_rank  = _percentile01(RSB10)
+            # Weight blend (tuned to emphasise stability first, then resilience)
+            RnV01 = (0.65 * MV01 + 0.35 * RC01).clip(0.0, 1.0)
+            RnV10 = (10.0 * RnV01).round(2)
 
-    RSB_Core_fn = 10.0 * (0.60*cv_rank + 0.25*jerk_rank + 0.15*flip_rank)
-    RSB_Late_fn = 10.0 * (0.70*late_rank + 0.30*ten_rank)
-    RSB_10_fn   = 10.0 * ten_rank
-    Spark_fn    = np.clip((Spark / 0.05), 0.0, 1.0)  # 0.05 (~5% jump) → 1.0
-    # (Spark kept on 0..1; it’s a tag/indicator, not a ranking metric)
+            # --------- Risk Tagging ----------
+            def _tag(rnv):
+                if not np.isfinite(rnv): return ""
+                if rnv >= 7.5: return "Reliable"
+                if rnv >= 5.5: return "Variable"
+                return "Fragile"
 
-    rsb_df = pd.DataFrame({
-        "Horse": horses,
-        "RSB_Core":  np.round(RSB_Core_fn, 2),
-        "RSB_Late":  np.round(RSB_Late_fn, 2),
-        "RSB_10":    np.round(RSB_10_fn, 2),
-        "Spark":     np.round(Spark_fn, 2),
-    })
+            # Build view
+            out = pd.DataFrame({
+                "Horse": work["Horse"].astype(str).values,
+                "R&V": RnV10,
+                "MV (↓ steadier)": MV.round(3),
+                "RC (↑ better rebound)": RC.round(3),
+            })
 
-    # Optional: simple flags
-    flags = []
-    for c, l, t, s in zip(RSB_Core_fn, RSB_Late_fn, RSB_10_fn, Spark_fn):
-        bits = []
-        if c >= 7.0: bits.append("Smooth")
-        if l >= 7.0: bits.append("Late flow")
-        if t >= 7.0: bits.append("Finish+")
-        if s >= 0.8: bits.append("Kick↑")
-        flags.append(" · ".join(bits))
-    rsb_df["Flag"] = flags
+            # Join a small context column (optional): PI for sorting tie-breaks
+            if "PI" in metrics.columns:
+                out = out.merge(metrics[["Horse","PI"]], on="Horse", how="left")
 
-    # Show as its own module
-    rsb_view = rsb_df.sort_values(["RSB_Core","RSB_Late","RSB_10"], ascending=False, kind="mergesort").reset_index(drop=True)
-    st.dataframe(rsb_view, use_container_width=True)
+            out["Risk Tag"] = out["R&V"].apply(_tag)
 
-    # If you want it in metrics too (non-destructive left-merge):
-    try:
-        metrics = metrics.merge(rsb_df, on="Horse", how="left")
-    except Exception:
-        pass
-# ======================= /RSB_fn =======================
+            # Sort: most reliable first; tie-break by PI desc, then RC desc
+            sort_cols = ["R&V", "PI" if "PI" in out.columns else "RC (↑ better rebound)", "RC (↑ better rebound)"]
+            sort_cols = [c for c in sort_cols if c in out.columns]
+            out = out.sort_values(sort_cols, ascending=[False, False, False]).reset_index(drop=True)
+
+            # Present
+            st.dataframe(
+                out[["Horse","R&V","Risk Tag","MV (↓ steadier)","RC (↑ better rebound)"] + (["PI"] if "PI" in out.columns else [])],
+                use_container_width=True
+            )
+            st.caption("R&V = 0–10 reliability (higher = steadier + good recovery). MV uses robust dispersion of field-z speeds across segments (excl. first). RC measures rebound after the worst dip within the next ~3 segments.")
+
+            # Optional, RAM-light scatter (off by default)
+            with st.expander("Show reliability map (MV vs RC)"):
+                fig, ax = plt.subplots(figsize=(6.4, 4.6))
+                x = out["MV (↓ steadier)"].to_numpy(dtype=float)
+                y = out["RC (↑ better rebound)"].to_numpy(dtype=float)
+                ax.scatter(x, y, s=30, edgecolor="black", linewidth=0.4, alpha=0.9)
+                for xi, yi, nm in zip(x, y, out["Horse"]):
+                    if np.isfinite(xi) and np.isfinite(yi):
+                        ax.text(xi, yi, str(nm), fontsize=8,
+                                bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.7))
+                ax.set_xlabel("Micro-Volatility (lower is better)")
+                ax.set_ylabel("Recovery Control (higher is better)")
+                ax.set_title("R&V Reliability Map")
+                ax.grid(True, linestyle=":", alpha=0.3)
+                st.pyplot(fig)
+# ======================= /R&V =======================
 
 # ======================= xWin — Probability to Win (100-replay view) =======================
 st.markdown("## xWin — Probability to Win")
