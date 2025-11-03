@@ -1685,20 +1685,19 @@ def _shape_adjust(beta: float, rsi: float, sci: float) -> float:
     return beta
 
 # ---- Inputs / guards ----
-weight_col_candidates = ["Horse Weight", "Weight", "Carried", "Carried_kg"]
-weight_col = next((c for c in weight_col_candidates if c in metrics.columns), None)
+# --- Safe universal weight handler ---
+weight_col_candidates = ["Horse Weight", "Horse_Weight", "Wt", "Weight", "Weight (kg)"]
+weight_col = next((c for c in weight_col_candidates if c in df.columns), None)
+
+if weight_col is None:
+    st.warning("No horse weight column found — defaulting all to 60 kg.")
+    df["Horse Weight"] = 60.0
+else:
+    df["Horse Weight"] = pd.to_numeric(df[weight_col], errors="coerce").fillna(60.0)
 
 need_cols = {"Horse", "PI"}
 if weight_col: need_cols.add(weight_col)
 missing = [c for c in need_cols if c not in metrics.columns]
-
-# --- Safe Weight Helper ---
-# Ensure "Horse Weight" exists and is numeric; if missing, assume 60 kg baseline
-if "Horse Weight" not in df.columns:
-    st.warning("Column 'Horse Weight' not found — assuming 60 kg for all horses.")
-    df["Horse Weight"] = 60.0
-else:
-    df["Horse Weight"] = pd.to_numeric(df["Horse Weight"], errors="coerce").fillna(60.0)
 
 if missing:
     st.warning("Ahead of the Handicap: missing columns → " + ", ".join(missing))
