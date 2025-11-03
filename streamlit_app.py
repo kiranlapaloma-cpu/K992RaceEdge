@@ -3291,15 +3291,15 @@ else:
     dur_rel = np.nan_to_num(Sustain_s / (rt_s.to_numpy() + 1e-6))
     auc_rel = np.nan_to_num(AUC_nt / (rt_s.to_numpy() + 1e-6))
 
-    dur01 = _percentile01(dur_rel).to_numpy()
-    auc01 = _percentile01(auc_rel).to_numpy()
+    dur01 = _percentile01(dur_rel)
+    auc01 = _percentile01(auc_rel)
 
     acc = _as_num(VP.get("Accel")); grd = _as_num(VP.get(GR_COL))
     den = (acc.add(grd, fill_value=0) / 2.0).replace(0, np.nan)
     sm_raw = 1.0 - (acc - grd).abs() / den
-    sm01 = _percentile01(sm_raw.fillna(np.nanmedian(sm_raw))).to_numpy()
+    sm01 = _percentile01(sm_raw.fillna(np.nanmedian(sm_raw)))
 
-    on01 = 1.0 - _percentile01(VP["Onset_from_home_m"]).to_numpy()  # earlier → higher
+    on01 = 1.0 - _percentile01(VP["Onset_from_home_m"])  # earlier → higher
 
     (wV, wS), (w_dur, w_auc, w_sm, w_on) = _trip_weights(D_m)
     SSI_star = _clip01(w_dur * dur01 + w_auc * auc01 + w_sm * sm01 + w_on * on01)
