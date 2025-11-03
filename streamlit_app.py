@@ -1730,9 +1730,7 @@ else:
         PI_med = float(np.nanmedian(df["PI"]))
         df["ΔPI_vs_med"] = df["PI"] - PI_med
         df["RanAbove_kg"] = df["ΔPI_vs_med"] / beta_eff
-        df["RanAbove_lb"] = df["RanAbove_kg"] * 2.20462262
-        # --- Convert RanAbove to Merit Rating scale ---
-        df["RanAbove_MR"] = df["RanAbove_lb"] * 0.908
+        df["RanAbove_MR"] = df["RanAbove_kg"] * 2
         
         # 6) Friendly view
         view = df.copy()
@@ -1740,7 +1738,7 @@ else:
             weight_col: "Wt (kg)"
         })
         view["β_eff (PI/kg)"] = beta_eff
-        view = view[["Horse", "Wt (kg)", "PI", "ΔPI_vs_med", "RanAbove_kg", "RanAbove_lb", "β_eff (PI/kg)"]]
+        view = view[["Horse", "Wt (kg)", "PI", "ΔPI_vs_med", "RanAbove_kg", "RanAbove_MR", "β_eff (PI/kg)"]]
         view = view.sort_values("RanAbove_kg", ascending=False)
 
         # Round for display only (keep raw in df if you need later)
