@@ -1692,6 +1692,14 @@ need_cols = {"Horse", "PI"}
 if weight_col: need_cols.add(weight_col)
 missing = [c for c in need_cols if c not in metrics.columns]
 
+# --- Safe Weight Helper ---
+# Ensure "Horse Weight" exists and is numeric; if missing, assume 60 kg baseline
+if "Horse Weight" not in df.columns:
+    st.warning("Column 'Horse Weight' not found — assuming 60 kg for all horses.")
+    df["Horse Weight"] = 60.0
+else:
+    df["Horse Weight"] = pd.to_numeric(df["Horse Weight"], errors="coerce").fillna(60.0)
+
 if missing:
     st.warning("Ahead of the Handicap: missing columns → " + ", ".join(missing))
 else:
