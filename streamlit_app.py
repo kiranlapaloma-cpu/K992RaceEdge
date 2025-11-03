@@ -1686,14 +1686,28 @@ def _shape_adjust(beta: float, rsi: float, sci: float) -> float:
 
 # ---- Inputs / guards ----
 # --- Safe universal weight handler ---
+# Make sure we’re pointing at the right DataFrame
+try:
+    df_work = df.copy()
+except NameError:
+    # fallback for your app’s variable naming
+    if "metrics" in locals():
+        df_work = metrics.copy()
+    elif "data" in locals():
+        df_work = data.copy()
+    else:
+        st.error("No dataframe found. Please define df, metrics, or data before this block.")
+        df_work = pd.DataFrame()
+
+# now safely handle weights
 weight_col_candidates = ["Horse Weight", "Horse_Weight", "Wt", "Weight", "Weight (kg)"]
-weight_col = next((c for c in weight_col_candidates if c in df.columns), None)
+weight_col = next((c for c in weight_col_candidates if c in df_work.columns), None)
 
 if weight_col is None:
     st.warning("No horse weight column found — defaulting all to 60 kg.")
-    df["Horse Weight"] = 60.0
+    df_work["Horse Weight"] = 60.0
 else:
-    df["Horse Weight"] = pd.to_numeric(df[weight_col], errors="coerce").fillna(60.0)
+    df_work["Horse Weight"] = pd.to_numeric(df_work[weight_col], errors="coerce").fillna(60.0)
 
 need_cols = {"Horse", "PI"}
 if weight_col: need_cols.add(weight_col)
