@@ -1685,7 +1685,7 @@ def _shape_adjust(beta: float, rsi: float, sci: float) -> float:
     return beta
 
 # ---- Inputs / guards ----
-weight_col_candidates = ["Weight Allocated", "Weight", "Carried", "Carried_kg"]
+weight_col_candidates = ["Horse Weight", "Weight", "Carried", "Carried_kg"]
 weight_col = next((c for c in weight_col_candidates if c in metrics.columns), None)
 
 need_cols = {"Horse", "PI"}
