@@ -2915,6 +2915,33 @@ VP_view = VP_view.rename(columns={
     "Sustain_s":"Sustain (s ≥~95%)",
     "Sustain_m":"Sustain (m ≥~95%)"
 })
+# ---------- V-Composite (add composite columns before displaying) ----------
+def _to_num(x):
+    return pd.to_numeric(x, errors="coerce")
+
+tsi = _to_num(VP["TSI"]).clip(0, 100)
+ssi = _to_num(VP["SSI"]).clip(0, 100)
+vmax = _to_num(VP.get("Vmax_kmph"))  # matches your renamed column
+
+# --- A) Simple composite ----------------------------------------------
+VP["VComposite"] = (0.70 * tsi + 0.30 * ssi).round(2)
+
+# --- B) Power-aware composite ----------------------------------------
+v_med = float(np.nanmedian(vmax)) if np.isfinite(np.nanmedian(vmax)) else np.nan
+v_ratio = (vmax / v_med).replace([np.inf, -np.inf], np.nan)
+v_ratio = v_ratio.clip(lower=0.70, upper=1.30)
+
+ssi_star = (ssi * v_ratio).clip(0, 100)
+VP["SSI*"] = ssi_star.round(2)
+VP["VComposite_Power"] = (0.70 * tsi + 0.30 * ssi_star).round(2)
+
+# --- Optional: sorted display ----------------------------------------
+cols = ["Horse", "VProfile", "TSI", "SSI", "Vmax_kmph", "VComposite", "SSI*", "VComposite_Power"]
+for c in cols:
+    if c not in VP.columns: VP[c] = np.nan
+vp_view = VP[cols].sort_values("VComposite_Power", ascending=False)
+st.dataframe(vp_view, use_container_width=True)
+st.caption("V-Composite: 0.70×TSI + 0.30×SSI · Power-aware version boosts SSI by Vmax/median(Vmax).")
 st.dataframe(VP_view, use_container_width=True)
 
 # --------- concise per-horse lines ----------
