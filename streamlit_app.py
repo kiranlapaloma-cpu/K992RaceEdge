@@ -3034,6 +3034,320 @@ else:
         plt.close(figQ)
 # ======================= /V-Profile — Style Quadrant (economy & crisp) =======================
 
+# ======================= V-Profile 2.0 — One-Run Engine (0–10) =======================
+st.markdown("## V-Profile 2.0 — One-Run Engine (speed × sustain)")
+
+VP = metrics.copy()
+GR_COL = metrics.attrs.get("GR_COL", "Grind")
+STEP   = float(metrics.attrs.get("STEP", 100))
+D_m    = float(race_distance_input)
+RSI    = float(metrics.attrs.get("RSI", np.nan))
+SCI    = float(metrics.attrs.get("SCI", np.nan))
+GOING  = str(metrics.attrs.get("GOING", "Good"))
+
+BEND_S = metrics.attrs.get("BEND_START_M", None)   # metres-from-home (e.g., 800)
+BEND_E = metrics.attrs.get("BEND_END_M",   None)   # metres-from-home (e.g., 400)
+
+# ---------- helpers (RAM-light, vectorised) ----------
+def _as_num(s):   return pd.to_numeric(s, errors="coerce")
+def _clip01(x):   return np.minimum(1.0, np.maximum(0.0, x))
+def _mad_std(x):
+    x = np.asarray(pd.to_numeric(x, errors="coerce"), dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size == 0: return np.nan
+    med = np.median(x); mad = np.median(np.abs(x - med))
+    return 1.4826 * mad if mad > 0 else (np.std(x) if x.size else np.nan)
+
+def _percentile01(col):
+    s = _as_num(col)
+    med = np.nanmedian(s); sd = _mad_std(s)
+    if not np.isfinite(sd) or sd <= 0: sd = 1.0
+    z = (s - med) / sd
+    return _clip01(1.0 / (1.0 + np.exp(-0.8 * z)))  # logistic squash to 0..1
+
+def _ema_np(arr, alpha=0.35):
+    out = np.empty_like(arr, dtype=float)
+    prev = np.nan
+    for i, v in enumerate(arr):
+        if not np.isfinite(prev):
+            prev = v
+        else:
+            prev = alpha * v + (1 - alpha) * prev
+        out[i] = prev
+    return out
+
+def _trip_band_kmph(D):
+    # Absolute km/h anchors (trip-aware). Returns (lo, hi) for mapping 0..1.
+    if D <= 1200:  return 66.0, 74.0
+    if D <= 1600:  return 62.0, 70.0
+    if D <= 2000:  return 60.0, 67.0
+    if D <= 2400:  return 58.0, 65.0
+    return 56.0, 63.0
+
+def _map01(x, lo, hi):
+    if not np.isfinite(x): return 0.0
+    if hi <= lo: return 0.0
+    return float(_clip01((x - lo) / (hi - lo)))
+
+def _trip_weights(D):
+    # Engine blend and SSI blend vary with trip
+    if D <= 1200:   return (0.60, 0.40), (0.45, 0.35, 0.10, 0.10)
+    if D <= 1650:   return (0.50, 0.50), (0.40, 0.35, 0.15, 0.10)
+    return (0.40, 0.60), (0.35, 0.40, 0.15, 0.10)
+
+# ---------- Build speed segments from *_Time columns ----------
+time_cols = [c for c in VP.columns if isinstance(c, str) and c.endswith("_Time")]
+def _mark_key(c):
+    try:    return int(c.split("_")[0])
+    except: return 10**9
+marks = sorted([_mark_key(c) for c in time_cols if c != "Finish_Time" and _mark_key(c) < 10**9], reverse=True)
+
+segs = []  # (label, length_m, src_col, end_m_from_home)
+if marks:
+    first = int(marks[0])
+    L0 = max(1.0, D_m - first)
+    if f"{first}_Time" in VP.columns:
+        segs.append((f"{int(D_m)}→{first}", float(L0), f"{first}_Time", first))
+    for a, b in zip(marks, marks[1:]):
+        src = f"{int(b)}_Time"
+        if src in VP.columns:
+            segs.append((f"{int(a)}→{int(b)}", float(a - b), src, b))
+if "Finish_Time" in VP.columns:
+    fin_len = 100.0 if STEP == 100 else 200.0
+    segs.append((f"{int(STEP)}→0 (Finish)", float(fin_len), "Finish_Time", 0))
+
+if not segs:
+    st.info("V-Profile 2.0: no *_Time columns found — cannot compute engine score.")
+else:
+    # ---------- Speeds per segment (m/s), mask first 200 m ----------
+    # We exclude earliest segments until cumulative length ≥ 200 m
+    lengths = np.array([L for (_, L, _, _) in segs], dtype=float)
+    cum_early = np.cumsum(lengths[::-1])[::-1]  # from start → toward finish
+    # segments flagged 'early' are those entirely within the first 200m from the start
+    excl = np.zeros_like(lengths, dtype=bool)
+    remain = 200.0
+    for i, L in enumerate(lengths):
+        if remain <= 0: break
+        if L <= remain:
+            excl[i] = True
+            remain -= L
+        else:
+            # partial segment; we can't split — keep it but it's no longer 'excluded'
+            break
+
+    # build per-horse speeds for each segment
+    t_mat = np.column_stack([_as_num(VP[src]) for (_, _, src, _) in segs]).astype(float)
+    t_mat[(t_mat <= 0) | (~np.isfinite(t_mat))] = np.nan
+    with np.errstate(invalid="ignore", divide="ignore"):
+        spd_mat = lengths / t_mat  # (horses × segments), m/s
+
+    # Smooth each horse’s speed curve (median(3) + EMA)
+    # Use simple convolution for median(3) emulation: roll min/median/max would be costly; cheap approx via np.nanmean over window + EMA
+    # We keep it light: apply EMA only (already very stabilising)
+    spd_smooth = np.apply_along_axis(lambda r: _ema_np(r, alpha=0.35), 1, spd_mat)
+
+    # Optional bend de-weighting mask per segment (by segment centre/end marker ~ end_m_from_home)
+    if BEND_S is not None and BEND_E is not None and BEND_S > BEND_E:
+        ends = np.array([endm for (_, _, _, endm) in segs], dtype=float)
+        starts = ends + lengths
+        centers = 0.5 * (starts + ends)
+        bend_w = np.where((centers <= BEND_S) & (centers >= BEND_E), 0.5, 1.0)
+    else:
+        bend_w = np.ones_like(lengths)
+
+    # Apply exclusion mask (first 200 m)
+    use_mask = ~excl
+
+    # ---------- Vmax & adaptive near-top threshold ----------
+    # Compute per-horse Vmax on used segments
+    spd_use = spd_smooth[:, use_mask]
+    Vmax_mps = np.nanmax(spd_use, axis=1)
+    Vmax_kmph = Vmax_mps * 3.6
+
+    # Race intensity to set threshold θ
+    ts_med = _as_num(VP.get("tsSPI")).median(skipna=True)
+    if not np.isfinite(ts_med): ts_med = 100.0
+    theta = 0.94
+    if ts_med < 100.0:   theta = 0.96   # crawly → stricter
+    elif ts_med >= 102:  theta = 0.92   # truly run → easier
+    theta_exit = max(0.90, theta - 0.005)
+
+    p_pow = 2.2  # AUC exponent (heavier weight near Vmax)
+
+    # Precompute per-segment Δt for AUC and onset maths
+    # Use each horse’s own time; where NaN, contribute 0
+    dt_mat = t_mat.copy()
+    dt_mat[~np.isfinite(dt_mat)] = 0.0
+
+    # Distance-from-home at segment starts (for onset)
+    seg_end = np.array([e for (_, _, _, e) in segs], dtype=float)
+    seg_start = seg_end + lengths
+
+    Sustain_s = np.zeros(len(VP), dtype=float)
+    AUC_nt    = np.zeros(len(VP), dtype=float)
+    Onset_m   = np.full(len(VP), np.nan, dtype=float)
+
+    for i in range(len(VP)):
+        v = spd_smooth[i, :]
+        dt = dt_mat[i, :]
+        if not np.isfinite(Vmax_mps[i]) or Vmax_mps[i] <= 0:
+            Sustain_s[i] = 0.0; AUC_nt[i] = 0.0; Onset_m[i] = np.nan
+            continue
+
+        # Near-top with hysteresis; only consider used segments
+        ratio = np.divide(v, Vmax_mps[i])
+        near = np.zeros_like(ratio, dtype=bool)
+        on = False
+        for j in range(ratio.size):
+            if not use_mask[j] or not np.isfinite(ratio[j]): 
+                continue
+            if not on and ratio[j] >= theta:
+                on = True; near[j] = True
+            elif on and ratio[j] >= theta_exit:
+                near[j] = True
+            else:
+                on = False
+
+        # merge tiny gaps <=0.2s (fill), drop runs <0.8s
+        # find runs:
+        idx = np.where(near)[0]
+        if idx.size:
+            # fill tiny single-gap between two runs if the gap dt ≤ 0.2 s
+            gaps = np.where(np.diff(idx) > 1)[0]
+            for g in gaps:
+                gap_start = idx[g] + 1
+                gap_end = idx[g+1] - 1
+                gap_dt = np.nansum(dt[gap_start:gap_end+1])
+                if gap_dt <= 0.2:
+                    near[gap_start:gap_end+1] = True
+
+            # remove short runs <0.8 s
+            pr = np.where(~near)[0]
+            # segment runs by scanning:
+            s = 0
+            while s < near.size:
+                if near[s]:
+                    e = s
+                    while e + 1 < near.size and near[e+1]:
+                        e += 1
+                    run_dt = np.nansum(dt[s:e+1])
+                    if run_dt < 0.8:
+                        near[s:e+1] = False
+                    s = e + 1
+                else:
+                    s += 1
+
+        # compute totals with bend weighting
+        dur = float(np.nansum(dt[near]))
+        wt  = bend_w[near] if near.any() else np.array([], dtype=float)
+        sp  = v[near] if near.any() else np.array([], dtype=float)
+        dtn = dt[near] if near.any() else np.array([], dtype=float)
+        auc = float(np.nansum(((np.divide(sp, Vmax_mps[i]) ** p_pow) * dtn) * (wt if wt.size else 1.0)))
+
+        # earliest onset of the **longest** run → metres-from-home
+        onset_m = np.nan
+        if near.any():
+            # find longest consecutive near block by time
+            best_sum, best_s = 0.0, -1
+            s = 0
+            while s < near.size:
+                if near[s]:
+                    e = s
+                    while e + 1 < near.size and near[e+1]:
+                        e += 1
+                    run_dt = float(np.nansum(dt[s:e+1]))
+                    if run_dt > best_sum:
+                        best_sum, best_s = run_dt, s
+                    s = e + 1
+                else:
+                    s += 1
+            if best_s >= 0:
+                # onset metres ≈ end_m of the segment right before the first near sample in that best run
+                onset_m = float(seg_end[best_s])
+
+        Sustain_s[i] = dur
+        AUC_nt[i]    = auc
+        Onset_m[i]   = onset_m
+
+    VP["Vmax_mps"]  = Vmax_mps
+    VP["Vmax_kmph"] = Vmax_kmph
+    VP["Sustain_s"] = Sustain_s
+    VP["AUC_nt"]    = AUC_nt
+    VP["Onset_from_home_m"] = Onset_m
+
+    # ---------- Absolute + relative speed anchoring ----------
+    lo_k, hi_k = _trip_band_kmph(D_m)
+    abs_anchor = np.array([_map01(vk, lo_k, hi_k) for vk in Vmax_kmph], dtype=float)
+    rel_anchor = _percentile01(VP["Vmax_mps"]).to_numpy()
+    Vmax_score = _clip01(0.70 * abs_anchor + 0.30 * rel_anchor)
+
+    # ---------- Sustain Index (SSI*) ----------
+    # Normalise by race scale; prefer quality near top (AUC per second)
+    rt_s = _as_num(VP.get("RaceTime_s"))
+    if not np.isfinite(rt_s).any():
+        # fallback if RaceTime_s missing: approximate by sum of times of used segments
+        rt_s = pd.Series(np.nansum(t_mat[:, use_mask], axis=1), index=VP.index)
+
+    dur_rel = np.nan_to_num(Sustain_s / (rt_s.to_numpy() + 1e-6))
+    auc_rel = np.nan_to_num(AUC_nt / (rt_s.to_numpy() + 1e-6))
+
+    dur01 = _percentile01(dur_rel).to_numpy()
+    auc01 = _percentile01(auc_rel).to_numpy()
+
+    acc = _as_num(VP.get("Accel")); grd = _as_num(VP.get(GR_COL))
+    den = (acc.add(grd, fill_value=0) / 2.0).replace(0, np.nan)
+    sm_raw = 1.0 - (acc - grd).abs() / den
+    sm01 = _percentile01(sm_raw.fillna(np.nanmedian(sm_raw))).to_numpy()
+
+    on01 = 1.0 - _percentile01(VP["Onset_from_home_m"]).to_numpy()  # earlier → higher
+
+    (wV, wS), (w_dur, w_auc, w_sm, w_on) = _trip_weights(D_m)
+    SSI_star = _clip01(w_dur * dur01 + w_auc * auc01 + w_sm * sm01 + w_on * on01)
+
+    # Tiny shape nudge (if available and clear)
+    if np.isfinite(RSI) and np.isfinite(SCI) and SCI >= 0.6:
+        SSI_star = _clip01(SSI_star * (1.0 + (0.03 if RSI < -0.6 else (-0.02 if RSI > 0.6 else 0.0))))
+
+    # ---------- Final Engine scores ----------
+    Engine10_bal = 10.0 * np.power(Vmax_score, wV) * np.power(SSI_star, wS)
+    Engine10_bal = np.clip(Engine10_bal, 0.0, 10.0)
+
+    # Raw “power × duration” side-dial
+    SSS_raw = Vmax_mps * Sustain_s  # m/s × s = m (proxy magnitude)
+    # Trip anchors for mapping (tune later with your archive)
+    if D_m <= 1200:    lo_sss, hi_sss = 13.0, 24.0
+    elif D_m <= 1600:  lo_sss, hi_sss = 12.0, 22.0
+    elif D_m <= 2000:  lo_sss, hi_sss = 11.0, 20.0
+    else:              lo_sss, hi_sss = 10.0, 19.0
+    SSS01 = np.array([_map01(x, lo_sss, hi_sss) for x in SSS_raw], dtype=float)
+    Engine10_raw = 10.0 * SSS01
+
+    # ---------- Output table (RAM-friendly) ----------
+    out = pd.DataFrame({
+        "Horse": VP.get("Horse", pd.Series(np.arange(len(VP)))).astype(str),
+        "Engine10": np.round(Engine10_bal, 2),
+        "Vmax (km/h)": np.round(Vmax_kmph, 2),
+        "Sustain near-top (s)": np.round(Sustain_s, 2),
+        "Dur% of race": np.round(100.0 * dur_rel, 1),
+        "Onset (m-from-home)": np.round(Onset_m, 0),
+        "SSI* (0-100)": np.round(100.0 * SSI_star, 1),
+        "SpeedScore (0-100)": np.round(100.0 * Vmax_score, 1),
+        "Engine10 (raw dial)": np.round(Engine10_raw, 2),
+    }, index=VP.index)
+
+    out = out.sort_values(["Engine10", "SSI* (0-100)", "SpeedScore (0-100)"], ascending=[False, False, False])
+    st.dataframe(out, use_container_width=True)
+
+    with st.expander("How to read this"):
+        st.markdown(
+            "- **Engine10** is the headline one-run figure (0–10), balancing absolute top speed and how long you stayed near it.\n"
+            "- **Vmax (km/h)** is anchored to trip-realistic bands (70%) plus a field-relative safety net (30%).\n"
+            "- **SSI*** rewards *time & quality near top* (AUC/sec), smoothness (Accel≈Grind), and earlier onset (small).\n"
+            "- **Engine10 (raw dial)** is a physics-y side-read from Vmax×duration, mapped per trip — great for freak efforts.\n"
+            "- First 200 m excluded; optional bend segments down-weighted if bend bounds are provided."
+        )
+# ======================= /V-Profile 2.0 — One-Run Engine =======================
+
 # ======================= PWX + EFI — Robust final build =======================
 st.markdown("## PWX + EFI — Burst vs. Efficiency (field-calibrated)")
 
