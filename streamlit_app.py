@@ -1933,6 +1933,108 @@ else:
         st.caption(f"Top-10 plotted: {rule}. Finish segment included explicitly.")
 # ======================= /Pace Curve (lean version) =======================
 
+# ===== Energy Interpretation — Early/Late/ΔG (no plots) =====
+import numpy as np
+import pandas as pd
+
+def _nz(x, alt=np.nan):
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else alt
+    except Exception:
+        return alt
+
+def _z(x):
+    x = pd.to_numeric(x, errors="coerce")
+    mu, sd = np.nanmean(x), np.nanstd(x)
+    if not np.isfinite(sd) or sd == 0:  # guard tiny fields
+        return pd.Series(np.zeros(len(x)), index=x.index)
+    return (x - mu) / sd
+
+def build_energy_interpretation(df,
+                                early_col="EARLY_idx",
+                                late_col="LATE_idx",
+                                deltag_col="DeltaG"):
+    E = pd.to_numeric(df.get(early_col), errors="coerce")
+    L = pd.to_numeric(df.get(late_col),  errors="coerce")
+    DG = pd.to_numeric(df.get(deltag_col), errors="coerce")
+
+    # Deviations from the race equilibrium = 100 baseline
+    E_dev = E - 100.0   # + = extra early burn, - = conserved
+    L_dev = L - 100.0   # + = strong late hold, - = tailed off
+    DG_dev = DG - 100.0 # + = overperformed efficiency, - = under
+
+    # Volatility / balance
+    balance = L_dev - E_dev            # + = finished stronger than started
+    abs_imb = (E_dev.abs() + L_dev.abs()) - balance.abs()  # “wasted motion”
+
+    # Normalized components for a single signature score (higher = better run shape)
+    zE = _z(E_dev)   # we will subtract zE (penalize early spend)
+    zL = _z(L_dev)
+    zDG = _z(DG_dev)
+
+    # Signature score (weights tuned to reward late strength + efficiency, penalize early spend)
+    sig = (0.45 * zL) + (0.20 * zDG) - (0.35 * zE)
+
+    # Risk: higher when early/late are far apart or both extreme
+    risk = _z((E_dev.abs() + L_dev.abs()) + abs_imb)
+
+    # Categorical flags
+    def tag_row(e, l, dg):
+        if not np.isfinite(e) or not np.isfinite(l) or not np.isfinite(dg):
+            return "insufficient"
+        # Strong patterns first
+        if e <= -1.5 and l >= 1.5 and dg >= 2.0:
+            return "Hidden closer (against shape)"
+        if e >= 1.5 and l >= 1.0:
+            return "Pressed & found (tough)"
+        if e >= 1.5 and l <= -1.0:
+            return "Front-spent (paid late)"
+        if e <= -1.0 and l <= -1.0:
+            return "Idle run / never involved"
+        if l >= 1.5:
+            return "Late engine"
+        if e >= 1.5:
+            return "Fast early"
+        return "balanced"
+
+    def cue_row(dg):
+        if not np.isfinite(dg): return "neutral"
+        if dg >= 2.0:  return "↑ over-efficiency (out-ran rating)"
+        if dg <= -2.0: return "↓ under-efficiency (trip/fitness?)"
+        return "neutral"
+
+    # Trip suggestions (very light-touch heuristics)
+    def trip_hint(e, l):
+        if l >= 1.5 and e <= 0.5:   return "up in trip OK / strong closer"
+        if e >= 1.5 and l <= 0.0:   return "drop in trip/softer pace"
+        if abs(e) < 0.7 and abs(l) < 0.7: return "any trip (shape-neutral)"
+        return "needs shape/ride"
+
+    out = pd.DataFrame({
+        "Horse": df["Horse"],
+        "Early_dev": np.round(E_dev, 2),
+        "Late_dev":  np.round(L_dev, 2),
+        "DeltaG":    np.round(DG, 2),
+        "Balance":   np.round(balance, 2),
+        "SigScore":  np.round(sig, 2),
+        "Risk":      np.round(risk, 2),
+        "Tag":       [tag_row(e, l, d) for e, l, d in zip(E_dev, L_dev, DG_dev)],
+        "Cue":       [cue_row(d) for d in DG_dev],
+        "Trip":      [trip_hint(e, l) for e, l in zip(E_dev, L_dev)]
+    })
+
+    # Nice ordering: highest signal first, then lower risk
+    out = out.sort_values(["SigScore", "Balance", "Late_dev"], ascending=[False, False, False]).reset_index(drop=True)
+    return out
+
+# ---- run it on your metrics table ----
+# Expect metrics to already include columns 'Horse', 'EARLY_idx', 'LATE_idx', 'DeltaG'
+energy_view = build_energy_interpretation(metrics, early_col="EARLY_idx", late_col="LATE_idx", deltag_col="DeltaG")
+
+# Streamlit table (or just display/return in your pipeline)
+st.dataframe(energy_view, use_container_width=True)
+
 # ======================= Winning DNA Matrix — distance-aware & report cards =======================
 st.markdown("## Winning DNA Matrix")
 
