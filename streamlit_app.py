@@ -2951,6 +2951,304 @@ st.caption(
 
 # ======================= /V-Profile =======================
 
+# ======================= Fatigue Curve & Endurance Signature (FC-ES) =======================
+st.markdown("## Fatigue Curve & Endurance Signature (post-peak decay vs field)")
+
+# --- pick the timings dataframe (raw split columns) ---
+df_raw = 'work' in globals() and isinstance(work, pd.DataFrame) and not work.empty
+tim = work.copy() if df_raw else metrics.copy()
+
+# --- basics ---
+STEP = int(metrics.attrs.get("STEP", 100))
+D_m  = float(metrics.attrs.get("D_m", race_distance_input if 'race_distance_input' in globals() else 0))
+
+# --- helper: collect ordered split markers (numbers from "..._Time") ---
+def _collect_markers_from_columns(cols):
+    marks = []
+    for c in cols:
+        if isinstance(c, str) and c.endswith("_Time") and c != "Finish_Time":
+            head = c.split("_")[0]
+            try:
+                marks.append(int(head))
+            except:
+                pass
+    # Keep only plausible markers (0 < m < D_m), unique, sorted DESC (early→late)
+    marks = sorted({m for m in marks if 0 < m < D_m}, reverse=True)
+    return marks
+
+marks = _collect_markers_from_columns(tim.columns)
+
+# Build segment list: (label, length_m, source_col, end_from_home_m)
+segs = []
+if marks:
+    # first leg: D → m1
+    m1 = marks[0]
+    L0 = max(1.0, float(D_m - m1))
+    if f"{m1}_Time" in tim.columns:
+        segs.append((f"{int(D_m)}→{m1}", L0, f"{m1}_Time", float(m1)))
+    # middle legs: a → b, time col is b_Time
+    for a, b in zip(marks, marks[1:]):
+        col = f"{int(b)}_Time"
+        if col in tim.columns:
+            segs.append((f"{a}→{b}", float(a - b), col, float(b)))
+
+# finish leg: always Finish_Time if present
+if "Finish_Time" in tim.columns:
+    fin_len = 100.0 if STEP == 100 else 200.0
+    segs.append((f"{STEP}→0 (Finish)", fin_len, "Finish_Time", 0.0))
+
+if not segs:
+    st.info("FC-ES: Not enough *_Time columns to compute fatigue curve.")
+else:
+    # --- smoothing helpers (very light to preserve real moves) ---
+    def _ema_np(x, alpha=0.35):
+        out = np.empty_like(x, dtype=float)
+        prev = np.nan
+        for i, v in enumerate(x):
+            if not np.isfinite(prev):
+                prev = v
+            else:
+                prev = alpha * v + (1 - alpha) * prev
+            out[i] = prev
+        return out
+
+    # storage
+    rows = []
+    last_split_speeds = []  # for FT field median
+    norm_curves = []        # (horse, xs[], rs[]) for REP median curve
+
+    # Pre-resolve indices to avoid recomputing per row
+    seg_labels, seg_lengths, seg_cols, seg_ends = zip(*segs)  # tuples
+    seg_lengths = np.array(seg_lengths, dtype=float)
+    seg_ends    = np.array(seg_ends, dtype=float)
+
+    # Iterate horses
+    for idx, r in tim.iterrows():
+        name = str(r.get("Horse", f"#{idx}"))
+
+        # Build per-segment time and speed
+        tvals = []
+        for col in seg_cols:
+            tv = pd.to_numeric(r.get(col), errors="coerce")
+            tv = float(tv) if (pd.notna(tv) and tv > 0) else np.nan
+            tvals.append(tv)
+        tvals = np.array(tvals, dtype=float)
+
+        # Guard: at least 3 valid segments
+        if np.isfinite(tvals).sum() < 3:
+            rows.append({
+                "Horse": name, "Vmax_kmh": np.nan, "FI_%": np.nan, "FS_%/200m": np.nan,
+                "FO_m": np.nan, "A95_m": np.nan, "FT_%": np.nan, "REP_%": np.nan, "Signature": "NA"
+            })
+            last_split_speeds.append(np.nan)
+            norm_curves.append((name, np.array([]), np.array([])))
+            continue
+
+        spd = np.divide(seg_lengths, tvals, out=np.full_like(tvals, np.nan, dtype=float), where=np.isfinite(tvals))
+        # ignore the first split (launch noise): that's index 0
+        spd_use = spd.copy()
+        spd_use[0] = np.nan
+
+        # light smoothing on the **used** part only
+        s = pd.Series(spd_use)
+        s_med = s.rolling(3, center=True, min_periods=1).median().to_numpy()
+        s_smooth = _ema_np(s_med, alpha=0.35)
+
+        # Find Vmax AFTER the ignored first split
+        if np.isfinite(s_smooth[1:]).any():
+            i_peak_rel = np.nanargmax(s_smooth[1:]) + 1
+        else:
+            i_peak_rel = np.nanargmax(s_smooth)  # fallback (rare)
+
+        vmax = s_smooth[i_peak_rel]
+        vmax_kmh = vmax * 3.6 if np.isfinite(vmax) else np.nan
+
+        # Fatigue window = after the peak
+        i_start = int(i_peak_rel + 1)
+        if i_start >= len(s_smooth) - 1:
+            # too short: force last 2 segments
+            i_start = max(len(s_smooth) - 2, 1)
+
+        # Normalized curve r_j = v_j / Vmax over window
+        v_win = s_smooth[i_start:]
+        x_win = seg_ends[i_start:]   # metres from home (end of segment)
+        L_win = seg_lengths[i_start:]
+        r_win = np.divide(v_win, vmax, out=np.full_like(v_win, np.nan), where=(np.isfinite(v_win) & (vmax > 0)))
+
+        # FI: drop from peak to finish
+        v_finish = s_smooth[-1]
+        FI = 100.0 * (1.0 - (v_finish / vmax)) if (np.isfinite(v_finish) and np.isfinite(vmax) and vmax > 0) else np.nan
+
+        # FS: slope (% per 200m) of r vs distance-from-home (higher negative decay → larger FS)
+        FS = np.nan
+        if np.isfinite(r_win).sum() >= 2 and np.isfinite(x_win).sum() >= 2:
+            # OLS slope on valid points
+            mask = np.isfinite(r_win) & np.isfinite(x_win)
+            if mask.sum() >= 2:
+                xx = x_win[mask]
+                yy = r_win[mask]
+                # Fit yy = a + b*xx
+                b, a = np.polyfit(xx, yy, 1)
+                # b is per metre; convert to % per 200m, positive means decay rate magnitude
+                FS = -b * 100.0 * 200.0
+
+        # FO: first sustained drop below 0.98*Vmax (hysteresis: ≥2 of next 3 below)
+        FO = np.nan
+        if np.isfinite(r_win).sum() >= 1:
+            thr = 0.98
+            for j in range(len(r_win)):
+                window = r_win[j:j+3]
+                below = np.isfinite(window) & (window < thr)
+                if below.sum() >= 2:
+                    FO = float(x_win[j])  # metres-from-home at onset split end
+                    break
+            if not np.isfinite(FO):
+                # no clear onset → very late
+                FO = float(min(x_win) if len(x_win) else 0.0)
+
+        # A95: distance at/above 95% within fatigue window
+        A95 = float(np.nansum(np.where(np.isfinite(r_win) & (r_win >= 0.95), L_win, 0.0)))
+
+        # For FT (finish tail vs field median)
+        last_split_speeds.append(v_finish if np.isfinite(v_finish) else np.nan)
+
+        # Store normalized curve for REP
+        norm_curves.append((name, x_win.copy(), r_win.copy()))
+
+        rows.append({
+            "Horse": name, "Vmax_kmh": round(vmax_kmh, 2) if np.isfinite(vmax_kmh) else np.nan,
+            "FI_%": round(FI, 2) if np.isfinite(FI) else np.nan,
+            "FS_%/200m": round(FS, 2) if np.isfinite(FS) else np.nan,
+            "FO_m": round(FO, 0) if np.isfinite(FO) else np.nan,
+            "A95_m": round(A95, 1) if np.isfinite(A95) else np.nan,
+            # FT_% and REP_% filled later after field medians are known
+            "FT_%": np.nan, "REP_%": np.nan, "Signature": ""
+        })
+
+    # --- Field medians and REP ---
+    # FT: compare last split speed vs field median
+    field_last_med = float(np.nanmedian(np.array(last_split_speeds))) if len(last_split_speeds) else np.nan
+
+    # Median normalized decay curve across horses, aligned by distance-from-home bins
+    # Build bins dictionary: key = distance (metres from home), val = list of r at that distance
+    bins = {}
+    for (_name, xs, rs) in norm_curves:
+        for x, rj in zip(xs, rs):
+            if np.isfinite(x) and np.isfinite(rj):
+                bins.setdefault(float(x), []).append(float(rj))
+    # Compute medians for each bin
+    med_curve = {x: float(np.nanmedian(vals)) for x, vals in bins.items() if len(vals) > 0}
+
+    # Compute FT and REP per horse + Signature
+    out = []
+    for row, (_name, xs, rs) in zip(rows, norm_curves):
+        # FT
+        vfin = np.nan
+        # Recover v_finish from last_split_speeds aligned by order
+        # (we added in the same loop order, so index matches)
+        # But we didn't keep the index; recalc safely:
+        # If needed, recompute v_finish quickly using medians already in rows… we already stored FI; use last_split_speeds order:
+        # easiest: pull by position
+        # We'll do a fallback simple ratio using last_split_speeds list order:
+        # find this horse position
+        # (safe because zip preserves order)
+        # However, we can't access that position easily here—so recompute from rs/xs isn't possible.
+        # Simpler: use field_last_med and reconstruct v_finish from REP inputs:
+        # We didn't cache per-horse v_finish; let’s compute FT from the original 'tim' row again.
+        # Safer path: set FT from last_split_speeds in parallel by position:
+        pass
+
+    # Re-run a simple pass to assign FT using stored list (kept in order)
+    ft_vals = []
+    for vfin in last_split_speeds:
+        if np.isfinite(vfin) and np.isfinite(field_last_med) and field_last_med > 0:
+            ft_vals.append(100.0 * (vfin / field_last_med))
+        else:
+            ft_vals.append(np.nan)
+
+    # REP: mean difference to median curve over available points (×100 to %)
+    rep_vals = []
+    for (_name, xs, rs) in norm_curves:
+        diffs = []
+        for x, rj in zip(xs, rs):
+            med = med_curve.get(float(x), np.nan)
+            if np.isfinite(rj) and np.isfinite(med):
+                diffs.append(rj - med)
+        rep_vals.append(100.0 * float(np.nanmean(diffs)) if len(diffs) else np.nan)
+
+    # Fill rows with FT/REP and final Signature
+    def _signature(fi, fs, fo, ft, rep):
+        # Rules per spec; handle NaNs gracefully
+        fi = fi if np.isfinite(fi) else 999
+        fs = fs if np.isfinite(fs) else 999
+        ft = ft if np.isfinite(ft) else 100
+        rep = rep if np.isfinite(rep) else 0
+        # True Stayer
+        if fi <= 7.0 and fs <= 1.8 and rep >= 3.0 and ft >= 102.0:
+            return "🏆 True Stayer"
+        # Balanced Cruiser
+        if 7.0 < fi <= 10.0 and 1.8 < fs <= 2.5 and abs(rep) < 3.0:
+            return "⚖️ Balanced Cruiser"
+        # False Weakener (pace-induced fade)
+        if fi >= 10.0 and abs(rep) <= 1.0:
+            return "🧩 False Weakener"
+        # Sprinter / Spender
+        if fi >= 12.0 or fs >= 3.0:
+            return "⚡ Sprinter/Spender"
+        # Hidden Engine (late strength)
+        if fi <= 10.0 and ft >= 103.0 and rep >= 2.0:
+            return "🔎 Hidden Engine"
+        return "—"
+
+    for i in range(len(rows)):
+        rows[i]["FT_%"]  = round(ft_vals[i], 1) if np.isfinite(ft_vals[i]) else np.nan
+        rows[i]["REP_%"] = round(rep_vals[i], 1) if np.isfinite(rep_vals[i]) else np.nan
+        rows[i]["Signature"] = _signature(rows[i]["FI_%"], rows[i]["FS_%/200m"], rows[i]["FO_m"],
+                                          rows[i]["FT_%"], rows[i]["REP_%"])
+
+    fc = pd.DataFrame(rows)
+    # tidy and sort by best endurance (low FI, low FS, high REP/FT)
+    fc["__rank"] = (
+        fc["FI_%"].fillna(999) * 0.6 +
+        fc["FS_%/200m"].fillna(999) * 0.3 -
+        fc["REP_%"].fillna(-999) * 0.08 -
+        fc["FT_%"].fillna(0) * 0.02
+    )
+    show_cols = ["Horse","Vmax_kmh","FI_%","FS_%/200m","FO_m","A95_m","FT_%","REP_%","Signature"]
+    fc_view = fc.sort_values("__rank").reset_index(drop=True)[show_cols]
+    st.dataframe(fc_view, use_container_width=True)
+
+    # Optional tiny plot (toggle for RAM)
+    with st.expander("Show mini fatigue curves (normalized) — optional"):
+        draw_plot = st.checkbox("Render mini plot (saves RAM if off)", value=False)
+        if draw_plot:
+            # field median curve as faint black
+            xs_sorted = sorted(med_curve.keys(), reverse=True)
+            ys_med    = [med_curve[x] for x in xs_sorted]
+            fig_fc, ax_fc = plt.subplots(figsize=(7.0, 4.2))
+            ax_fc.plot(xs_sorted, ys_med, lw=2.0, color="black", alpha=0.4, label="Field median (normalized)")
+            # overlay up to 8 best signatures by REP
+            order = np.argsort(-np.nan_to_num(np.array(rep_vals), nan=-1e9))[:8]
+            palette = color_cycle(len(order)) if 'color_cycle' in globals() else [None]*len(order)
+            for k, i in enumerate(order):
+                nm, xs, rs = norm_curves[i]
+                ax_fc.plot(xs, rs, lw=1.2, marker="o", ms=2.5, label=nm,
+                           color=None if palette[k] is None else palette[k])
+            ax_fc.set_xlabel("Metres from home (end of split) →")
+            ax_fc.set_ylabel("Speed / Vmax (unitless)")
+            ax_fc.set_title("Fatigue Curves (post-peak) — normalized")
+            ax_fc.set_xlim(left=max(xs_sorted + [STEP]), right=-10)  # ensure left>right for descending axis
+            ax_fc.invert_xaxis()
+            ax_fc.grid(True, linestyle=":", alpha=0.25)
+            ax_fc.legend(loc="upper right", frameon=False, fontsize=8, ncol=2)
+            st.pyplot(fig_fc)
+
+    st.caption(
+        "FI = drop from peak to finish (lower is better). FS = decay rate (%/200m; lower is flatter). "
+        "FO = onset (m-from-home) of sustained fade below 98% Vmax. A95 = metres spent ≥95% of Vmax post-peak. "
+        "FT = finish split vs field median (%). REP = average advantage to the field’s normalized decay curve (%)."
+    )
+# ======================= /Fatigue Curve & Endurance Signature =======================
 # ======================= PWX + EFI — Robust final build =======================
 st.markdown("## PWX + EFI — Burst vs. Efficiency (field-calibrated)")
 
