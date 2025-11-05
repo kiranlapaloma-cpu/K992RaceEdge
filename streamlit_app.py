@@ -3386,9 +3386,6 @@ def build_fatigue_table_refined(metrics: pd.DataFrame) -> pd.DataFrame:
         "FatigueScore": np.round(FatigueScore, 3),
     })
 
-    # Order: late engines first, then balanced, then front-spent; within group by score desc
-    ord_grp = np.where(view["Tag"] == "late engine", 0,
-                np.where(view["Tag"] == "balanced", 1, 2)).astype(np.int16)
     view = view.assign(_g=ord_grp, _s=-view["FatigueScore"].astype(float))\
                .sort_values(["_g","_s","Reliability"], ascending=[True, True, False])\
                .drop(columns=["_g","_s"])\
