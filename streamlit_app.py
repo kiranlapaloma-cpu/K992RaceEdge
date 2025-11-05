@@ -3374,25 +3374,6 @@ def build_fatigue_table_refined(metrics: pd.DataFrame) -> pd.DataFrame:
     Mono = np.nan_to_num(monos, nan=0.5).astype(np.float32)
     Reliability = (0.5 * comp + 0.5 * np.clip(Mono, 0.0, 1.0)).astype(np.float32)
 
-    # Tags / Cues (IQR-relative + minimum absolute floors so they travel across races)
-    fg_iqr = np.nanpercentile(FG_eff, 75) - np.nanpercentile(FG_eff, 25)
-    fg_floor = max(0.03, 0.12 * fg_iqr)  # both absolute and relative
-    line_iqr = np.nanpercentile(LineEff, 75) - np.nanpercentile(LineEff, 25)
-    line_floor = max(0.80, 0.15 * line_iqr)
-
-    cond_late   = (LineEff >= line_floor) & (FG_eff <= -fg_floor)  # strong late line with less-than-field fade
-    cond_spent  = (LineEff <= -line_floor) & (FG_eff >= fg_floor)  # weak late + extra fade
-    cond_bal    = np.abs(FG_vs_field) <= 0.25
-
-    Tag = np.full(len(df), "neutral", dtype=object)
-    Tag[cond_bal]   = "balanced"
-    Tag[cond_spent] = "front-spent"
-    Tag[cond_late]  = "late engine"
-
-    Cue = np.full(len(df), "needs shape/ride", dtype=object)
-    Cue[cond_bal]   = "repeats"
-    Cue[cond_spent] = "↓ trip / easier early"
-    Cue[cond_late]  = "↑ trip / stronger pace"
 
     # Assemble view
     view = pd.DataFrame({
