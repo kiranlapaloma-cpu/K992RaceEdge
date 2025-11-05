@@ -3402,8 +3402,6 @@ def build_fatigue_table_refined(metrics: pd.DataFrame) -> pd.DataFrame:
         "Line_vs_field": np.round(Line_vs_field, 3),         # keep raw sign convention
         "FG_eff(adjusted)": np.round(FG_eff, 3),
         "Reliability": np.round(Reliability, 3),
-        "Tag": Tag,
-        "Cue": Cue,
         "FatigueScore": np.round(FatigueScore, 3),
     })
 
