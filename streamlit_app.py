@@ -1937,6 +1937,8 @@ else:
 import numpy as np
 import pandas as pd
 
+st.markdown("## Energy Interpretation")
+
 def _nz(x, alt=np.nan):
     try:
         v = float(x)
