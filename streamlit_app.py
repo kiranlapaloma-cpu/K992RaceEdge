@@ -3120,6 +3120,140 @@ else:
     st.dataframe(out,use_container_width=True)
 # ======================= /PWX + EFI =======================
 
+# ======================= Fatigue Module — Early burn vs Late finish (RAM-lean) =======================
+st.markdown("## Fatigue Read — early burn vs late finish (field-adjusted)")
+
+import numpy as np
+import pandas as pd
+
+# ---- config / guards ---------------------------------------------------------
+GR_COL = str(metrics.attrs.get("GR_COL", "Grind"))
+DIST_M = float(metrics.attrs.get("DIST_M", float(race_distance_input)))
+
+need = ["Horse", "tsSPI", "Accel", GR_COL, "EARLY_idx", "LATE_idx", "DeltaG"]
+miss = [c for c in need if c not in metrics.columns]
+if miss:
+    st.warning("Fatigue Read: missing columns → " + ", ".join(miss))
+else:
+    # ---- select minimal view (avoid copies) ----------------------------------
+    view = metrics.loc[:, ["Horse", "tsSPI", "Accel", GR_COL, "EARLY_idx", "LATE_idx", "DeltaG"]]
+
+    # Horse names (keep as small list of str)
+    horses = view["Horse"].astype(str).tolist()
+
+    # All numeric as float32 (single allocation)
+    X = view.drop(columns="Horse").apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float32)
+    ts  = X[:, 0]   # tsSPI
+    ac  = X[:, 1]   # Accel
+    gr  = X[:, 2]   # Grind (or corrected Grind via GR_COL)
+    eix = X[:, 3]   # EARLY_idx
+    lix = X[:, 4]   # LATE_idx
+    dG  = X[:, 5]   # DeltaG
+
+    # ---- baseline anchor (scale-free) ----------------------------------------
+    # Default anchor = tsSPI; for pure sprints give Accel a small say (no copy; use mask)
+    B = ts.copy()
+    if DIST_M <= 1200:
+        B = 0.5 * (ts + ac)
+
+    # ---- segment deltas vs baseline ------------------------------------------
+    D_acc = ac - B
+    D_gr  = gr - B
+
+    # Fade/Gain rate per ~200m (negative = tiring, positive = building)
+    FG_core = (D_gr - D_acc) / np.float32(200.0)
+
+    # How they hit the line vs baseline
+    Level_rel = D_gr
+
+    # ---- field de-shaping (centre to race) -----------------------------------
+    # robust-ish medians (nan-safe)
+    m_core  = np.nanmedian(FG_core)
+    m_level = np.nanmedian(Level_rel)
+
+    FG_rel      = FG_core  - np.float32(m_core)
+    Level_field = Level_rel - np.float32(m_level)
+
+    # ---- attribution: early use & efficiency ---------------------------------
+    Early_dev = eix - np.float32(100.0)     # + = pressed early
+    # Efficiency tilt: reward doing more with less burn (DeltaG<100)
+    # (100 - DeltaG) positive when efficient, negative when wasteful
+    FG_eff = FG_rel - np.float32(0.20) * Early_dev + np.float32(0.10) * (np.float32(100.0) - dG)
+
+    # ---- reliability (0..1) ---------------------------------------------------
+    # Cheap "jitter" across Accel/Grind/tsSPI; penalise extreme early pushes
+    stack = np.vstack([ac, gr, ts]).astype(np.float32)
+    jitter = np.nanstd(stack, axis=0).astype(np.float32)
+    rel = 1.0 - np.float32(0.25) * jitter - np.float32(0.20) * (np.abs(Early_dev) / np.float32(10.0))
+    rel = np.clip(rel, 0.0, 1.0).astype(np.float32)
+
+    # If race-wide fade was extreme, soften to avoid over-calling tiredness
+    race_fade_hard = np.nanmedian(FG_core) < -0.012  # ≈ −1.2% per 200m
+    if bool(race_fade_hard):
+        FG_rel *= np.float32(0.7)
+        FG_eff *= np.float32(0.7)
+
+    # ---- tags & cues (vectorised) --------------------------------------------
+    # Conditions
+    cond_late_engine = (FG_eff >= 0.8) & (Level_field >= 1.5)
+    cond_balanced    = (np.abs(FG_rel) <= 0.3) & (np.abs(Level_field) <= 0.7)
+    cond_late_cliff  = (FG_eff <= -0.8) & ((D_gr - 2.0 * D_acc) <= -1.2)
+
+    tag_choices = np.array(["late engine", "balanced", "late cliff", "neutral"], dtype=object)
+    tag_idx = np.select(
+        [cond_late_engine, cond_balanced, cond_late_cliff],
+        [0, 1, 2],
+        default=3
+    ).astype(int)
+    tags = tag_choices[tag_idx]
+
+    cue_choices = np.array(
+        ["⬆ trip / stronger pace", "repeats", "⬇ trip / easier early", "needs shape/ride"],
+        dtype=object
+    )
+    cues = cue_choices[tag_idx]
+
+    # ---- composite (for sorting only; higher = better late resilience) -------
+    FatigueScore = (
+        np.float32(0.55) * (-FG_rel) +
+        np.float32(0.25) * (-FG_eff) +
+        np.float32(0.20) * (-Level_field)
+    ).astype(np.float32)
+
+    # ---- build tiny output frame (rounded for display only) ------------------
+    out = pd.DataFrame({
+        "Horse": horses,
+        "FG_rate/200m": FG_core,
+        "FG_vs_field": FG_rel,
+        "Line_vs_field": Level_field,
+        "FG_eff(adjusted)": FG_eff,
+        "Reliability": rel,
+        "Tag": tags,
+        "Cue": cues,
+        "FatigueScore": FatigueScore
+    })
+
+    # Sort: most actionable (late engine first), then score
+    # (Late engine → lower FG_rel/FG_eff/Level_field → higher FatigueScore by our sign choice)
+    out = out.sort_values(["Tag", "FatigueScore"], ascending=[True, False], kind="mergesort")
+
+    # Light rounding for view
+    view_cols = ["FG_rate/200m", "FG_vs_field", "Line_vs_field", "FG_eff(adjusted)", "Reliability", "FatigueScore"]
+    out_view = out.copy()
+    out_view[view_cols] = out_view[view_cols].astype(np.float32).round(3)
+
+    st.dataframe(out_view, use_container_width=True)
+    st.caption(
+        "Reading guide — **FG_rate/200m**: fade/gain per 200 m vs own baseline "
+        "(− = tiring, + = building). **FG_vs_field**/**Line_vs_field**: adjusted to the race’s overall shape. "
+        "**FG_eff**: de-biased for early burn (EARLY_idx) and efficiency (DeltaG). **Reliability**: 0–1 trust. "
+        "**Tag/Cue** gives the quick actionable take."
+    )
+
+    # Optional: tiny CSV download (no heavy buffers)
+    csv_bytes = out_view.to_csv(index=False).encode("utf-8")
+    st.download_button("Download Fatigue Read (CSV)", data=csv_bytes, file_name="fatigue_read.csv", mime="text/csv")
+# ======================= /Fatigue Module =======================
 # ======================= R&V (CAR) — Context-Aware Reliability =======================
 st.markdown("## R&V — Context-Aware Reliability (CAR)")
 
