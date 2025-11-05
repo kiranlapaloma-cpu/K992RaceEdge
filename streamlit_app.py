@@ -3120,144 +3120,156 @@ else:
     st.dataframe(out,use_container_width=True)
 # ======================= /PWX + EFI =======================
 
-# ===================== Fatigue Module v0.7 (RAM-light) ======================
-# Inputs expected: `metrics` DataFrame with at least 'Horse' and ideally:
-# 'FG_rate/200m', 'FG_vs_field', 'Line_vs_field', 'EARLY_idx', 'LATE_idx', 'DeltaG'
-# Also expects race distance in meters via DIST_M (int). Safe fallbacks included.
+# ======================= Fatigue Gradient — One-Run (lightweight) =======================
+# Columns shown: Horse | FG_rate/200m | FG_vs_field | Line_vs_field | FG_eff(adjusted)
+#                 | Reliability | Tag | Cue | FatigueScore
+# Works whether FG_vs_field / Line_vs_field exist or not (has safe fallbacks).
+# Sign fix: your data uses NEGATIVE Line_vs_field = stronger late kick.
+# We therefore use LineEff = (-Line_vs_field) internally (bigger = stronger closer).
 
 import numpy as np
 import pandas as pd
-import streamlit as st
 
-def _col(df, name, default=np.nan):
-    return df[name].to_numpy(dtype=np.float32, copy=False) if name in df.columns else np.full(len(df), default, dtype=np.float32)
+def _to_num(x):
+    s = pd.to_numeric(x, errors="coerce")
+    return s.astype(np.float32)
 
-def _nz(x, fill):
-    x = np.asarray(x, dtype=np.float32)
-    bad = ~np.isfinite(x)
-    if np.any(bad): x = x.copy(); x[bad] = fill
-    return x
-
-def _clip(x, lo, hi):
-    return np.minimum(np.maximum(x, lo), hi).astype(np.float32)
-
-def build_fatigue_table(metrics: pd.DataFrame, DIST_M: int = 1200) -> pd.DataFrame:
+def build_fatigue_table(metrics: pd.DataFrame, race_distance_m: float | int | None = None) -> pd.DataFrame:
     df = metrics.copy()
 
-    # ---------- Core signals (with fallbacks that keep RAM tiny) ----------
-    # Preferred direct cols if present
-    FG_rate = _col(df, "FG_rate/200m", default=np.nan)
-    FG_rel  = _col(df, "FG_vs_field", default=np.nan)
-    Line    = _col(df, "Line_vs_field", default=np.nan)
-    dG      = _col(df, "DeltaG", default=np.nan)  # ~100 baseline
+    # ---- 1) Basic columns (safe loads) -------------------------------------
+    horse = df.get("Horse", pd.Series(np.arange(len(df)), dtype=object))
 
-    # Fallbacks from early/late indices if needed
-    early_idx = _col(df, "EARLY_idx", default=np.nan)  # higher => spent more early
-    late_idx  = _col(df, "LATE_idx",  default=np.nan)  # higher => weaker line
-    n200_est  = max(int(round(DIST_M / 200.0)) - 2, 1)  # ~ (# of 200m after the first & last)
-    n200_est  = np.float32(n200_est)
+    Accel     = _to_num(df.get("Accel",     np.nan))
+    Grind     = _to_num(df.get("Grind",     np.nan))
+    EARLY_idx = _to_num(df.get("EARLY_idx", np.nan))
+    LATE_idx  = _to_num(df.get("LATE_idx",  np.nan))
+    DeltaG    = _to_num(df.get("DeltaG",    np.nan))  # 100 = neutral, >100 finished stronger
 
-    # FG_rate: slope of “fatigue” per 200m (negative = holds form late; positive = fades)
-    if not np.isfinite(FG_rate).any():
-        # scale ~ (early pressure - late resilience) / usable splits
-        FG_rate = (early_idx - late_idx) / n200_est
+    # Fallback for DeltaG if missing
+    if not np.isfinite(DeltaG).any():
+        # neutral fallback
+        DeltaG = pd.Series(np.full(len(df), 100.0, dtype=np.float32))
 
-    # FG_vs_field: relative to field median FG_rate
-    if not np.isfinite(FG_rel).any():
-        field_med = np.nanmedian(FG_rate) if np.isfinite(FG_rate).any() else 0.0
-        FG_rel = FG_rate - np.float32(field_med)
+    # ---- 2) Field-relative gradients ---------------------------------------
+    # FG_vs_field (how much more/less a horse faded vs the field)
+    if "FG_vs_field" in df.columns:
+        FG_rel = _to_num(df["FG_vs_field"])
+    else:
+        # Simple one-run proxy: (Grind - Accel) vs field median
+        raw_FG = (Grind - Accel)
+        FG_rel = (raw_FG - np.nanmedian(raw_FG)).astype(np.float32)
 
-    # Line_vs_field: how much better the late-line was vs field (positive = stronger closer)
-    if not np.isfinite(Line).any():
-        # Define "line strength" ~ (100 - late_idx), then compare to field median
-        line_strength = np.float32(100.0) - late_idx
-        field_med_line = np.nanmedian(line_strength) if np.isfinite(line_strength).any() else 0.0
-        Line = line_strength - np.float32(field_med_line)
+    # Line_vs_field (late-line strength vs field). In your data: NEGATIVE = stronger closer.
+    if "Line_vs_field" in df.columns:
+        Line_vs_field = _to_num(df["Line_vs_field"])
+    else:
+        # Proxy: (LATE_idx - EARLY_idx) vs field median
+        raw_line = (LATE_idx - EARLY_idx)
+        Line_vs_field = (raw_line - np.nanmedian(raw_line)).astype(np.float32)
 
-    # DeltaG fallback ~ 100 (neutral)
-    dG = _nz(dG, 100.0)
+    # ---- 3) Per-200m rate (just scale the FG_rel by #segments) -------------
+    if race_distance_m is None:
+        # Try to recover from session state (Streamlit) if you keep it there
+        try:
+            import streamlit as st
+            race_distance_m = float(st.session_state.get("race_distance_m", 1200))
+        except Exception:
+            race_distance_m = 1200.0
 
-    # Early_dev: positive if pressed early vs field
-    field_med_early = np.nanmedian(early_idx) if np.isfinite(early_idx).any() else 100.0
-    Early_dev = _nz(early_idx - np.float32(field_med_early), 0.0)
+    n_segments = max(1, int(round(float(race_distance_m) / 200.0)))
+    FG_rate_per_200 = (FG_rel / np.float32(n_segments)).astype(np.float32)
 
-    # ---------- Composites ----------
-    # LateCloserScore: wants big positive line, less fade vs field, efficient (smaller DeltaG)
-    LateCloserScore  = (np.float32(0.60) * Line
-                        + np.float32(0.30) * (-FG_rel)
-                        + np.float32(0.10) * (np.float32(100.0) - dG)).astype(np.float32)
+    # ---- 4) Sign fix for late-line: bigger is better closer -----------------
+    LineEff = (-Line_vs_field).astype(np.float32)  # <<==== IMPORTANT FIX
 
-    # FrontSpentScore: weak line + faded more than field + pressed early
-    FrontSpentScore  = (np.float32(0.60) * (-Line)
-                        + np.float32(0.30) * (FG_rel)
-                        + np.float32(0.10) * np.maximum(Early_dev, 0.0)).astype(np.float32)
+    # ---- 5) Scores (all vectorised) ----------------------------------------
+    # Early/Late deviations vs neutral 100
+    Early_dev = (EARLY_idx - np.float32(100.0)).astype(np.float32)
+    Late_dev  = (LATE_idx  - np.float32(100.0)).astype(np.float32)
 
-    # Distance-aware gates (gentle scaling)
-    dist_scale   = np.float32(np.sqrt(max(DIST_M, 1000.0) / 1200.0))  # ~1 at 1200m
-    late_line_th = np.float32(0.90) * dist_scale
-    late_sc_th   = np.float32(0.35) * dist_scale
-    spent_line_th= np.float32(0.90) * dist_scale
-    spent_sc_th  = np.float32(0.35) * dist_scale
+    # Efficiency: late-line (bigger is better now) minus a fraction of extra fade vs field
+    FG_eff_adj = (LineEff - np.float32(0.50) * FG_rel).astype(np.float32)
 
-    # Optional guard: in brutal races (DeltaG very high), ease both bars slightly
-    brutal = dG >= np.float32(101.5)
-    if brutal.any():
-        relax = np.float32(0.90)
-        late_line_th = np.where(brutal, relax * late_line_th, late_line_th).astype(np.float32)
-        late_sc_th   = np.where(brutal, relax * late_sc_th,   late_sc_th  ).astype(np.float32)
-        spent_line_th= np.where(brutal, relax * spent_line_th,spent_line_th).astype(np.float32)
-        spent_sc_th  = np.where(brutal, relax * spent_sc_th,  spent_sc_th ).astype(np.float32)
+    # Composite fatigue scores (positive = late engine; negative = front-spent)
+    # Tunable constants kept tiny for stability.
+    LateCloserScore = (np.float32(0.60) * LineEff +
+                       np.float32(0.30) * (-FG_rel) +
+                       np.float32(0.10) * (np.float32(100.0) - DeltaG)).astype(np.float32)
 
-    cond_late_engine = (Line >= late_line_th)   & (LateCloserScore  >= late_sc_th)
-    cond_front_spent = (Line <= -spent_line_th) & (FrontSpentScore >= spent_sc_th)
-    cond_balanced    = (np.abs(FG_rel) <= np.float32(0.25)) & (np.abs(Line) <= np.float32(0.60))
+    FrontSpentScore = (np.float32(0.60) * (-LineEff) +
+                       np.float32(0.30) * (FG_rel) +
+                       np.float32(0.10) * np.maximum(Early_dev, np.float32(0.0))).astype(np.float32)
 
-    # Tag & Cue
-    tag_choices = np.array(["late engine", "front-spent", "balanced", "neutral"], dtype=object)
-    cue_choices = np.array(["↑ trip / stronger pace", "↓ trip / easier early", "repeats", "needs shape/ride"], dtype=object)
-    tag_idx = np.select([cond_late_engine, cond_front_spent, cond_balanced], [0, 1, 2], default=3).astype(int)
-    tags = tag_choices[tag_idx]
-    cues = cue_choices[tag_idx]
+    # Normalised FatigueScore (late better > 0, spent < 0)
+    FatigueScore = (LateCloserScore - FrontSpentScore).astype(np.float32)
 
-    # FG_eff(adjusted): compact “how well fade matched the line” (handy at a glance)
-    FG_eff_adj = (Line - np.float32(0.50) * FG_rel).astype(np.float32)
+    # ---- 6) Reliability (lightweight, no extra RAM) ------------------------
+    # Mix: data completeness + small penalty for extreme FG_rel/LineEff
+    valid_cols = np.column_stack([
+        np.isfinite(Accel), np.isfinite(Grind),
+        np.isfinite(EARLY_idx), np.isfinite(LATE_idx),
+        np.isfinite(FG_rel), np.isfinite(Line_vs_field)
+    ])
+    comp = valid_cols.mean(axis=1).astype(np.float32)  # 0..1
 
-    # Reliability: higher when signals are moderate (extremes can be noisy) and N is okay
-    # Bound between 0.3 and 0.9 (RAM-free proxy)
-    base_rel = 0.85 / (1.0 + np.abs(FG_rel) + 0.5 * np.abs(Line))
-    Reliability = _clip(base_rel, 0.30, 0.90)
+    # Shape-stability dampener (keep super lightweight)
+    shape_pen = np.clip(1.0 - (np.abs(FG_rel)/8.0 + np.abs(LineEff)/10.0), 0.0, 1.0).astype(np.float32)
+    Reliability = (np.float32(0.4) * comp + np.float32(0.6) * shape_pen).astype(np.float32)
 
-    # Final FatigueScore (↑ better late resilience)
-    FatigueScore = (np.float32(0.70) * LateCloserScore
-                    - np.float32(0.30) * FrontSpentScore).astype(np.float32)
+    # ---- 7) Tags / Cues (using corrected sign) -----------------------------
+    # Gates
+    late_line_th = np.float32(0.80)   # needs a meaningful late-line
+    spent_line_th = np.float32(0.80)  # meaningful front-spent line (remember: LineEff uses flipped sign)
+    late_sc_th = np.float32(0.30)
+    spent_sc_th = np.float32(0.30)
 
-    # ---------- Assemble tidy view (same columns/order) ----------
-    out = pd.DataFrame({
-        "Horse": df["Horse"],
-        "FG_rate/200m": FG_rate.astype(np.float32),
-        "FG_vs_field":  FG_rel.astype(np.float32),
-        "Line_vs_field": Line.astype(np.float32),
-        "FG_eff(adjusted)": FG_eff_adj.astype(np.float32),
-        "Reliability": Reliability.astype(np.float32),
-        "Tag": tags,
-        "Cue": cues,
-        "FatigueScore": FatigueScore.astype(np.float32),
+    cond_late_engine = (LineEff >= late_line_th)   & (LateCloserScore  >= late_sc_th)
+    cond_front_spent = (LineEff <= -spent_line_th) & (FrontSpentScore >= spent_sc_th)
+    cond_balanced    = (np.abs(FG_rel) <= np.float32(0.25)) & (np.abs(LineEff) <= np.float32(0.60))
+
+    Tag = np.full(len(df), "neutral", dtype=object)
+    Tag[cond_balanced]    = "balanced"
+    Tag[cond_front_spent] = "front-spent"
+    Tag[cond_late_engine] = "late engine"
+
+    Cue = np.full(len(df), "needs shape/ride", dtype=object)
+    Cue[cond_balanced]    = "repeats"
+    Cue[cond_front_spent] = "↓ trip / easier early"
+    Cue[cond_late_engine] = "↑ trip / stronger pace"
+
+    # ---- 8) Assemble view ---------------------------------------------------
+    view = pd.DataFrame({
+        "Horse": horse,
+        "FG_rate/200m": FG_rate_per_200.round(3),
+        "FG_vs_field": FG_rel.round(3),
+        "Line_vs_field": Line_vs_field.round(3),         # keep raw sign for your visual consistency
+        "FG_eff(adjusted)": FG_eff_adj.round(3),
+        "Reliability": Reliability.round(3),
+        "Tag": Tag,
+        "Cue": Cue,
+        "FatigueScore": FatigueScore.round(3),
     })
 
-    # Friendly rounding for display (computations above stay float32)
-    disp = out.copy()
-    for c in ["FG_rate/200m","FG_vs_field","Line_vs_field","FG_eff(adjusted)","Reliability","FatigueScore"]:
-        disp[c] = disp[c].round(3)
+    # Sort: strongest late engines first, then balanced, then front-spent
+    order_key = np.where(view["Tag"] == "late engine", 0,
+                  np.where(view["Tag"] == "balanced",   1, 2)).astype(np.int16)
+    view = view.assign(_ord=order_key, _fs=-view["FatigueScore"].values)\
+               .sort_values(["_ord", "_fs"], ascending=[True, True])\
+               .drop(columns=["_ord", "_fs"])\
+               .reset_index(drop=True)
 
-    return disp
+    return view
 
-# ---- run & render -----------------------------------------------------------
-# DIST_M: pull from your app; safe fallback to 1200 if not present
-DIST_M = int(st.session_state.get("race_distance_m", 1200))
-fatigue_table = build_fatigue_table(metrics, DIST_M=DIST_M)
-
-st.dataframe(fatigue_table, use_container_width=True)
-# =================== end Fatigue Module v0.7 drop-in =========================
+# ---- 9) Render (Streamlit-friendly, but harmless elsewhere) ----------------
+try:
+    import streamlit as st
+    fatigue_table = build_fatigue_table(metrics, race_distance_m=st.session_state.get("race_distance_m", 1200))
+    st.dataframe(fatigue_table, use_container_width=True)
+except Exception:
+    # If not in Streamlit context, just leave the function available
+    pass
+# ============================================================================
 
 # ======================= R&V (CAR) — Context-Aware Reliability =======================
 st.markdown("## R&V — Context-Aware Reliability (CAR)")
