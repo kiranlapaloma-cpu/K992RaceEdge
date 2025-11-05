@@ -3122,6 +3122,308 @@ else:
     st.dataframe(out,use_container_width=True)
 # ======================= /PWX + EFI =======================
 
+# ======================= Fatigue Gradient — One-Run (refined, RAM-light) =======================
+import numpy as np
+import pandas as pd
+
+try:
+    import streamlit as st
+except Exception:
+    st = None
+
+# ---------- tiny helpers (scalar / vector, RAM-light) ----------
+def _to_num(s):
+    return pd.to_numeric(s, errors="coerce").astype(np.float32)
+
+def _nz(x, alt=0.0):
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else float(alt)
+    except Exception:
+        return float(alt)
+
+def _late_markers_from_cols(cols):
+    """Decide late-window markers from available *_Time columns.
+    100m splits: prefer 500,400,300,200,100,Finish. 200m splits: 400,200,Finish.
+    Returns list of (label, length_m, src_col) in left→right order (early→late)."""
+    want100 = ["500_Time","400_Time","300_Time","200_Time","100_Time","Finish_Time"]
+    want200 = ["400_Time","200_Time","Finish_Time"]
+    have = set(cols)
+
+    # Pick the fuller scheme we can actually support
+    if all(c in have for c in ["200_Time","Finish_Time"]) and any(c in have for c in ["300_Time","100_Time","500_Time","400_Time"]):
+        # Prefer 100m if we can get >=3 points
+        got = [c for c in want100 if c in have]
+        # Require at least 4 points to use the 100m scheme, else fall back to 200m
+        if len(got) >= 4:
+            # segment lengths: 100 for 100_Time legs, Finish leg = STEP (100/200)
+            return [(c.replace("_Time",""), 100.0, c) if c!="Finish_Time" else ("Finish", np.nan, c) for c in got]
+
+    # fallback: 200m
+    got = [c for c in want200 if c in have]
+    if len(got) >= 3:
+        return [(c.replace("_Time",""), 200.0, c) if c!="Finish_Time" else ("Finish", np.nan, c) for c in got]
+
+    # last resort: minimal late pair if exists
+    if "200_Time" in have and "Finish_Time" in have:
+        return [("200", 200.0, "200_Time"), ("Finish", np.nan, "Finish_Time")]
+    return []  # not enough to compute
+
+def _extract_late_speeds(row, segs, step_default=100.0, bend_weight_first=True):
+    """Return np.array of late segment speeds (m/s) for a single horse.
+       segs: list[(label, length_m, src_col)] where length_m for 'Finish' is resolved via step_default.
+       bend_weight_first: if True, we down-weight first late point later (not here)."""
+    spd = []
+    for (lab, L, src) in segs:
+        Lm = float(L) if np.isfinite(L) else float(step_default)  # Finish leg length = STEP
+        t = row.get(src, np.nan)
+        t = _nz(t, np.nan)
+        if np.isfinite(t) and t > 0:
+            spd.append(Lm / t)
+        else:
+            spd.append(np.nan)
+    return np.asarray(spd, dtype=np.float32)
+
+def _theil_sen_slope_per200(x, y):
+    """Robust slope per 200m using Theil–Sen (very small n, so O(n^2) is fine). x is distance index (0..n-1)."""
+    # Use only finite pairs
+    m = np.isfinite(x) & np.isfinite(y)
+    xx, yy = x[m], y[m]
+    n = len(xx)
+    if n < 2:
+        return np.nan
+    # pairwise slopes
+    slopes = []
+    for i in range(n):
+        for j in range(i+1, n):
+            dx = (xx[j] - xx[i])
+            if dx == 0:
+                continue
+            slopes.append( (yy[j] - yy[i]) / (dx * 200.0) )  # scale to per-200m
+    if not slopes:
+        return np.nan
+    return float(np.median(slopes))
+
+def _ols_slope_per200(x, y):
+    m = np.isfinite(x) & np.isfinite(y)
+    xx, yy = x[m], y[m]
+    n = len(xx)
+    if n < 2:
+        return np.nan
+    xm = float(np.mean(xx)); ym = float(np.mean(yy))
+    num = float(np.sum((xx - xm) * (yy - ym)))
+    den = float(np.sum((xx - xm)**2))
+    if den <= 0:
+        return np.nan
+    b = num / den  # per x-step
+    return float(b / 200.0)  # per 200m
+
+def _mono_score(v):
+    """Monotonicity of late speeds: 1 - (#direction flips)/(n-1) in sign of diffs."""
+    w = v[np.isfinite(v)]
+    if len(w) <= 2:
+        return 0.5
+    dif = np.diff(w)
+    sgn = np.sign(dif)
+    flips = np.sum(np.abs(np.diff(sgn)) > 0)
+    denom = max(1, len(sgn) - 1)
+    return float(1.0 - (flips / denom))
+
+def _trip_bucket(dm):
+    dm = float(dm)
+    if dm <= 1200: return "SPRINT"
+    if dm <= 1650: return "MILE"
+    if dm <= 2050: return "MIDDLE"
+    return "STAY"
+
+def _late_scalars_by_trip(dm):
+    """Distance-aware constants (small, stable)."""
+    bucket = _trip_bucket(dm)
+    # late-lift scale (not used directly as m/s scaling here, but reserved)
+    S_norm = {"SPRINT":0.70, "MILE":0.60, "MIDDLE":0.55, "STAY":0.50}[bucket]
+    kappa  = {"SPRINT":0.18, "MILE":0.20, "MIDDLE":0.22, "STAY":0.24}[bucket]
+    return S_norm, kappa
+
+# ---------- main builder ----------
+def build_fatigue_table_refined(metrics: pd.DataFrame) -> pd.DataFrame:
+    df = metrics.copy()
+    # try to locate raw timing table (preferred for *_Time)
+    work = None
+    if st is not None:
+        work = st.session_state.get("work", None)
+    if work is None or not isinstance(work, pd.DataFrame):
+        work = df
+
+    # basics
+    step = _nz(metrics.attrs.get("STEP", 100), 100.0)
+    dm   = _nz(metrics.attrs.get("race_distance_m", st.session_state.get("race_distance_m", 1200) if st else 1200), 1200.0)
+    RSI  = metrics.attrs.get("RSI", np.nan)
+    SCI  = metrics.attrs.get("SCI", np.nan)
+    bend = bool(metrics.attrs.get("LATE_BEND", True))  # default True: many SA tracks bend into the straight
+
+    # late segments
+    segs0 = _late_markers_from_cols(work.columns)
+    if not segs0:
+        # abort gracefully
+        view = pd.DataFrame({"Horse": df.get("Horse", pd.Series(range(len(df))))})
+        view["Note"] = "Not enough *_Time columns to compute fatigue."
+        return view
+
+    # distance-aware constants
+    S_norm, kappa = _late_scalars_by_trip(dm)
+
+    # pull per-horse late speeds
+    late_speeds = []
+    for _, r in work.iterrows():
+        late_speeds.append(_extract_late_speeds(r, segs0, step_default=step, bend_weight_first=bend))
+    late_speeds = np.asarray(late_speeds, dtype=object)  # ragged ok; each row tiny
+
+    # one-split outlier guard & robust slope per horse
+    x_idx = np.arange(len(segs0), dtype=np.float32)
+    slopes = np.full(len(df), np.nan, dtype=np.float32)
+    monos  = np.full(len(df), np.nan, dtype=np.float32)
+
+    for i in range(len(df)):
+        vi = np.asarray(late_speeds[i], dtype=np.float32)
+        if vi.size == 0 or not np.isfinite(vi).any():
+            continue
+
+        # bend-awareness: down-weight first point (applied in slope by nudging toward neighbors)
+        v = vi.copy()
+        if bend and np.isfinite(v[0]) and v.size >= 2 and np.isfinite(v[1]):
+            v[0] = 0.8 * v[0] + 0.2 * v[1]  # small soften; avoids fabricating speed
+
+        # outlier guard: mask the single worst split if >12% from median of finite
+        vf = v[np.isfinite(v)]
+        if vf.size >= 3:
+            med = float(np.median(vf))
+            dev = np.abs(v - med) / (med if med > 0 else 1.0)
+            j = int(np.nanargmax(dev))
+            if np.isfinite(dev[j]) and dev[j] > 0.12:
+                v[j] = np.nan
+
+        # slope per 200m (Theil–Sen if 5+ finite points, else OLS)
+        msk = np.isfinite(v)
+        nfin = int(np.sum(msk))
+        if nfin >= 2:
+            if nfin >= 5:
+                slopes[i] = _theil_sen_slope_per200(x_idx[msk], v[msk])
+            else:
+                slopes[i] = _ols_slope_per200(x_idx[msk], v[msk])
+            monos[i] = _mono_score(v[msk])
+        else:
+            slopes[i] = np.nan
+            monos[i]  = 0.5
+
+    # FG_rate/200m: slope; more negative = more fade (fatigue)
+    # Convert to "vs field" semantics (positive = MORE fade vs field, to match your earlier sign logic):
+    med_slope = np.nanmedian(slopes)
+    FG_vs_field = -(slopes - med_slope)  # flip so + means "faded more than field"
+    # small-field shrinkage
+    if len(df) <= 7:
+        FG_vs_field = 0.8 * FG_vs_field
+
+    # Line_vs_field: use provided if exists, else proxy from LATE_idx - EARLY_idx (median-centered)
+    if "Line_vs_field" in df.columns:
+        line_raw = _to_num(df["Line_vs_field"])
+    else:
+        zE = _to_num(df.get("EARLY_idx", np.nan))
+        zL = _to_num(df.get("LATE_idx", np.nan))
+        line_raw = (zL - zE) - np.nanmedian(zL - zE)  # raw sign: negative = stronger late
+    Line_vs_field = line_raw.copy()  # keep raw sign in table for continuity
+    LineEff = (-line_raw).astype(np.float32)         # internal: bigger = stronger late
+
+    # Early heat (small, fair)
+    EARLY_idx = _to_num(df.get("EARLY_idx", np.nan))
+    EHeat = np.maximum(0.0, EARLY_idx - 104.0)
+
+    # Race-shape factor (bounded, SCI-gated)
+    if np.isfinite(RSI) and np.isfinite(SCI) and SCI >= 0.6:
+        FS = 1.0 + np.sign(RSI) * min(0.12, 0.08 * (abs(float(RSI)) ** 0.8))
+    else:
+        FS = 1.0
+
+    # Class anchor (tiny): tsSPI → normalize slow/fast run illusions
+    tsSPI = _to_num(df.get("tsSPI", np.nan))
+    ClassAdj = np.clip((tsSPI - 100.0) / 8.0, -0.2, 0.2)
+
+    # Efficiency (late minus fade), small penalty for early burn; distance aware captured via slope per 200 already
+    FG_eff = (LineEff - 0.50 * FG_vs_field - 0.03 * EHeat).astype(np.float32)
+
+    # Composite fatigue score: late engine vs front-spent (positive = late engine, negative = front-spent)
+    LateCloserScore  = (0.60 * LineEff + 0.30 * (-FG_vs_field)).astype(np.float32)
+    FrontSpentScore  = (0.60 * (-LineEff) + 0.30 * (FG_vs_field)).astype(np.float32)
+    FatigueScore_raw = (LateCloserScore - FrontSpentScore).astype(np.float32)
+
+    # shape + class calibration (light touch)
+    FatigueScore = (FS * FatigueScore_raw - 0.10 * ClassAdj).astype(np.float32)
+
+    # Reliability = 0.5 completeness + 0.5 monotonicity
+    need_cols = [
+        "Accel", metrics.attrs.get("GR_COL","Grind"),
+        "EARLY_idx", "LATE_idx"
+    ]
+    comp_bits = []
+    for c in need_cols:
+        if c in df.columns:
+            comp_bits.append(np.isfinite(_to_num(df[c])))
+    if comp_bits:
+        comp = np.mean(np.column_stack(comp_bits), axis=1).astype(np.float32)
+    else:
+        comp = np.full(len(df), 0.5, dtype=np.float32)
+    Mono = np.nan_to_num(monos, nan=0.5).astype(np.float32)
+    Reliability = (0.5 * comp + 0.5 * np.clip(Mono, 0.0, 1.0)).astype(np.float32)
+
+    # Tags / Cues (IQR-relative + minimum absolute floors so they travel across races)
+    fg_iqr = np.nanpercentile(FG_eff, 75) - np.nanpercentile(FG_eff, 25)
+    fg_floor = max(0.03, 0.12 * fg_iqr)  # both absolute and relative
+    line_iqr = np.nanpercentile(LineEff, 75) - np.nanpercentile(LineEff, 25)
+    line_floor = max(0.80, 0.15 * line_iqr)
+
+    cond_late   = (LineEff >= line_floor) & (FG_eff <= -fg_floor)  # strong late line with less-than-field fade
+    cond_spent  = (LineEff <= -line_floor) & (FG_eff >= fg_floor)  # weak late + extra fade
+    cond_bal    = np.abs(FG_vs_field) <= 0.25
+
+    Tag = np.full(len(df), "neutral", dtype=object)
+    Tag[cond_bal]   = "balanced"
+    Tag[cond_spent] = "front-spent"
+    Tag[cond_late]  = "late engine"
+
+    Cue = np.full(len(df), "needs shape/ride", dtype=object)
+    Cue[cond_bal]   = "repeats"
+    Cue[cond_spent] = "↓ trip / easier early"
+    Cue[cond_late]  = "↑ trip / stronger pace"
+
+    # Assemble view
+    view = pd.DataFrame({
+        "Horse": df.get("Horse", pd.Series(np.arange(len(df)), dtype=object)),
+        "FG_rate/200m": np.round(slopes, 4),                 # raw slope (m/s per 200m) — diagnostic
+        "FG_vs_field":  np.round(FG_vs_field, 3),            # + = faded more than field
+        "Line_vs_field": np.round(Line_vs_field, 3),         # keep raw sign convention
+        "FG_eff(adjusted)": np.round(FG_eff, 3),
+        "Reliability": np.round(Reliability, 3),
+        "Tag": Tag,
+        "Cue": Cue,
+        "FatigueScore": np.round(FatigueScore, 3),
+    })
+
+    # Order: late engines first, then balanced, then front-spent; within group by score desc
+    ord_grp = np.where(view["Tag"] == "late engine", 0,
+                np.where(view["Tag"] == "balanced", 1, 2)).astype(np.int16)
+    view = view.assign(_g=ord_grp, _s=-view["FatigueScore"].astype(float))\
+               .sort_values(["_g","_s","Reliability"], ascending=[True, True, False])\
+               .drop(columns=["_g","_s"])\
+               .reset_index(drop=True)
+
+    return view
+
+# ---------- render ----------
+_ftab = build_fatigue_table_refined(metrics)
+if st is not None:
+    st.markdown("## Fatigue Gradient — refined (one-run)")
+    st.dataframe(_ftab, use_container_width=True)
+# ======================= /Fatigue Gradient (refined) =======================
+
 # ======================= R&V (CAR) — Context-Aware Reliability =======================
 st.markdown("## R&V — Context-Aware Reliability (CAR)")
 
