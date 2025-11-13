@@ -3209,7 +3209,7 @@ st.dataframe(AM_view, use_container_width=True)
 # ... end of Ability Matrix render (plot + AM_view table) ...
 
 # ======================= FPI400 MODULE — Final Power Index (400m) =======================
-# FPI400 = (average speed over last 400m) per kilogram carried.
+# FPI400 = (average speed over last 400m) * (kg carried).
 # Uses "Horse Weight" column as carried weight (kg).
 # Renders its own Streamlit table.
 
@@ -3221,14 +3221,14 @@ def compute_fpi400(df: pd.DataFrame,
                    step: int,
                    weight_col: str = "Horse Weight") -> pd.DataFrame:
     """
-    Final Power Index (FPI400):
-    Pure last-400m average speed per kg carried.
+    Final Power Index (FPI400) — POWER version:
+    last-400m average speed * kilograms carried.
     step = 100 or 200 (split size).
 
     Produces columns:
         FPI400_v400      -- avg speed over last 400m (m/s)
         FPI400_weight    -- carried weight (kg)
-        FPI400_raw       -- v400 / weight
+        FPI400_raw       -- v400 * weight
         FPI400           -- index (median = 100)
     """
 
@@ -3244,11 +3244,11 @@ def compute_fpi400(df: pd.DataFrame,
 
     # --- Construct last 400m time window ---
     if step == 200:
-        # For 200m splits: last 400m = 400→200 + 200→0
+        # 200m splits: last 400m = 400→200 + 200→0
         t400 = pd.to_numeric(w.get("400_Time"), errors="coerce") if "400_Time" in w.columns else np.nan
         t_last400 = t400 + fin
     else:
-        # For 100m splits: sum last four 100m segments
+        # 100m splits: sum last four 100m segments
         segs = []
         for col in ["300_Time", "200_Time", "100_Time", "Finish_Time"]:
             if col in w.columns:
@@ -3277,8 +3277,8 @@ def compute_fpi400(df: pd.DataFrame,
 
     w["FPI400_weight"] = W
 
-    # --- Raw FPI400: m/s per kg ---
-    w["FPI400_raw"] = w["FPI400_v400"] / w["FPI400_weight"]
+    # --- Raw FPI400: POWER = speed * weight ---
+    w["FPI400_raw"] = w["FPI400_v400"] * w["FPI400_weight"]
     w["FPI400_raw"] = w["FPI400_raw"].replace([np.inf, -np.inf], np.nan)
 
     # --- Index: race median = 100 ---
@@ -3290,7 +3290,7 @@ def compute_fpi400(df: pd.DataFrame,
 
     # Metadata for UI
     w.attrs["FPI400_NOTE"] = {
-        "desc": "FPI400 = (last 400m avg speed in m/s) per kg carried; race median index = 100.",
+        "desc": "FPI400 = (last 400m avg speed in m/s) × kg carried; race median index = 100.",
         "weight_col": weight_col,
         "step": step
     }
@@ -3300,15 +3300,14 @@ def compute_fpi400(df: pd.DataFrame,
 def render_fpi400_table(df: pd.DataFrame):
     """Renders the standalone FPI400 table in Streamlit."""
 
-    st.markdown("## Final Power Index — **FPI400** (Last 400m per kg carried)")
-    st.caption("Higher = stronger sustained late engine under load. Median = 100.")
+    st.markdown("## Final Power Index — **FPI400** (Last 400m Power under Load)")
+    st.caption("Higher = stronger sustained late engine *and* more weight carried. Median = 100.")
 
     note = df.attrs.get("FPI400_NOTE", {})
     if "error" in note:
         st.warning(f"FPI400 could not be computed: {note.get('error')}")
         return
 
-    # Build table
     cols = []
     for c in ["Horse", "Finish_Pos", "RaceTime_s",
               "Horse Weight", "FPI400_weight",
@@ -3323,20 +3322,16 @@ def render_fpi400_table(df: pd.DataFrame):
     show = df.sort_values("FPI400", ascending=False) if "FPI400" in df.columns else df
 
     st.dataframe(show[cols], use_container_width=True)
-    st.caption("Rule of thumb: ~100 = benchmark; 110+ = group-level sustained late power.")
+    st.caption("Rule of thumb: ~100 = benchmark; 110+ = group-level late power for the weight carried.")
 # ======================= /FPI400 MODULE =======================
 
-
-# ======================= MODULE INVOCATION =======================
-# Call this AFTER you have 'metrics' and 'split_step' available.
-
+# Invocation (same as before)
 try:
     metrics = compute_fpi400(metrics, int(split_step), weight_col="Horse Weight")
     render_fpi400_table(metrics)
 except Exception as e:
     st.warning("FPI400 module failed.")
     st.exception(e)
-# ======================= /INVOCATION =======================
 
 # ======================= xWin — Probability to Win (100-replay view) =======================
 st.markdown("## xWin — Probability to Win")
