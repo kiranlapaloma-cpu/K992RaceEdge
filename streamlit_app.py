@@ -3208,6 +3208,136 @@ st.dataframe(AM_view, use_container_width=True)
 
 # ... end of Ability Matrix render (plot + AM_view table) ...
 
+# ======================= FPI400 MODULE — Final Power Index (400m) =======================
+# FPI400 = (average speed over last 400m) per kilogram carried.
+# Uses "Horse Weight" column as carried weight (kg).
+# Renders its own Streamlit table.
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+def compute_fpi400(df: pd.DataFrame,
+                   step: int,
+                   weight_col: str = "Horse Weight") -> pd.DataFrame:
+    """
+    Final Power Index (FPI400):
+    Pure last-400m average speed per kg carried.
+    step = 100 or 200 (split size).
+
+    Produces columns:
+        FPI400_v400      -- avg speed over last 400m (m/s)
+        FPI400_weight    -- carried weight (kg)
+        FPI400_raw       -- v400 / weight
+        FPI400           -- index (median = 100)
+    """
+
+    w = df.copy()
+    step = int(step)
+
+    # --- Need Finish_Time at minimum ---
+    fin = pd.to_numeric(w.get("Finish_Time"), errors="coerce")
+    if fin.isna().all():
+        w["FPI400"] = np.nan
+        w.attrs["FPI400_NOTE"] = {"error": "Missing Finish_Time"}
+        return w
+
+    # --- Construct last 400m time window ---
+    if step == 200:
+        # For 200m splits: last 400m = 400→200 + 200→0
+        t400 = pd.to_numeric(w.get("400_Time"), errors="coerce") if "400_Time" in w.columns else np.nan
+        t_last400 = t400 + fin
+    else:
+        # For 100m splits: sum last four 100m segments
+        segs = []
+        for col in ["300_Time", "200_Time", "100_Time", "Finish_Time"]:
+            if col in w.columns:
+                segs.append(pd.to_numeric(w[col], errors="coerce"))
+        if len(segs) == 0:
+            t_last400 = fin  # best-effort fallback
+        else:
+            t_last400 = sum(segs)
+
+    t_last400 = t_last400.where(t_last400 > 0, np.nan)
+
+    # --- Average speed over last 400m (m/s) ---
+    v400 = 400.0 / t_last400
+    v400 = v400.replace([np.inf, -np.inf], np.nan)
+    w["FPI400_v400"] = v400
+
+    # --- Carried weight (kg): "Horse Weight" ---
+    W = pd.to_numeric(w.get(weight_col), errors="coerce")
+    W = W.where(W > 0, np.nan)
+
+    # Fill missing weights with race median
+    if W.notna().any():
+        medW = float(np.nanmedian(W))
+        if np.isfinite(medW) and medW > 0:
+            W = W.fillna(medW)
+
+    w["FPI400_weight"] = W
+
+    # --- Raw FPI400: m/s per kg ---
+    w["FPI400_raw"] = w["FPI400_v400"] / w["FPI400_weight"]
+    w["FPI400_raw"] = w["FPI400_raw"].replace([np.inf, -np.inf], np.nan)
+
+    # --- Index: race median = 100 ---
+    med_raw = float(np.nanmedian(w["FPI400_raw"]))
+    if np.isfinite(med_raw) and med_raw > 0:
+        w["FPI400"] = 100.0 * (w["FPI400_raw"] / med_raw)
+    else:
+        w["FPI400"] = np.nan
+
+    # Metadata for UI
+    w.attrs["FPI400_NOTE"] = {
+        "desc": "FPI400 = (last 400m avg speed in m/s) per kg carried; race median index = 100.",
+        "weight_col": weight_col,
+        "step": step
+    }
+    return w
+
+
+def render_fpi400_table(df: pd.DataFrame):
+    """Renders the standalone FPI400 table in Streamlit."""
+
+    st.markdown("## Final Power Index — **FPI400** (Last 400m per kg carried)")
+    st.caption("Higher = stronger sustained late engine under load. Median = 100.")
+
+    note = df.attrs.get("FPI400_NOTE", {})
+    if "error" in note:
+        st.warning(f"FPI400 could not be computed: {note.get('error')}")
+        return
+
+    # Build table
+    cols = []
+    for c in ["Horse", "Finish_Pos", "RaceTime_s",
+              "Horse Weight", "FPI400_weight",
+              "FPI400_v400", "FPI400_raw", "FPI400"]:
+        if c in df.columns:
+            cols.append(c)
+
+    if not cols:
+        st.info("No FPI400 columns to display.")
+        return
+
+    show = df.sort_values("FPI400", ascending=False) if "FPI400" in df.columns else df
+
+    st.dataframe(show[cols], use_container_width=True)
+    st.caption("Rule of thumb: ~100 = benchmark; 110+ = group-level sustained late power.")
+# ======================= /FPI400 MODULE =======================
+
+
+# ======================= MODULE INVOCATION =======================
+# Call this AFTER you have 'metrics' and 'split_step' available.
+
+try:
+    metrics = compute_fpi400(metrics, int(split_step), weight_col="Horse Weight")
+    render_fpi400_table(metrics)
+except Exception as e:
+    st.warning("FPI400 module failed.")
+    st.exception(e)
+# ======================= /INVOCATION =======================
+
 # ======================= xWin — Probability to Win (100-replay view) =======================
 st.markdown("## xWin — Probability to Win")
 
