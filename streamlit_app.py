@@ -1591,11 +1591,11 @@ def _field_corr(x, y):
 def _beta_base(distance_m: float) -> float:
     """Baseline PI-per-kg by trip; conservative, race-agnostic."""
     d = float(distance_m)
-    if d <= 1200: return 0.30
-    if d <= 1600: return 0.35
+    if d <= 1200: return 0.32
+    if d <= 1600: return 0.37
     if d <= 2000: return 0.40
-    if d <= 2400: return 0.45
-    return 0.50
+    if d <= 2400: return 0.44
+    return 0.48
 
 def _shape_adjust(beta: float, rsi: float, sci: float) -> float:
     """Light-touch modulation by race shape (one-run safe)."""
