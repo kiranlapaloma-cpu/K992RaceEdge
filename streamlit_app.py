@@ -3378,7 +3378,7 @@ def render_pwr400_table(df: pd.DataFrame):
     # Build display columns
     cols = []
     for c in [
-        "Horse", "Finish_Pos", "RaceTime_s",
+        "Horse", "Finish_Pos",
         weight_col,
         "PWR400_v400",
         "PWR400_SIdx", "PWR400_WIdx",
