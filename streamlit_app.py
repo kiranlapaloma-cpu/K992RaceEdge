@@ -3381,8 +3381,7 @@ def render_pwr400_table(df: pd.DataFrame):
         "Horse", "Finish_Pos",
         weight_col,
         "PWR400_v400",
-        "PWR400_SIdx", "PWR400_WIdx",
-        "PWR400_raw", "PWR400"
+        "PWR400"
     ]:
         if c in df.columns:
             cols.append(c)
