@@ -3208,130 +3208,210 @@ st.dataframe(AM_view, use_container_width=True)
 
 # ... end of Ability Matrix render (plot + AM_view table) ...
 
-# ======================= FPI400 MODULE — Final Power Index (400m) =======================
-# FPI400 = (average speed over last 400m) * (kg carried).
-# Uses "Horse Weight" column as carried weight (kg).
-# Renders its own Streamlit table.
+# ======================= PWR400 MODULE — Late Power under Load (400m) =======================
+# Pure power lens: last 400m speed + weight, no efficiency.
+# PWR400 = distance-aware blend of Speed Index (S400) and Weight Index (W_idx).
+# Uses "Horse Weight" as carried kg and renders its own Streamlit table.
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-def compute_fpi400(df: pd.DataFrame,
-                   step: int,
-                   weight_col: str = "Horse Weight") -> pd.DataFrame:
+def compute_pwr400(
+    df: pd.DataFrame,
+    distance_m: float,
+    step: int,
+    weight_col: str = "Horse Weight"
+) -> pd.DataFrame:
     """
-    Final Power Index (FPI400) — POWER version:
-    last-400m average speed * kilograms carried.
-    step = 100 or 200 (split size).
+    Compute PWR400 (Late Power Index over last 400m):
 
-    Produces columns:
-        FPI400_v400      -- avg speed over last 400m (m/s)
-        FPI400_weight    -- carried weight (kg)
-        FPI400_raw       -- v400 * weight
-        FPI400           -- index (median = 100)
+      • S400      = Speed Index over last 400m (median = 100)
+      • W_idx     = Weight Index (field-relative carried weight, median = 100)
+      • alpha(D)  = distance-aware weight importance
+      • PWR400_raw = S400 + alpha(D) * (W_idx - 100)
+      • PWR400    = PWR400_raw reindexed so race median = 100
+
+    step = split size (100 or 200).
+    distance_m = race distance in meters.
     """
 
     w = df.copy()
     step = int(step)
+    D = float(distance_m)
 
-    # --- Need Finish_Time at minimum ---
+    # ---------- 1. Last-400m time & speed (v400) ----------
     fin = pd.to_numeric(w.get("Finish_Time"), errors="coerce")
+
     if fin.isna().all():
-        w["FPI400"] = np.nan
-        w.attrs["FPI400_NOTE"] = {"error": "Missing Finish_Time"}
+        # No finish times → can't do anything
+        w["PWR400_v400"] = np.nan
+        w["PWR400_SIdx"] = np.nan
+        w["PWR400_WIdx"] = np.nan
+        w["PWR400_raw"]  = np.nan
+        w["PWR400"]      = np.nan
+        w.attrs["PWR400_NOTE"] = {"error": "Missing Finish_Time"}
         return w
 
-    # --- Construct last 400m time window ---
+    # Build last-400m time
     if step == 200:
-        # 200m splits: last 400m = 400→200 + 200→0
-        t400 = pd.to_numeric(w.get("400_Time"), errors="coerce") if "400_Time" in w.columns else np.nan
-        t_last400 = t400 + fin
+        # Preferred: 400 + Finish (400m window)
+        if "200_Time" in w.columns:
+            t400 = pd.to_numeric(w["200_Time"], errors="coerce")
+            t_last400 = t400 + fin
+            source = "200_Time + Finish_Time"
+        else:
+            # Fallback: only Finish_Time available (best-effort; effectively 200m)
+            t_last400 = fin.copy()
+            source = "Finish_Time only (fallback; <400m)"
     else:
-        # 100m splits: sum last four 100m segments
+        # 100m splits: sum last four 100m segments where available
         segs = []
+        used_cols = []
         for col in ["300_Time", "200_Time", "100_Time", "Finish_Time"]:
             if col in w.columns:
                 segs.append(pd.to_numeric(w[col], errors="coerce"))
-        if len(segs) == 0:
-            t_last400 = fin  # best-effort fallback
-        else:
+                used_cols.append(col)
+        if segs:
             t_last400 = sum(segs)
+            source = " + ".join(used_cols)
+        else:
+            t_last400 = fin.copy()
+            source = "Finish_Time only (fallback)"
 
     t_last400 = t_last400.where(t_last400 > 0, np.nan)
 
-    # --- Average speed over last 400m (m/s) ---
     v400 = 400.0 / t_last400
     v400 = v400.replace([np.inf, -np.inf], np.nan)
-    w["FPI400_v400"] = v400
+    w["PWR400_v400"] = v400
 
-    # --- Carried weight (kg): "Horse Weight" ---
+    # ---------- 2. Speed Index S400 (field-relative) ----------
+    v_med = float(np.nanmedian(v400))
+    if not (np.isfinite(v_med) and v_med > 0):
+        w["PWR400_SIdx"] = np.nan
+    else:
+        w["PWR400_SIdx"] = 100.0 * (v400 / v_med)
+
+    # ---------- 3. Weight Index W_idx (field-relative carried weight) ----------
     W = pd.to_numeric(w.get(weight_col), errors="coerce")
     W = W.where(W > 0, np.nan)
 
-    # Fill missing weights with race median
     if W.notna().any():
-        medW = float(np.nanmedian(W))
-        if np.isfinite(medW) and medW > 0:
-            W = W.fillna(medW)
-
-    w["FPI400_weight"] = W
-
-    # --- Raw FPI400: POWER = speed * weight ---
-    w["FPI400_raw"] = w["FPI400_v400"] * w["FPI400_weight"]
-    w["FPI400_raw"] = w["FPI400_raw"].replace([np.inf, -np.inf], np.nan)
-
-    # --- Index: race median = 100 ---
-    med_raw = float(np.nanmedian(w["FPI400_raw"]))
-    if np.isfinite(med_raw) and med_raw > 0:
-        w["FPI400"] = 100.0 * (w["FPI400_raw"] / med_raw)
+        W_med = float(np.nanmedian(W))
+        if np.isfinite(W_med) and W_med > 0:
+            w["PWR400_WIdx"] = 100.0 * (W / W_med)
+        else:
+            w["PWR400_WIdx"] = np.nan
     else:
-        w["FPI400"] = np.nan
+        W_med = np.nan
+        w["PWR400_WIdx"] = np.nan
 
-    # Metadata for UI
-    w.attrs["FPI400_NOTE"] = {
-        "desc": "FPI400 = (last 400m avg speed in m/s) × kg carried; race median index = 100.",
+    # ---------- 4. Distance-aware alpha(D) ----------
+    # Linear Option A:
+    #   alpha(D) = 0.20 + 0.00025 * (D - 1000), clamped to [0.20, 0.70]
+    alpha = 0.20 + 0.00025 * (D - 1000.0)
+    alpha = max(0.20, min(0.70, alpha))
+
+    # ---------- 5. Raw Power score & indexed PWR400 ----------
+    S400 = pd.to_numeric(w["PWR400_SIdx"], errors="coerce")
+    Widx = pd.to_numeric(w["PWR400_WIdx"], errors="coerce")
+
+    # Need both indices to build raw power
+    mask_valid = S400.notna() & Widx.notna()
+    PWR_raw = pd.Series(np.nan, index=w.index, dtype=float)
+    PWR_raw[mask_valid] = S400[mask_valid] + alpha * (Widx[mask_valid] - 100.0)
+
+    w["PWR400_raw"] = PWR_raw
+
+    raw_med = float(np.nanmedian(PWR_raw))
+    if np.isfinite(raw_med) and raw_med > 0:
+        w["PWR400"] = 100.0 * (PWR_raw / raw_med)
+    else:
+        w["PWR400"] = np.nan
+
+    # ---------- 6. Metadata for UI / PDF / DB ----------
+    w.attrs["PWR400_NOTE"] = {
+        "desc": "PWR400 = distance-aware late power: Speed Index (last 400m) + alpha(D) × (Weight Index − 100); race median = 100.",
+        "distance_m": int(D),
+        "alpha": round(alpha, 4),
         "weight_col": weight_col,
-        "step": step
+        "v400_source": source,
+        "v400_med": round(v_med, 5) if np.isfinite(v_med) else None,
+        "W_med": round(W_med, 3) if np.isfinite(W_med) else None,
     }
+
     return w
 
 
-def render_fpi400_table(df: pd.DataFrame):
-    """Renders the standalone FPI400 table in Streamlit."""
+def render_pwr400_table(df: pd.DataFrame):
+    """
+    Render the standalone PWR400 table in Streamlit.
+    """
 
-    st.markdown("## Final Power Index — **FPI400** (Last 400m Power under Load)")
-    st.caption("Higher = stronger sustained late engine *and* more weight carried. Median = 100.")
-
-    note = df.attrs.get("FPI400_NOTE", {})
+    note = df.attrs.get("PWR400_NOTE", {}) or {}
     if "error" in note:
-        st.warning(f"FPI400 could not be computed: {note.get('error')}")
+        st.markdown("## Late Power Index — **PWR400**")
+        st.warning(f"PWR400 could not be computed: {note.get('error')}")
         return
 
+    trip = note.get("distance_m", None)
+    alpha = note.get("alpha", None)
+    v_src = note.get("v400_source", "last 400m window")
+    weight_col = note.get("weight_col", "Horse Weight")
+
+    st.markdown("## Late Power Index — **PWR400** (Last 400m under Load)")
+    if trip and alpha is not None:
+        st.caption(
+            f"Blend of Speed Index (last 400m) and Weight Index with distance-aware α. "
+            f"Trip: **{trip}m**, α ≈ **{alpha:.3f}**, v₄₀₀ window: **{v_src}**, weight: **{weight_col}**."
+        )
+    else:
+        st.caption("Blend of Speed Index (last 400m) and Weight Index with distance-aware α. Median PWR400 = 100.")
+
+    # Build display columns
     cols = []
-    for c in ["Horse", "Finish_Pos", "RaceTime_s",
-              "Horse Weight", "FPI400_weight",
-              "FPI400_v400", "FPI400_raw", "FPI400"]:
+    for c in [
+        "Horse", "Finish_Pos", "RaceTime_s",
+        weight_col,
+        "PWR400_v400",
+        "PWR400_SIdx", "PWR400_WIdx",
+        "PWR400_raw", "PWR400"
+    ]:
         if c in df.columns:
             cols.append(c)
 
     if not cols:
-        st.info("No FPI400 columns to display.")
+        st.info("No PWR400 columns to display.")
         return
 
-    show = df.sort_values("FPI400", ascending=False) if "FPI400" in df.columns else df
+    show = df.copy()
+    if "PWR400" in show.columns:
+        show = show.sort_values("PWR400", ascending=False)
 
     st.dataframe(show[cols], use_container_width=True)
-    st.caption("Rule of thumb: ~100 = benchmark; 110+ = group-level late power for the weight carried.")
-# ======================= /FPI400 MODULE =======================
+    st.caption(
+        "Interpretation: PWR400 ≈ 100 = typical late power for this field; 110+ = strong late engine under meaningful weight; "
+        "90–95 = weak late power."
+    )
 
-# Invocation (same as before)
+# ======================= /PWR400 MODULE =======================
+
+
+# ======================= MODULE INVOCATION EXAMPLE =======================
+# Call this AFTER you have `metrics`, `race_distance_input`, and `split_step` available.
+
 try:
-    metrics = compute_fpi400(metrics, int(split_step), weight_col="Horse Weight")
-    render_fpi400_table(metrics)
+    metrics = compute_pwr400(
+        metrics,
+        float(race_distance_input),
+        int(split_step),
+        weight_col="Horse Weight"  # adjust if your column name differs
+    )
+    render_pwr400_table(metrics)
 except Exception as e:
-    st.warning("FPI400 module failed.")
+    st.warning("PWR400 module failed.")
     st.exception(e)
+# ======================= /INVOCATION EXAMPLE =======================
 
 # ======================= xWin — Probability to Win (100-replay view) =======================
 st.markdown("## xWin — Probability to Win")
