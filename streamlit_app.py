@@ -3049,12 +3049,12 @@ else:
         yv = dfm["Freshness"].to_numpy()
 
         # ----- Colour: map Tag → numeric, for a centred colour scale -----
-        # late engine → +1, balanced/neutral → 0, front-spent → -1
+        # late engine → +8, balanced/neutral → 0, front-spent → -8
         tag_map = {
-            "late engine": 1.0,
+            "late engine": 3.0,
             "balanced": 0.0,
             "neutral": 0.0,
-            "front-spent": -1.0,
+            "front-spent": -3.0,
         }
         dfm["TagVal"] = dfm["Tag"].map(tag_map).fillna(0.0)
         cv = dfm["TagVal"].to_numpy()
