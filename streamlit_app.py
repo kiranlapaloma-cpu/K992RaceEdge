@@ -2746,8 +2746,8 @@ def build_fatigue_table_refined(metrics: pd.DataFrame) -> pd.DataFrame:
     line_iqr = np.nanpercentile(LineEff, 75) - np.nanpercentile(LineEff, 25)
     line_floor = max(0.80, 0.15 * line_iqr)
 
-    cond_late   = (LineEff >= line_floor) & (FG_eff <= -fg_floor)  # strong late line with less-than-field fade
-    cond_spent  = (LineEff <= -line_floor) & (FG_eff >= fg_floor)  # weak late + extra fade
+    cond_late   = (FG_eff >= -2.5)  # strong late line with less-than-field fade
+    cond_spent  = (FG_eff >= 3)  # weak late + extra fade
     cond_bal    = np.abs(FG_vs_field) <= 0.25
 
     Tag = np.full(len(df), "neutral", dtype=object)
