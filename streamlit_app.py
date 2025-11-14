@@ -2984,7 +2984,6 @@ def render_pwr400_table(df: pd.DataFrame):
 
 # ======================= /PWR400 MODULE =======================
 
-
 # ======================= MODULE INVOCATION EXAMPLE =======================
 # Call this AFTER you have `metrics`, `race_distance_input`, and `split_step` available.
 
@@ -3000,6 +2999,166 @@ except Exception as e:
     st.warning("PWR400 module failed.")
     st.exception(e)
 # ======================= /INVOCATION EXAMPLE =======================
+
+# ======================= Visual: Power–Fatigue Map (PWR400 vs FatigueScore) =======================
+from matplotlib.colors import TwoSlopeNorm
+from matplotlib.patches import Rectangle
+from matplotlib.lines import Line2D
+import matplotlib.pyplot as plt
+import numpy as np
+import io
+
+def render_power_fatigue_map(metrics: pd.DataFrame,
+                             pwr_df: pd.DataFrame,
+                             fg_df: pd.DataFrame):
+    """
+    metrics : base table (needs Horse, PI)
+    pwr_df  : PWR400 module table (needs Horse, PWR400)
+    fg_df   : fatigue table from build_fatigue_table_refined (needs Horse, FatigueScore, Tag)
+    """
+
+    st.markdown("## Power–Fatigue Map — PWR400 vs FatigueScore")
+
+    need_m = {"Horse", "PI"}
+    need_p = {"Horse", "PWR400"}
+    need_f = {"Horse", "FatigueScore", "Tag"}
+
+    if not need_m.issubset(metrics.columns):
+        st.warning(
+            "Power–Fatigue Map: metrics missing columns: "
+            + ", ".join(sorted(need_m - set(metrics.columns)))
+        )
+        return
+    if not need_p.issubset(pwr_df.columns):
+        st.warning(
+            "Power–Fatigue Map: PWR table missing columns: "
+            + ", ".join(sorted(need_p - set(pwr_df.columns)))
+        )
+        return
+    if not need_f.issubset(fg_df.columns):
+        st.warning(
+            "Power–Fatigue Map: fatigue table missing columns: "
+            + ", ".join(sorted(need_f - set(fg_df.columns)))
+        )
+        return
+
+    # Merge all three on Horse
+    base = metrics.loc[:, ["Horse", "PI"]]
+    pwr  = pwr_df.loc[:, ["Horse", "PWR400"]]
+    fat  = fg_df.loc[:, ["Horse", "FatigueScore", "Tag"]]
+
+    dfm = base.merge(pwr, on="Horse", how="inner").merge(fat, on="Horse", how="inner")
+
+    # numeric casting
+    for c in ["PWR400", "PI", "FatigueScore"]:
+        dfm[c] = pd.to_numeric(dfm[c], errors="coerce")
+
+    dfm = dfm.dropna(subset=["PWR400", "FatigueScore"])
+    if dfm.empty:
+        st.info("Not enough overlapping data to draw the Power–Fatigue Map.")
+        return
+
+    # ----- Axes: X = FatigueScore (positive = stronger late), Y = PWR400Δ (power vs field) -----
+    pwr_med = float(np.nanmedian(dfm["PWR400"]))
+    dfm["PWR400Δ"] = dfm["PWR400"] - pwr_med
+
+    names = dfm["Horse"].astype(str).to_list()
+    xv = dfm["FatigueScore"].to_numpy()      # positive = better, negative = more fatigue
+    yv = dfm["PWR400Δ"].to_numpy()           # positive = more late power under load
+
+    # ----- Colour from Tag: front-spent → -1, balanced → 0, late engine → +1 -----
+    tag_map = {"late engine": 1.0, "balanced": 0.0, "front-spent": -1.0}
+    dfm["TagVal"] = dfm["Tag"].map(tag_map).fillna(0.0)
+    cv = dfm["TagVal"].to_numpy()
+
+    # ----- Dot size from PI (same logic as your shape map) -----
+    DOT_MIN, DOT_MAX = 40.0, 140.0
+    piv = dfm["PI"].fillna(0).to_numpy()
+    pmin, pmax = np.nanmin(piv), np.nanmax(piv)
+    if not np.isfinite(pmin) or not np.isfinite(pmax) or pmin == pmax:
+        sizes = np.full_like(xv, DOT_MIN)
+    else:
+        sizes = DOT_MIN + (piv - pmin) / (pmax - pmin + 1e-9) * (DOT_MAX - DOT_MIN)
+
+    # ----- Limits & quadrant tinting -----
+    span = max(4.5, float(np.nanmax(np.abs(np.concatenate([xv, yv])))))
+    lim = np.ceil(span / 1.5) * 1.5
+
+    fig, ax = plt.subplots(figsize=(7.8, 6.2))
+
+    TINT = 0.12
+    # Quadrants:
+    #   +X, +Y → big engine & holds late (monster)
+    #   -X, +Y → power with fatigue (fragile engine / spent)
+    #   +X, -Y → efficient grinder (good FG, modest power)
+    #   -X, -Y → weak & front-spent
+    ax.add_patch(Rectangle((0, 0),       lim,  lim, facecolor="#4daf4a", alpha=TINT, zorder=0))
+    ax.add_patch(Rectangle((-lim, 0),    lim,  lim, facecolor="#377eb8", alpha=TINT, zorder=0))
+    ax.add_patch(Rectangle((0, -lim),    lim,  lim, facecolor="#ff7f00", alpha=TINT, zorder=0))
+    ax.add_patch(Rectangle((-lim, -lim), lim,  lim, facecolor="#984ea3", alpha=TINT, zorder=0))
+
+    ax.axvline(0, color="gray", lw=1.3, ls=(0, (3, 3)), zorder=1)
+    ax.axhline(0, color="gray", lw=1.3, ls=(0, (3, 3)), zorder=1)
+
+    # Colour scale centred at 0 (balanced)
+    norm = TwoSlopeNorm(vcenter=0.0, vmin=-1.0, vmax=1.0)
+
+    sc = ax.scatter(
+        xv, yv, s=sizes, c=cv,
+        cmap="coolwarm", norm=norm,
+        edgecolor="black", linewidth=0.6, alpha=0.95
+    )
+
+    # Labels
+    label_points_neatly(ax, xv, yv, names)
+
+    ax.set_xlim(-lim, lim)
+    ax.set_ylim(-lim, lim)
+    ax.set_xlabel("FatigueScore →  (positive = stronger late / less fatigue)")
+    ax.set_ylabel("PWR400 − field median (late power under load) ↑")
+    ax.set_title("Power–Fatigue Map: late power vs fatigue  ·  Size = PI  ·  Colour = FG Tag")
+
+    # Size legend (PI bands)
+    s_ex = [DOT_MIN, 0.5 * (DOT_MIN + DOT_MAX), DOT_MAX]
+    h_ex = [
+        Line2D([0], [0],
+               marker="o", color="w",
+               markerfacecolor="gray",
+               markersize=np.sqrt(s / np.pi),
+               markeredgecolor="black")
+        for s in s_ex
+    ]
+    ax.legend(
+        h_ex,
+        ["PI low", "PI mid", "PI high"],
+        loc="upper left",
+        frameon=False,
+        fontsize=8,
+    )
+
+    # Colourbar for tags
+    cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Fatigue Tag  (−1 front-spent · 0 balanced · +1 late engine)")
+
+    ax.grid(True, linestyle=":", alpha=0.25)
+    st.pyplot(fig)
+
+    # Downloadable PNG
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=300, bbox_inches="tight")
+    powfat_png = buf.getvalue()
+    st.download_button(
+        "Download Power–Fatigue Map (PNG)",
+        powfat_png,
+        file_name="power_fatigue_map.png",
+        mime="image/png",
+    )
+    st.caption(
+        "X = FatigueScore (more positive = stronger late); "
+        "Y = PWR400 vs field median (late power under load); "
+        "Colour = fatigue tag; Size = PI."
+    )
+# ======================= /Power–Fatigue Map =======================
 
 # ======================= R&V (CAR) — Context-Aware Reliability =======================
 st.markdown("## R&V — Context-Aware Reliability (CAR)")
@@ -3183,241 +3342,6 @@ st.dataframe(out, use_container_width=True)
 st.caption("CAR = class-aware reliability: blends Steadiness (MV), Rebound (RC) and Class (PI/GCI). "
            "High CAR → repeatable pattern you can trust; low CAR → fragile/shape-dependent.")
 # ======================= /R&V (CAR) =======================
-
-# ======================= Ability Matrix v2 — Intrinsic vs Hidden Ability (Strict) =======================
-st.markdown("---")
-st.markdown("## Ability Matrix v2 — Intrinsic vs Hidden Ability (Strict)")
-
-# Merge HiddenScore in
-AM = metrics.copy()
-if "Horse" not in AM.columns:
-    AM["Horse"] = work.get("Horse", "")
-AM = AM.merge(hh_view[["Horse","HiddenScore"]], on="Horse", how="left")
-AM["HiddenScore"] = AM["HiddenScore"].fillna(0.0)
-
-# Use corrected grind if active
-gr_col = metrics.attrs.get("GR_COL", "Grind")
-
-# ----- Core components -----
-AM["IAI"]  = 0.35*AM["tsSPI"] + 0.25*AM["Accel"] + 0.25*AM[gr_col] + 0.15*AM["F200_idx"]
-AM["BAL"]  = 100.0 - (AM["Accel"] - AM[gr_col]).abs() / 2.0
-AM["COMP"] = 100.0 - (AM["tsSPI"] - 100.0).abs()
-
-# ----- Percentiles within this race -----
-def pct_rank(s):
-    s = pd.to_numeric(s, errors="coerce")
-    return s.rank(pct=True, method="average").fillna(0.0).clip(0.0, 1.0)
-
-AM["IAI_pct"]  = pct_rank(AM["IAI"])
-AM["HID_pct"]  = pct_rank(AM["HiddenScore"])
-AM["BAL_pct"]  = 1.0 - pct_rank((AM["BAL"]  - 100.0).abs())
-AM["COMP_pct"] = 1.0 - pct_rank((AM["COMP"] - 100.0).abs())
-
-# ----- Hidden contribution caps (blocks hidden-only "elites") -----
-def hidden_scale(iai):
-    iai = float(iai) if pd.notna(iai) else np.nan
-    if not np.isfinite(iai): return 0.0
-    if iai < 101.0:  return 0.25     # average engines
-    if iai < 101.5:  return 0.50     # decent engines
-    return 1.00                      # strong engines
-
-AM["_hid_scale"] = AM["IAI"].map(hidden_scale)
-
-# ----- Composite score (for ordering/plot) -----
-AM["AbilityScore"] = (
-      6.5 * AM["IAI_pct"]
-    + 2.5 * (AM["HID_pct"] * AM["_hid_scale"])
-    + 0.6 * AM["BAL_pct"]
-    + 0.4 * AM["COMP_pct"]
-).clip(0.0, 10.0).round(2)
-
-# ----- Confidence by field size -----
-field_n = int(len(AM.index))
-def conf_band(n):
-    if n >= 12: return "High"
-    if n >= 8:  return "Med"
-    return "Low"
-if "Confidence" not in AM.columns:
-    AM["Confidence"] = conf_band(field_n)
-
-# ----- Strict tier gates (Section E) -----
-small_field = field_n <= 7
-elite_iai_floor = 102.0 if small_field else 101.8
-elite_pct_floor = 0.90  if small_field else 0.85
-
-def in_range(x, lo, hi):
-    x = float(x) if pd.notna(x) else np.nan
-    return np.isfinite(x) and (lo <= x <= hi)
-
-def to_float(x, default=np.nan):
-    try:
-        v = float(x);  return v if np.isfinite(v) else default
-    except Exception:
-        return default
-
-def tier_for_row(r):
-    iai      = to_float(r.get("IAI"))
-    pi       = to_float(r.get("PI"))
-    gci      = to_float(r.get("GCI"))
-    iai_pct  = to_float(r.get("IAI_pct"), 0.0)
-    bal      = to_float(r.get("BAL"))
-    conf_ok  = str(r.get("Confidence","")).strip() in ("High","Med")
-
-    # 🥇 Elite — all must pass
-    if (
-        np.isfinite(iai) and iai >= elite_iai_floor and
-        np.isfinite(pi)  and pi  >= 7.2 and
-        np.isfinite(gci) and gci >= 6.0 and
-        iai_pct >= elite_pct_floor and
-        in_range(bal, 98.0, 104.0) and
-        conf_ok
-    ):
-        return "🥇 Elite"
-
-    # 🥈 High — all must pass
-    if (
-        np.isfinite(iai) and iai >= 101.0 and
-        np.isfinite(pi)  and pi  >= 6.2 and
-        iai_pct >= 0.70 and
-        in_range(bal, 97.0, 105.0)
-    ):
-        return "🥈 High"
-
-    # 🥉 Competitive — any
-    if (
-        (np.isfinite(iai) and iai >= 100.4) or
-        iai_pct >= 0.55 or
-        (np.isfinite(pi) and pi >= 5.4)
-    ):
-        return "🥉 Competitive"
-
-    return "⚪ Ordinary"
-
-AM["AbilityTier"] = AM.apply(tier_for_row, axis=1)
-
-# Near-Elite helper (passes 4/6 elite gates but not all)
-def near_elite_row(r):
-    iai, pi, gci, iai_pct, bal = map(to_float, (r.get("IAI"), r.get("PI"), r.get("GCI"),
-                                                r.get("IAI_pct"), r.get("BAL")))
-    conf_ok  = str(r.get("Confidence","")).strip() in ("High","Med")
-    hits = 0
-    hits += int(np.isfinite(iai) and iai >= elite_iai_floor)
-    hits += int(np.isfinite(pi)  and pi  >= 7.2)
-    hits += int(np.isfinite(gci) and gci >= 6.0)
-    hits += int(iai_pct >= elite_pct_floor)
-    hits += int(in_range(bal, 98.0, 104.0))
-    hits += int(conf_ok)
-    return "⭐ Near-Elite" if (hits >= 4 and r.get("AbilityTier") != "🥇 Elite") else ""
-
-AM["NearEliteFlag"] = AM.apply(near_elite_row, axis=1)
-
-# “Why this tier?” explainer
-def why_tier_row(r):
-    conf_ok = str(r.get("Confidence","")).strip() in ("High","Med")
-    iai = to_float(r['IAI']); pi = to_float(r['PI']); gci = to_float(r['GCI'])
-    iai_pct = to_float(r['IAI_pct']); bal = to_float(r['BAL'])
-    return " · ".join([
-        f"IAI {iai:.2f} {'✅' if np.isfinite(iai) and iai>=elite_iai_floor else '❌'}",
-        f"PI {pi:.2f} {'✅' if np.isfinite(pi) and pi>=7.2 else '❌'}",
-        f"GCI {gci:.2f} {'✅' if np.isfinite(gci) and gci>=6.0 else '❌'}",
-        f"IAI_pct {iai_pct:.2f} {'✅' if iai_pct>=elite_pct_floor else '❌'}",
-        f"BAL {bal:.1f} {'✅' if in_range(bal,98,104) else '❌'}",
-        f"Conf {r.get('Confidence','')} {'✅' if conf_ok else '❌'}",
-    ])
-
-AM["WhyTier"] = AM.apply(why_tier_row, axis=1)
-
-# ---------- Plot (IAI vs Hidden) ----------
-try:
-    ability_png
-except NameError:
-    ability_png = None
-
-need_cols_am = {"Horse","IAI","HiddenScore","PI","BAL"}
-if not need_cols_am.issubset(AM.columns):
-    st.info("Ability Matrix: missing columns to plot.")
-else:
-    plot_df = AM.dropna(subset=["IAI","HiddenScore","PI","BAL"]).copy()
-    if plot_df.empty:
-        st.info("Not enough complete data to draw Ability Matrix.")
-    else:
-        x = plot_df["IAI"] - 100.0          # engine vs par
-        y = plot_df["HiddenScore"]          # hidden 0..3
-        sizes = 60.0 + (plot_df["PI"].clip(0,10) / 10.0) * 200.0
-
-        # ---- Robust colour scale (BAL centered at 100) ----
-        vals = pd.to_numeric(plot_df["BAL"], errors="coerce").to_numpy()
-        vmin = float(np.nanmin(vals)) if np.isfinite(vals).any() else np.nan
-        vmax = float(np.nanmax(vals)) if np.isfinite(vals).any() else np.nan
-        if (not np.isfinite(vmin)) or (not np.isfinite(vmax)) or (vmin == vmax):
-            vmin, vmax = 95.0, 105.0
-        EPS = 1e-3
-        if vmin >= 100.0: vmin = 100.0 - EPS
-        if vmax <= 100.0: vmax = 100.0 + EPS
-        norm = _safe_bal_norm(plot_df["BAL"], center=100.0)
-
-        figA, axA = plt.subplots(figsize=(8.6, 6.0))
-        sc = axA.scatter(
-            x, y,
-            s=sizes,
-            c=plot_df["BAL"],
-            cmap="coolwarm",
-            norm=norm,
-            edgecolor="black",
-            linewidth=0.6,
-            alpha=0.95
-        )
-
-        # label repel (defined earlier)
-        label_points_neatly(axA, x.values, y.values, plot_df["Horse"].astype(str).tolist())
-
-        axA.axvline(0.0, color="gray", lw=1.0, ls="--")
-        axA.axhline(1.2, color="gray", lw=0.8, ls=":")
-        axA.set_xlabel("Intrinsic Ability (IAI – 100)  →")
-        axA.set_ylabel("HiddenScore (0–3)  ↑")
-        axA.set_title("Ability Matrix v2 — Size = PI · Colour = BAL (100 = balanced late)")
-
-        for s, lab in [(60, "PI low"), (160, "PI mid"), (260, "PI high")]:
-            axA.scatter([], [], s=s, label=lab, color="gray", edgecolor="black")
-        axA.legend(loc="upper left", frameon=False, fontsize=8, title="Point size:")
-
-        cbar = figA.colorbar(sc, ax=axA, fraction=0.05, pad=0.04)
-        cbar.set_label("BAL (100 = balanced late)")
-
-        axA.grid(True, linestyle=":", alpha=0.25)
-        st.pyplot(figA)
-
-        # Download image
-        buf = io.BytesIO()
-        figA.savefig(buf, format="png", dpi=300, bbox_inches="tight", facecolor="white")
-        ability_png = buf.getvalue()
-        st.download_button("Download Ability Matrix (PNG)", ability_png,
-                           file_name="ability_matrix_v2.png", mime="image/png")
-
-# ---------- Final table ----------
-if "DirectionHint" not in AM.columns:
-    def dir_hint_row(r):
-        dv = float(r.get("Accel", np.nan)) - float(r.get(gr_col, np.nan))
-        if not np.isfinite(dv): return ""
-        if dv >= 2.0:  return "⚡ Sprint-lean (turn of foot)"
-        if dv <= -2.0: return "🪨 Stayer-lean (sustained)"
-        return "⚖ Balanced"
-    AM["DirectionHint"] = AM.apply(dir_hint_row, axis=1)
-
-am_cols = ["Horse","Finish_Pos","IAI","HiddenScore","BAL","COMP",
-           "AbilityScore","AbilityTier","NearEliteFlag","WhyTier",
-           "DirectionHint","Confidence","PI","GCI"]
-for c in am_cols:
-    if c not in AM.columns:
-        AM[c] = np.nan
-
-AM_view = AM.sort_values(
-    ["AbilityTier","AbilityScore","PI","Finish_Pos"],
-    ascending=[True, False, False, True]
-)[am_cols]
-st.dataframe(AM_view, use_container_width=True)
-
-# ... end of Ability Matrix render (plot + AM_view table) ...
 
 # ======================= xWin — Probability to Win (100-replay view) =======================
 st.markdown("## xWin — Probability to Win")
