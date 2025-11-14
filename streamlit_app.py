@@ -2790,6 +2790,217 @@ if st is not None:
     st.dataframe(_ftab, use_container_width=True)
 # ======================= /Fatigue Gradient (refined) =======================
 
+# ======================= PWR400 MODULE — Late Power under Load (400m) =======================
+# Pure power lens: last 400m speed + weight, no efficiency.
+# PWR400 = distance-aware blend of Speed Index (S400) and Weight Index (W_idx).
+# Uses "Horse Weight" as carried kg and renders its own Streamlit table.
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+def compute_pwr400(
+    df: pd.DataFrame,
+    distance_m: float,
+    step: int,
+    weight_col: str = "Horse Weight"
+) -> pd.DataFrame:
+    """
+    Compute PWR400 (Late Power Index over last 400m):
+
+      • S400      = Speed Index over last 400m (median = 100)
+      • W_idx     = Weight Index (field-relative carried weight, median = 100)
+      • alpha(D)  = distance-aware weight importance
+      • PWR400_raw = S400 + alpha(D) * (W_idx - 100)
+      • PWR400    = PWR400_raw reindexed so race median = 100
+
+    step = split size (100 or 200).
+    distance_m = race distance in meters.
+    """
+
+    w = df.copy()
+    step = int(step)
+    D = float(distance_m)
+
+    # ---------- 1. Last-400m time & speed (v400) ----------
+    fin = pd.to_numeric(w.get("Finish_Time"), errors="coerce")
+
+    if fin.isna().all():
+        # No finish times → can't do anything
+        w["PWR400_v400"] = np.nan
+        w["PWR400_SIdx"] = np.nan
+        w["PWR400_WIdx"] = np.nan
+        w["PWR400_raw"]  = np.nan
+        w["PWR400"]      = np.nan
+        w.attrs["PWR400_NOTE"] = {"error": "Missing Finish_Time"}
+        return w
+
+    # Build last-400m time
+    if step == 200:
+        # Preferred: 400 + Finish (400m window)
+        if "200_Time" in w.columns:
+            t400 = pd.to_numeric(w["200_Time"], errors="coerce")
+            t_last400 = t400 + fin
+            source = "200_Time + Finish_Time"
+        else:
+            # Fallback: only Finish_Time available (best-effort; effectively 200m)
+            t_last400 = fin.copy()
+            source = "Finish_Time only (fallback; <400m)"
+    else:
+        # 100m splits: sum last four 100m segments where available
+        segs = []
+        used_cols = []
+        for col in ["300_Time", "200_Time", "100_Time", "Finish_Time"]:
+            if col in w.columns:
+                segs.append(pd.to_numeric(w[col], errors="coerce"))
+                used_cols.append(col)
+        if segs:
+            t_last400 = sum(segs)
+            source = " + ".join(used_cols)
+        else:
+            t_last400 = fin.copy()
+            source = "Finish_Time only (fallback)"
+
+    t_last400 = t_last400.where(t_last400 > 0, np.nan)
+
+    v400 = 400.0 / t_last400
+    v400 = v400.replace([np.inf, -np.inf], np.nan)
+    w["PWR400_v400"] = v400
+
+    # ---------- 2. Convert speed to km/h ----------
+    # 400 meters = 0.4 km
+    # t_hours = t_seconds / 3600
+    v400_kmh = 0.4 / (t_last400 / 3600.0)
+    v400_kmh = v400_kmh.replace([np.inf, -np.inf], np.nan)
+    w["PWR400_v400"] = v400_kmh
+
+    # ---------- 3. Speed Index from km/h ----------
+    v_med = float(np.nanmedian(v400_kmh))
+    if np.isfinite(v_med) and v_med > 0:
+        w["PWR400_SIdx"] = 100.0 * (v400_kmh / v_med)
+    else:
+        w["PWR400_SIdx"] = np.nan
+
+    # ---------- 4. Weight Index W_idx (field-relative carried weight) ----------
+    W = pd.to_numeric(w.get(weight_col), errors="coerce")
+    W = W.where(W > 0, np.nan)
+
+    if W.notna().any():
+        W_med = float(np.nanmedian(W))
+        if np.isfinite(W_med) and W_med > 0:
+            w["PWR400_WIdx"] = 100.0 * (W / W_med)
+        else:
+            w["PWR400_WIdx"] = np.nan
+    else:
+        W_med = np.nan
+        w["PWR400_WIdx"] = np.nan
+
+    # ---------- 5. Distance-aware alpha(D) ----------
+    # Linear Option A:
+    #   alpha(D) = 0.20 + 0.00025 * (D - 1000), clamped to [0.20, 0.70]
+    alpha = 0.20 + 0.00025 * (D - 1000.0)
+    alpha = max(0.20, min(0.70, alpha))
+
+    # ---------- 6. Raw Power score & indexed PWR400 ----------
+    S400 = pd.to_numeric(w["PWR400_SIdx"], errors="coerce")
+    Widx = pd.to_numeric(w["PWR400_WIdx"], errors="coerce")
+
+    # Need both indices to build raw power
+    mask_valid = S400.notna() & Widx.notna()
+    PWR_raw = pd.Series(np.nan, index=w.index, dtype=float)
+    PWR_raw[mask_valid] = S400[mask_valid] + alpha * (Widx[mask_valid] - 100.0)
+
+    w["PWR400_raw"] = PWR_raw
+
+    raw_med = float(np.nanmedian(PWR_raw))
+    if np.isfinite(raw_med) and raw_med > 0:
+        w["PWR400"] = 100.0 * (PWR_raw / raw_med)
+    else:
+        w["PWR400"] = np.nan
+
+    # ---------- 7. Metadata for UI / PDF / DB ----------
+    w.attrs["PWR400_NOTE"] = {
+        "desc": "PWR400 = distance-aware late power: Speed Index (last 400m) + alpha(D) × (Weight Index − 100); race median = 100.",
+        "distance_m": int(D),
+        "alpha": round(alpha, 4),
+        "weight_col": weight_col,
+        "v400_source": source,
+        "v400_med": round(v_med, 5) if np.isfinite(v_med) else None,
+        "W_med": round(W_med, 3) if np.isfinite(W_med) else None,
+    }
+
+    return w
+
+
+def render_pwr400_table(df: pd.DataFrame):
+    """
+    Render the standalone PWR400 table in Streamlit.
+    """
+
+    note = df.attrs.get("PWR400_NOTE", {}) or {}
+    if "error" in note:
+        st.markdown("## Late Power Index — **PWR400**")
+        st.warning(f"PWR400 could not be computed: {note.get('error')}")
+        return
+
+    trip = note.get("distance_m", None)
+    alpha = note.get("alpha", None)
+    v_src = note.get("v400_source", "last 400m window")
+    weight_col = note.get("weight_col", "Horse Weight")
+
+    st.markdown("## Late Power Index — **PWR400** (Last 400m under Load)")
+    if trip and alpha is not None:
+        st.caption(
+            f"Blend of Speed Index (last 400m) and Weight Index with distance-aware α. "
+            f"Trip: **{trip}m**, α ≈ **{alpha:.3f}**, v₄₀₀ window: **{v_src}**, weight: **{weight_col}**."
+        )
+    else:
+        st.caption("Blend of Speed Index (last 400m) and Weight Index with distance-aware α. Median PWR400 = 100.")
+
+    # Build display columns
+    cols = []
+    for c in [
+        "Horse", "Finish_Pos",
+        weight_col,
+        "PWR400_v400",
+        "PWR400"
+    ]:
+        if c in df.columns:
+            cols.append(c)
+
+    if not cols:
+        st.info("No PWR400 columns to display.")
+        return
+
+    show = df.copy()
+    if "PWR400" in show.columns:
+        show = show.sort_values("PWR400", ascending=False)
+
+    st.dataframe(show[cols], use_container_width=True)
+    st.caption(
+        "Interpretation: PWR400 ≈ 100 = typical late power for this field; 110+ = strong late engine under meaningful weight; "
+        "90–95 = weak late power."
+    )
+
+# ======================= /PWR400 MODULE =======================
+
+
+# ======================= MODULE INVOCATION EXAMPLE =======================
+# Call this AFTER you have `metrics`, `race_distance_input`, and `split_step` available.
+
+try:
+    metrics = compute_pwr400(
+        metrics,
+        float(race_distance_input),
+        int(split_step),
+        weight_col="Horse Weight"  # adjust if your column name differs
+    )
+    render_pwr400_table(metrics)
+except Exception as e:
+    st.warning("PWR400 module failed.")
+    st.exception(e)
+# ======================= /INVOCATION EXAMPLE =======================
+
 # ======================= R&V (CAR) — Context-Aware Reliability =======================
 st.markdown("## R&V — Context-Aware Reliability (CAR)")
 
@@ -3207,217 +3418,6 @@ AM_view = AM.sort_values(
 st.dataframe(AM_view, use_container_width=True)
 
 # ... end of Ability Matrix render (plot + AM_view table) ...
-
-# ======================= PWR400 MODULE — Late Power under Load (400m) =======================
-# Pure power lens: last 400m speed + weight, no efficiency.
-# PWR400 = distance-aware blend of Speed Index (S400) and Weight Index (W_idx).
-# Uses "Horse Weight" as carried kg and renders its own Streamlit table.
-
-import numpy as np
-import pandas as pd
-import streamlit as st
-
-def compute_pwr400(
-    df: pd.DataFrame,
-    distance_m: float,
-    step: int,
-    weight_col: str = "Horse Weight"
-) -> pd.DataFrame:
-    """
-    Compute PWR400 (Late Power Index over last 400m):
-
-      • S400      = Speed Index over last 400m (median = 100)
-      • W_idx     = Weight Index (field-relative carried weight, median = 100)
-      • alpha(D)  = distance-aware weight importance
-      • PWR400_raw = S400 + alpha(D) * (W_idx - 100)
-      • PWR400    = PWR400_raw reindexed so race median = 100
-
-    step = split size (100 or 200).
-    distance_m = race distance in meters.
-    """
-
-    w = df.copy()
-    step = int(step)
-    D = float(distance_m)
-
-    # ---------- 1. Last-400m time & speed (v400) ----------
-    fin = pd.to_numeric(w.get("Finish_Time"), errors="coerce")
-
-    if fin.isna().all():
-        # No finish times → can't do anything
-        w["PWR400_v400"] = np.nan
-        w["PWR400_SIdx"] = np.nan
-        w["PWR400_WIdx"] = np.nan
-        w["PWR400_raw"]  = np.nan
-        w["PWR400"]      = np.nan
-        w.attrs["PWR400_NOTE"] = {"error": "Missing Finish_Time"}
-        return w
-
-    # Build last-400m time
-    if step == 200:
-        # Preferred: 400 + Finish (400m window)
-        if "200_Time" in w.columns:
-            t400 = pd.to_numeric(w["200_Time"], errors="coerce")
-            t_last400 = t400 + fin
-            source = "200_Time + Finish_Time"
-        else:
-            # Fallback: only Finish_Time available (best-effort; effectively 200m)
-            t_last400 = fin.copy()
-            source = "Finish_Time only (fallback; <400m)"
-    else:
-        # 100m splits: sum last four 100m segments where available
-        segs = []
-        used_cols = []
-        for col in ["300_Time", "200_Time", "100_Time", "Finish_Time"]:
-            if col in w.columns:
-                segs.append(pd.to_numeric(w[col], errors="coerce"))
-                used_cols.append(col)
-        if segs:
-            t_last400 = sum(segs)
-            source = " + ".join(used_cols)
-        else:
-            t_last400 = fin.copy()
-            source = "Finish_Time only (fallback)"
-
-    t_last400 = t_last400.where(t_last400 > 0, np.nan)
-
-    v400 = 400.0 / t_last400
-    v400 = v400.replace([np.inf, -np.inf], np.nan)
-    w["PWR400_v400"] = v400
-
-    # ---------- 2. Convert speed to km/h ----------
-    # 400 meters = 0.4 km
-    # t_hours = t_seconds / 3600
-    v400_kmh = 0.4 / (t_last400 / 3600.0)
-    v400_kmh = v400_kmh.replace([np.inf, -np.inf], np.nan)
-    w["PWR400_v400"] = v400_kmh
-
-    # ---------- 3. Speed Index from km/h ----------
-    v_med = float(np.nanmedian(v400_kmh))
-    if np.isfinite(v_med) and v_med > 0:
-        w["PWR400_SIdx"] = 100.0 * (v400_kmh / v_med)
-    else:
-        w["PWR400_SIdx"] = np.nan
-
-    # ---------- 4. Weight Index W_idx (field-relative carried weight) ----------
-    W = pd.to_numeric(w.get(weight_col), errors="coerce")
-    W = W.where(W > 0, np.nan)
-
-    if W.notna().any():
-        W_med = float(np.nanmedian(W))
-        if np.isfinite(W_med) and W_med > 0:
-            w["PWR400_WIdx"] = 100.0 * (W / W_med)
-        else:
-            w["PWR400_WIdx"] = np.nan
-    else:
-        W_med = np.nan
-        w["PWR400_WIdx"] = np.nan
-
-    # ---------- 5. Distance-aware alpha(D) ----------
-    # Linear Option A:
-    #   alpha(D) = 0.20 + 0.00025 * (D - 1000), clamped to [0.20, 0.70]
-    alpha = 0.20 + 0.00025 * (D - 1000.0)
-    alpha = max(0.20, min(0.70, alpha))
-
-    # ---------- 6. Raw Power score & indexed PWR400 ----------
-    S400 = pd.to_numeric(w["PWR400_SIdx"], errors="coerce")
-    Widx = pd.to_numeric(w["PWR400_WIdx"], errors="coerce")
-
-    # Need both indices to build raw power
-    mask_valid = S400.notna() & Widx.notna()
-    PWR_raw = pd.Series(np.nan, index=w.index, dtype=float)
-    PWR_raw[mask_valid] = S400[mask_valid] + alpha * (Widx[mask_valid] - 100.0)
-
-    w["PWR400_raw"] = PWR_raw
-
-    raw_med = float(np.nanmedian(PWR_raw))
-    if np.isfinite(raw_med) and raw_med > 0:
-        w["PWR400"] = 100.0 * (PWR_raw / raw_med)
-    else:
-        w["PWR400"] = np.nan
-
-    # ---------- 7. Metadata for UI / PDF / DB ----------
-    w.attrs["PWR400_NOTE"] = {
-        "desc": "PWR400 = distance-aware late power: Speed Index (last 400m) + alpha(D) × (Weight Index − 100); race median = 100.",
-        "distance_m": int(D),
-        "alpha": round(alpha, 4),
-        "weight_col": weight_col,
-        "v400_source": source,
-        "v400_med": round(v_med, 5) if np.isfinite(v_med) else None,
-        "W_med": round(W_med, 3) if np.isfinite(W_med) else None,
-    }
-
-    return w
-
-
-def render_pwr400_table(df: pd.DataFrame):
-    """
-    Render the standalone PWR400 table in Streamlit.
-    """
-
-    note = df.attrs.get("PWR400_NOTE", {}) or {}
-    if "error" in note:
-        st.markdown("## Late Power Index — **PWR400**")
-        st.warning(f"PWR400 could not be computed: {note.get('error')}")
-        return
-
-    trip = note.get("distance_m", None)
-    alpha = note.get("alpha", None)
-    v_src = note.get("v400_source", "last 400m window")
-    weight_col = note.get("weight_col", "Horse Weight")
-
-    st.markdown("## Late Power Index — **PWR400** (Last 400m under Load)")
-    if trip and alpha is not None:
-        st.caption(
-            f"Blend of Speed Index (last 400m) and Weight Index with distance-aware α. "
-            f"Trip: **{trip}m**, α ≈ **{alpha:.3f}**, v₄₀₀ window: **{v_src}**, weight: **{weight_col}**."
-        )
-    else:
-        st.caption("Blend of Speed Index (last 400m) and Weight Index with distance-aware α. Median PWR400 = 100.")
-
-    # Build display columns
-    cols = []
-    for c in [
-        "Horse", "Finish_Pos",
-        weight_col,
-        "PWR400_v400",
-        "PWR400"
-    ]:
-        if c in df.columns:
-            cols.append(c)
-
-    if not cols:
-        st.info("No PWR400 columns to display.")
-        return
-
-    show = df.copy()
-    if "PWR400" in show.columns:
-        show = show.sort_values("PWR400", ascending=False)
-
-    st.dataframe(show[cols], use_container_width=True)
-    st.caption(
-        "Interpretation: PWR400 ≈ 100 = typical late power for this field; 110+ = strong late engine under meaningful weight; "
-        "90–95 = weak late power."
-    )
-
-# ======================= /PWR400 MODULE =======================
-
-
-# ======================= MODULE INVOCATION EXAMPLE =======================
-# Call this AFTER you have `metrics`, `race_distance_input`, and `split_step` available.
-
-try:
-    metrics = compute_pwr400(
-        metrics,
-        float(race_distance_input),
-        int(split_step),
-        weight_col="Horse Weight"  # adjust if your column name differs
-    )
-    render_pwr400_table(metrics)
-except Exception as e:
-    st.warning("PWR400 module failed.")
-    st.exception(e)
-# ======================= /INVOCATION EXAMPLE =======================
 
 # ======================= xWin — Probability to Win (100-replay view) =======================
 st.markdown("## xWin — Probability to Win")
