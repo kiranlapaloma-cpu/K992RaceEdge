@@ -3000,6 +3000,171 @@ except Exception as e:
     st.exception(e)
 # ======================= /INVOCATION EXAMPLE =======================
 
+# ======================= Visual: Power–Freshness Map (PWR400 vs Fatigue) =======================
+import matplotlib.pyplot as plt
+from matplotlib.colors import TwoSlopeNorm
+from matplotlib.patches import Rectangle
+from matplotlib.lines import Line2D
+import numpy as np
+import io
+
+st.markdown("## Power–Freshness Map — Late Power vs Fatigue")
+
+# We need from the modules:
+#   metrics: Horse, PI, PWR400
+#   _ftab:   Horse, FatigueScore, Tag   (from build_fatigue_table_refined)
+need_p  = {"Horse", "PI", "PWR400"}
+need_fg = {"Horse", "FatigueScore", "Tag"}
+
+missing_p  = need_p  - set(metrics.columns)
+missing_fg = need_fg - set(_ftab.columns)
+
+if missing_p:
+    st.warning(
+        "Power–Freshness Map: metrics missing columns: "
+        + ", ".join(sorted(missing_p))
+    )
+elif missing_fg:
+    st.warning(
+        "Power–Freshness Map: fatigue table missing columns: "
+        + ", ".join(sorted(missing_fg))
+    )
+else:
+    # Merge power + PI with fatigue table
+    dfm = metrics.loc[:, ["Horse", "PI", "PWR400"]].merge(
+        _ftab.loc[:, ["Horse", "FatigueScore", "Tag"]],
+        on="Horse",
+        how="inner",
+    )
+
+    # numeric casting
+    for c in ["PI", "PWR400", "FatigueScore"]:
+        dfm[c] = pd.to_numeric(dfm[c], errors="coerce")
+
+    dfm = dfm.dropna(subset=["PWR400", "FatigueScore"])
+    if dfm.empty:
+        st.info("Not enough overlapping data to draw the Power–Freshness Map.")
+    else:
+        # ----- Axes -----
+        # X: PWR400Δ = PWR400 - race median (late power vs field)
+        pwr_med = float(np.nanmedian(dfm["PWR400"]))
+        dfm["PWR400Δ"] = dfm["PWR400"] - pwr_med
+
+        # Y: Freshness = -FatigueScore  (higher = stronger late / less fatigue)
+        dfm["Freshness"] = -dfm["FatigueScore"]
+
+        names = dfm["Horse"].astype(str).to_list()
+        xv = dfm["PWR400Δ"].to_numpy()
+        yv = dfm["Freshness"].to_numpy()
+
+        # ----- Colour: map Tag → numeric, for a centred colour scale -----
+        # late engine → +1, balanced/neutral → 0, front-spent → -1
+        tag_map = {
+            "late engine": 1.0,
+            "balanced": 0.0,
+            "neutral": 0.0,
+            "front-spent": -1.0,
+        }
+        dfm["TagVal"] = dfm["Tag"].map(tag_map).fillna(0.0)
+        cv = dfm["TagVal"].to_numpy()
+
+        # ----- Dot sizes from PI (same logic as Shape Map) -----
+        DOT_MIN, DOT_MAX = 40.0, 140.0
+        piv = dfm["PI"].fillna(0).to_numpy()
+        pmin, pmax = np.nanmin(piv), np.nanmax(piv)
+        if (not np.isfinite(pmin)) or (not np.isfinite(pmax)) or pmin == pmax:
+            sizes = np.full_like(xv, DOT_MIN)
+        else:
+            sizes = DOT_MIN + (piv - pmin) / (pmax - pmin + 1e-9) * (DOT_MAX - DOT_MIN)
+
+        # ----- Limits & quadrant tints -----
+        span = max(4.5, float(np.nanmax(np.abs(np.concatenate([xv, yv])))))
+        lim = np.ceil(span / 1.5) * 1.5
+
+        fig, ax = plt.subplots(figsize=(7.8, 6.2))
+
+        TINT = 0.12
+        # Quadrant meanings:
+        #   Q1 (+X, +Y): Big engine & stays on  → "Monsters"
+        #   Q2 (-X, +Y): Efficient grinders     → "Strong late, modest power"
+        #   Q3 (+X, -Y): Fragile engines        → "Power but fatigued"
+        #   Q4 (-X, -Y): Weak & spent          → "Dead zone"
+        ax.add_patch(Rectangle((0, 0),       lim,  lim, facecolor="#4daf4a", alpha=TINT, zorder=0))
+        ax.add_patch(Rectangle((-lim, 0),    lim,  lim, facecolor="#377eb8", alpha=TINT, zorder=0))
+        ax.add_patch(Rectangle((0, -lim),    lim,  lim, facecolor="#ff7f00", alpha=TINT, zorder=0))
+        ax.add_patch(Rectangle((-lim, -lim), lim,  lim, facecolor="#984ea3", alpha=TINT, zorder=0))
+
+        ax.axvline(0, color="gray", lw=1.3, ls=(0, (3, 3)), zorder=1)
+        ax.axhline(0, color="gray", lw=1.3, ls=(0, (3, 3)), zorder=1)
+
+        # Colour scale centred at 0 (balanced)
+        norm = TwoSlopeNorm(vcenter=0.0, vmin=-1.0, vmax=1.0)
+
+        sc = ax.scatter(
+            xv, yv,
+            s=sizes,
+            c=cv,
+            cmap="coolwarm",
+            norm=norm,
+            edgecolor="black",
+            linewidth=0.6,
+            alpha=0.95,
+        )
+
+        # Labels
+        label_points_neatly(ax, xv, yv, names)
+
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
+        ax.set_xlabel("PWR400 − field median (late power under load) →")
+        ax.set_ylabel("Freshness (−FatigueScore) ↑  — higher = stronger late / less fade")
+        ax.set_title("Power–Freshness Map: late power vs fatigue  ·  Size = PI  ·  Colour = Fatigue Tag")
+
+        # Size legend (PI bands)
+        s_ex = [DOT_MIN, 0.5 * (DOT_MIN + DOT_MAX), DOT_MAX]
+        h_ex = [
+            Line2D(
+                [0], [0],
+                marker="o",
+                color="w",
+                markerfacecolor="gray",
+                markersize=np.sqrt(s / np.pi),
+                markeredgecolor="black",
+            )
+            for s in s_ex
+        ]
+        ax.legend(
+            h_ex,
+            ["PI low", "PI mid", "PI high"],
+            loc="upper left",
+            frameon=False,
+            fontsize=8,
+        )
+
+        # Colourbar for fatigue tag
+        cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("Fatigue Tag (−1 front-spent · 0 balanced/neutral · +1 late engine)")
+
+        ax.grid(True, linestyle=":", alpha=0.25)
+        st.pyplot(fig)
+
+        # PNG download
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=300, bbox_inches="tight")
+        powfresh_png = buf.getvalue()
+        st.download_button(
+            "Download Power–Freshness Map (PNG)",
+            powfresh_png,
+            file_name="power_freshness_map.png",
+            mime="image/png",
+        )
+        st.caption(
+            "X = PWR400 vs field (late power under load); "
+            "Y = −FatigueScore (freshness, higher = stronger late); "
+            "Colour = fatigue tag; Size = PI."
+        )
+# ======================= /Power–Freshness Map =======================
+
 # ======================= R&V (CAR) — Context-Aware Reliability =======================
 st.markdown("## R&V — Context-Aware Reliability (CAR)")
 
