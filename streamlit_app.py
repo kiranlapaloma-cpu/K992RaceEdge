@@ -2740,25 +2740,16 @@ def build_fatigue_table_refined(metrics: pd.DataFrame) -> pd.DataFrame:
     Mono = np.nan_to_num(monos, nan=0.5).astype(np.float32)
     Reliability = (0.5 * comp + 0.5 * np.clip(Mono, 0.0, 1.0)).astype(np.float32)
 
-    # Tags / Cues (IQR-relative + minimum absolute floors so they travel across races)
-    fg_iqr = np.nanpercentile(FG_eff, 75) - np.nanpercentile(FG_eff, 25)
-    fg_floor = max(0.03, 0.12 * fg_iqr)  # both absolute and relative
-    line_iqr = np.nanpercentile(LineEff, 75) - np.nanpercentile(LineEff, 25)
-    line_floor = max(0.80, 0.15 * line_iqr)
+    # ---------- NEW TAG RULE: based ONLY on FatigueScore ----------
+    FS = np.asarray(FatigueScore, float)
 
-    cond_late   = (FG_eff >= -2.5)  # strong late line with less-than-field fade
-    cond_spent  = (FG_eff >= 3)  # weak late + extra fade
-    cond_bal    = np.abs(FG_vs_field) <= 0.25
+    Tag = np.full(len(FS), "balanced", dtype=object)
+    Tag[FS < -3.0] = "late engine"
+    Tag[FS >  3.0] = "front-spent"
 
-    Tag = np.full(len(df), "neutral", dtype=object)
-    Tag[cond_bal]   = "balanced"
-    Tag[cond_spent] = "front-spent"
-    Tag[cond_late]  = "late engine"
-
-    Cue = np.full(len(df), "needs shape/ride", dtype=object)
-    Cue[cond_bal]   = "repeats"
-    Cue[cond_spent] = "↓ trip / easier early"
-    Cue[cond_late]  = "↑ trip / stronger pace"
+    Cue = np.full(len(FS), "repeats", dtype=object)
+    Cue[FS < -3.0] = "↑ trip / stronger pace"
+    Cue[FS >  3.0] = "↓ trip / easier early"
 
     # Assemble view
     view = pd.DataFrame({
