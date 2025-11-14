@@ -3136,7 +3136,7 @@ else:
         cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
         cbar.set_label("Fatigue Tag (−3 front-spent · 0 balanced/neutral · +3 late engine)")
 
-        ax.grid(True, linestyle=":", alpha=0.75)
+        ax.grid(True, linestyle=":", alpha=0.25)
         st.pyplot(fig)
 
         # PNG download
