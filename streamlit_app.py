@@ -697,31 +697,22 @@ def pi_weights_distance_and_context(
     # Soft: reward Grind & tsSPI; soften Accel & F200
     # Heavy: stronger version of Soft
     if going == "Firm":
-        amp_main, amp_side = 0.06, 0.03
-        mult = {
-            "Accel":    1.0 + amp_main * field_scale,
-            "F200_idx": 1.0 + amp_side * field_scale,
-            "Grind":    1.0 - amp_main * field_scale,
-            "tsSPI":    1.0 - amp_side * field_scale,
-        }
+        # Firm: boost Accel ONLY
+        amp = 0.06 * field_scale
+        mult = {"F200_idx": 1.0, "tsSPI": 1.0, "Accel": 1.0 + amp, "Grind": 1.0}
+
     elif going == "Soft":
-        amp_main, amp_side = 0.06, 0.03
-        mult = {
-            "Accel":    1.0 - amp_main * field_scale,
-            "F200_idx": 1.0 - amp_side * field_scale,
-            "Grind":    1.0 + amp_main * field_scale,
-            "tsSPI":    1.0 + amp_side * field_scale,
-        }
+        # Soft: boost Grind ONLY
+        amp = 0.06 * field_scale
+        mult = {"F200_idx": 1.0, "tsSPI": 1.0, "Accel": 1.0, "Grind": 1.0 + amp}
+
     elif going == "Heavy":
-        amp_main, amp_side = 0.10, 0.05
-        mult = {
-            "Accel":    1.0 - amp_main * field_scale,
-            "F200_idx": 1.0 - amp_side * field_scale,
-            "Grind":    1.0 + amp_main * field_scale,
-            "tsSPI":    1.0 + amp_side * field_scale,
-        }
+        # Heavy: boost Grind ONLY (stronger)
+        amp = 0.10 * field_scale
+        mult = {"F200_idx": 1.0, "tsSPI": 1.0, "Accel": 1.0, "Grind": 1.0 + amp}
+
     else:  # "Good" or unknown
-        mult = {"F200_idx":1.0, "tsSPI":1.0, "Accel":1.0, "Grind":1.0}
+        mult = {"F200_idx": 1.0, "tsSPI": 1.0, "Accel": 1.0, "Grind": 1.0}
 
     weighted = {k: base[k] * mult[k] for k in base.keys()}
     s = sum(weighted.values()) or 1.0
