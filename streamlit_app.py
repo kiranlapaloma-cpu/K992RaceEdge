@@ -657,7 +657,7 @@ def pi_weights_distance_and_context(
 
     # ---- Base by distance (your current logic) ----
     if dm <= 1000:
-        F200, ts, ACC, GR = 0.15, 0.20, 0.40, 0.25
+        F200, ts, ACC, GR = 0.10, 0.20, 0.45, 0.25
 
     elif dm <= 1200:
         F200, ts, ACC, GR = 0.10, 0.25, 0.40, 0.25
