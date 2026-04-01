@@ -1,29 +1,28 @@
 # ======================= Batch 1 — Core + UI + I/O + DB bootstrap =======================
+import io, math, re, os, sqlite3, hashlib
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
-import io, math, re, os, sqlite3, hashlib
-from datetime import datetime
 
 # ======================= Global NaN/Inf → None guard (JSON-safe, index-safe) =======================
-import math, numpy as np, pandas as pd, streamlit as st
-pd.options.mode.use_inf_as_na = True
 
 def _is_nanlike(x):
     try:
-        return (x is None) or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))) \
-               or (isinstance(x, (np.floating,)) and (np.isnan(x) or np.isinf(x)))
+        return (
+            x is None
+            or (isinstance(x, float) and (math.isnan(x) or math.isinf(x)))
+            or (isinstance(x, np.floating) and (np.isnan(x) or np.isinf(x)))
+        )
     except Exception:
         return False
 
 def _san_df(df: pd.DataFrame) -> pd.DataFrame:
-    # values
     clean = df.replace([np.inf, -np.inf], np.nan).where(lambda d: d.notna(), None)
-    # index/columns too
-    clean.index   = [None if _is_nanlike(v) else v for v in clean.index.tolist()]
+    clean.index = [None if _is_nanlike(v) else v for v in clean.index.tolist()]
     clean.columns = [None if _is_nanlike(v) else v for v in clean.columns.tolist()]
-    # force object dtype so Arrow doesn’t re-infer with NaNs
     return clean.astype("object")
 
 def _san_ser(s: pd.Series) -> pd.Series:
@@ -32,10 +31,11 @@ def _san_ser(s: pd.Series) -> pd.Series:
     return ss.astype("object")
 
 def _sanitize(obj):
-    # pandas
-    if isinstance(obj, pd.DataFrame): return _san_df(obj).reset_index(drop=True)
-    if isinstance(obj, pd.Series):    return _san_ser(obj).reset_index(drop=True)
-    # pandas Styler
+    if isinstance(obj, pd.DataFrame):
+        return _san_df(obj).reset_index(drop=True)
+    if isinstance(obj, pd.Series):
+        return _san_ser(obj).reset_index(drop=True)
+
     try:
         from pandas.io.formats.style import Styler
         if isinstance(obj, Styler):
@@ -44,22 +44,23 @@ def _sanitize(obj):
             return sty
     except Exception:
         pass
-    # numpy
+
     if isinstance(obj, np.ndarray):
         return [_sanitize(v) for v in obj.tolist()]
-    # dict / list / tuple (recursive)
     if isinstance(obj, dict):
         return {k: _sanitize(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return type(obj)(_sanitize(v) for v in obj)
-    # scalars
+
     return None if _is_nanlike(obj) else obj
 
 # ---- Patch common emitters (incl. data_editor) ----
 _orig_write = st.write
 def _safe_write(*args, **kwargs):
-    return _orig_write(*(_sanitize(a) for a in args),
-                       **{k: _sanitize(v) for k, v in kwargs.items()})
+    return _orig_write(
+        *(_sanitize(a) for a in args),
+        **{k: _sanitize(v) for k, v in kwargs.items()}
+    )
 st.write = _safe_write
 
 _orig_json = st.json
@@ -67,14 +68,19 @@ st.json = lambda obj, *a, **k: _orig_json(_sanitize(obj), *a, **k)
 
 _orig_metric = st.metric
 def _safe_metric(label, value, delta=None, *a, **k):
-    v = _sanitize(value); d = _sanitize(delta)
-    return _orig_metric(label, "-" if v is None else v, "-" if (delta is not None and d is None) else d, *a, **k)
+    v = _sanitize(value)
+    d = _sanitize(delta)
+    return _orig_metric(
+        label,
+        "-" if v is None else v,
+        "-" if (delta is not None and d is None) else d,
+        *a, **k
+    )
 st.metric = _safe_metric
 
 _orig_dataframe = st.dataframe
 def _safe_dataframe(data=None, *a, **k):
     data = _sanitize(data)
-    # final guard: if it’s still a DataFrame-like, ensure a clean RangeIndex
     try:
         if isinstance(data, pd.DataFrame):
             data = data.reset_index(drop=True)
@@ -86,7 +92,6 @@ st.dataframe = _safe_dataframe
 _orig_table = st.table
 st.table = lambda data=None, *a, **k: _orig_table(_sanitize(data), *a, **k)
 
-# (optional but helpful)
 if hasattr(st, "data_editor"):
     _orig_editor = st.data_editor
     st.data_editor = lambda data=None, *a, **k: _orig_editor(_sanitize(data), *a, **k)
