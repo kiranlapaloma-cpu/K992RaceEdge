@@ -326,24 +326,24 @@ def _view_is(*names: str) -> bool:
 
 # ----------------------- RPSS helpers -----------------------
 DISTANCE_STD_100M = {
-    1000: 5.50,
-    1160: 5.53,
-    1200: 5.55,
-    1400: 5.63,
-    1450: 5.65,
-    1600: 5.70,
-    1750: 5.76,
-    1800: 5.78,
-    1900: 5.83,
-    1950: 5.85,
-    2000: 5.87,
-    2200: 5.95,
-    2400: 6.03,
-    2450: 6.05,
-    2600: 6.13,
-    2800: 6.22,
-    3000: 6.32,
-    3200: 6.42,
+    1000: 5.13,
+    1160: 5.28,
+    1200: 5.35,
+    1400: 5.65,
+    1450: 5.75,
+    1600: 5.90,
+    1750: 5.92,
+    1800: 5.93,
+    1900: 5.94,
+    1950: 5.95,
+    2000: 5.95,
+    2200: 6.02,
+    2400: 6.10,
+    2450: 6.12,
+    2600: 6.20,
+    2800: 6.30,
+    3000: 6.40,
+    3200: 6.50,
 }
 
 def _benchmark_std_100m(distance_m: float) -> float:
@@ -432,16 +432,18 @@ def compute_rpss(metrics_df: pd.DataFrame, distance_m: float, split_step: int, s
 
     if not np.isfinite(rpss):
         verdict = "Unavailable"
-    elif rpss < 98.5:
+    elif rpss < 97.0:
         verdict = "Weak sustained pace"
+    elif rpss < 98.5:
+        verdict = "Fair sustained pace"
     elif rpss < 99.5:
-        verdict = "Below standard"
+        verdict = "Slightly below strong standard"
     elif rpss <= 100.5:
-        verdict = "Genuine"
-    elif rpss <= 101.5:
-        verdict = "Strong"
-    else:
+        verdict = "Genuine / strong"
+    elif rpss <= 102.0:
         verdict = "Very strong"
+    else:
+        verdict = "Exceptional"
 
     out_cols = [c for c in ["Horse", "Finish_Pos"] if c in usable.columns]
     out = usable[out_cols + ["_RPSS_avg_split_time", "_RPSS_vs_std_pct", "_RPSS_margin", "_RPSS_valid_splits"]].copy()
