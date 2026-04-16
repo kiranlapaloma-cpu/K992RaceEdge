@@ -347,7 +347,7 @@ DISTANCE_STD_100M = {
 }
 
 def _benchmark_std_100m(distance_m: float) -> float:
-    """Empirical tsSPI benchmark ladder in seconds per 100m, interpolated by trip."""
+    """Practical trip benchmark ladder anchored at 5.50s per 100m for 1000m races."""
     knots = sorted((float(k), float(v)) for k, v in DISTANCE_STD_100M.items())
     d = float(distance_m)
     if d <= knots[0][0]:
@@ -384,47 +384,47 @@ def _robust_center(series: pd.Series, p_lo: float = 0.10, p_hi: float = 0.90) ->
         return float(s.median())
 
 
+def _phase_avg_split(df: pd.DataFrame, cols: list[str], prefix: str) -> pd.DataFrame:
+    vals = df[cols].apply(pd.to_numeric, errors="coerce").replace(0, np.nan) if cols else pd.DataFrame(index=df.index)
+    out = pd.DataFrame(index=df.index)
+    out[f"{prefix}_avg_split_time"] = vals.mean(axis=1, skipna=True) if cols else np.nan
+    out[f"{prefix}_valid_splits"] = vals.notna().sum(axis=1) if cols else 0
+    return out
+
+
 def compute_rpss(metrics_df: pd.DataFrame, distance_m: float, split_step: int, seg_markers: list[int]):
     """
     RPSS = Race Pace Strength Score.
-    Uses the tsSPI section only and compares the race's robust average split time
-    to a distance benchmark converted to the current split size (100m or 200m).
-
-    Supporting phase table benchmarks Acceleration and Grind to the SAME split-time
-    standard so the user can gauge how sharply the race lifted or slowed versus tsSPI.
+    Uses the tsSPI section only for the headline score, benchmarked to a distance standard.
+    Also reports race-level Acceleration and Grind phase split averages to describe shape change.
     """
     if metrics_df is None or len(metrics_df) == 0:
         return None
     step = int(split_step)
     D = float(distance_m)
-
-    def _phase_cols():
-        tssp_start = _adaptive_tssp_start(D, step, seg_markers)
-        mid_cols = [c for c in _make_range_cols(D, tssp_start, 600, step) if c in metrics_df.columns]
-        if step == 100:
-            acc_cols = [c for c in [f"{m}_Time" for m in [500, 400, 300, 200]] if c in metrics_df.columns]
-            grind_cols = [c for c in ["100_Time", "Finish_Time"] if c in metrics_df.columns]
-        else:
-            acc_cols = [c for c in [f"{m}_Time" for m in [600, 400]] if c in metrics_df.columns]
-            grind_cols = [c for c in ["Finish_Time"] if c in metrics_df.columns]
-        return mid_cols, acc_cols, grind_cols
-
-    mid_cols, acc_cols, grind_cols = _phase_cols()
+    tssp_start = _adaptive_tssp_start(D, step, seg_markers)
+    mid_cols = [c for c in _make_range_cols(D, tssp_start, 600, step) if c in metrics_df.columns]
     if not mid_cols:
         return None
 
-    def _row_avg(df: pd.DataFrame, cols: list[str], prefix: str):
-        vals = df[cols].apply(pd.to_numeric, errors="coerce").replace(0, np.nan) if cols else pd.DataFrame(index=df.index)
-        avg = vals.mean(axis=1, skipna=True) if len(cols) else pd.Series(np.nan, index=df.index)
-        cnt = vals.notna().sum(axis=1) if len(cols) else pd.Series(0, index=df.index)
-        df[f"_{prefix}_avg_split_time"] = avg
-        df[f"_{prefix}_valid_splits"] = cnt
-        return df
+    # Pace-shape companion windows using the app's pace-curve phase definitions.
+    if step == 100:
+        accel_cols = [c for c in ["600_Time", "500_Time", "400_Time", "300_Time"] if c in metrics_df.columns]
+        grind_cols = [c for c in ["200_Time", "Finish_Time"] if c in metrics_df.columns]
+    else:
+        accel_cols = [c for c in ["600_Time", "400_Time"] if c in metrics_df.columns]
+        grind_cols = [c for c in ["200_Time", "Finish_Time"] if c in metrics_df.columns]
+        # On 200m data the final leg usually sits in 200_Time; keep Finish_Time only if that's the last segment column.
+        if "200_Time" in grind_cols and "Finish_Time" in grind_cols:
+            grind_cols = ["200_Time"]
 
     df = metrics_df.copy()
-    df = _row_avg(df, mid_cols, "RPSS")
-    df = _row_avg(df, acc_cols, "ACC")
-    df = _row_avg(df, grind_cols, "GR")
+    mid_stats = _phase_avg_split(df, mid_cols, "_RPSS")
+    acc_stats = _phase_avg_split(df, accel_cols, "_ACC")
+    grd_stats = _phase_avg_split(df, grind_cols, "_GRD")
+    for part in [mid_stats, acc_stats, grd_stats]:
+        for c in part.columns:
+            df[c] = part[c]
 
     usable = df[(pd.to_numeric(df["_RPSS_avg_split_time"], errors="coerce").notna()) & (df["_RPSS_valid_splits"] > 0)].copy()
     if usable.empty:
@@ -450,36 +450,12 @@ def compute_rpss(metrics_df: pd.DataFrame, distance_m: float, split_step: int, s
     beaters_pct = float((pd.to_numeric(usable["_RPSS_avg_split_time"], errors="coerce") <= benchmark_split_time).mean() * 100.0)
     top_half_beaters_pct = float((pd.to_numeric(top_half["_RPSS_avg_split_time"], errors="coerce") <= benchmark_split_time).mean() * 100.0)
 
-    def _phase_summary(label: str, col: str, valid_col: str, base_avg: float | None = None):
-        vals = pd.to_numeric(usable[col], errors="coerce")
-        vals = vals[np.isfinite(vals)]
-        phase_avg = _robust_center(vals) if len(vals) else np.nan
-        vs_std = float(100.0 * (benchmark_split_time / phase_avg)) if np.isfinite(phase_avg) and phase_avg > 0 else np.nan
-        margin = float(benchmark_split_time - phase_avg) if np.isfinite(phase_avg) else np.nan
-        if base_avg is None or not np.isfinite(base_avg) or not np.isfinite(phase_avg) or phase_avg <= 0:
-            change_pct = np.nan
-            change_s = np.nan
-        else:
-            change_pct = float(100.0 * (base_avg / phase_avg))
-            change_s = float(base_avg - phase_avg)
-        splits_used = int(pd.to_numeric(usable[valid_col], errors="coerce").fillna(0).median()) if valid_col in usable.columns else 0
-        return {
-            "Phase": label,
-            "Benchmark split (s)": benchmark_split_time,
-            "Race avg split (s)": phase_avg,
-            "Vs std (%)": vs_std,
-            "Margin vs std (s)": margin,
-            "Change vs previous (%)": change_pct,
-            "Change vs previous (s)": change_s,
-            "Splits used": splits_used,
-        }
-
-    phase_rows = []
-    phase_rows.append(_phase_summary("tsSPI", "_RPSS_avg_split_time", "_RPSS_valid_splits", None))
-    phase_rows.append(_phase_summary("Acceleration", "_ACC_avg_split_time", "_ACC_valid_splits", race_avg))
-    acc_avg_for_phase = phase_rows[-1]["Race avg split (s)"]
-    phase_rows.append(_phase_summary("Grind", "_GR_avg_split_time", "_GR_valid_splits", acc_avg_for_phase))
-    phase_table = pd.DataFrame(phase_rows)
+    accel_avg = _robust_center(usable["_ACC_avg_split_time"])
+    grind_avg = _robust_center(usable["_GRD_avg_split_time"])
+    accel_vs_std = float(100.0 * (benchmark_split_time / accel_avg)) if np.isfinite(accel_avg) and accel_avg > 0 else np.nan
+    grind_vs_std = float(100.0 * (benchmark_split_time / grind_avg)) if np.isfinite(grind_avg) and grind_avg > 0 else np.nan
+    accel_lift_pct = float((race_avg / accel_avg) * 100.0) if np.isfinite(race_avg) and np.isfinite(accel_avg) and accel_avg > 0 else np.nan
+    grind_hold_pct = float((accel_avg / grind_avg) * 100.0) if np.isfinite(accel_avg) and np.isfinite(grind_avg) and grind_avg > 0 else np.nan
 
     if not np.isfinite(rpss):
         verdict = "Unavailable"
@@ -505,23 +481,35 @@ def compute_rpss(metrics_df: pd.DataFrame, distance_m: float, split_step: int, s
         "_RPSS_valid_splits": "tsSPI splits used",
     })
 
+    phase_table = pd.DataFrame([
+        {"Phase": "tsSPI", "Avg split (s)": race_avg, "Vs std (%)": rpss, "Change vs prior (%)": np.nan},
+        {"Phase": "Acceleration", "Avg split (s)": accel_avg, "Vs std (%)": accel_vs_std, "Change vs prior (%)": accel_lift_pct},
+        {"Phase": "Grind", "Avg split (s)": grind_avg, "Vs std (%)": grind_vs_std, "Change vs prior (%)": grind_hold_pct},
+    ])
+
     return {
         "distance_m": D,
         "split_step": step,
         "mid_cols": mid_cols,
-        "acc_cols": acc_cols,
+        "accel_cols": accel_cols,
         "grind_cols": grind_cols,
         "benchmark_std_100m": benchmark_std_100m,
         "benchmark_split_time": benchmark_split_time,
         "race_avg_split_time": race_avg,
         "top_half_avg_split_time": top_half_avg,
+        "accel_avg_split_time": accel_avg,
+        "grind_avg_split_time": grind_avg,
+        "accel_vs_std": accel_vs_std,
+        "grind_vs_std": grind_vs_std,
+        "accel_lift_pct": accel_lift_pct,
+        "grind_hold_pct": grind_hold_pct,
         "rpss": rpss,
         "top_half_rpss": top_half_rpss,
         "beaters_pct": beaters_pct,
         "top_half_beaters_pct": top_half_beaters_pct,
         "verdict": verdict,
-        "table": out.reset_index(drop=True),
         "phase_table": phase_table,
+        "table": out.reset_index(drop=True),
     }
 
 
@@ -543,6 +531,14 @@ def render_rpss_section(rpss_info: dict | None):
     st.caption(
         f"Benchmark: {rpss_info['benchmark_std_100m']:.2f}s per 100m • Top-half RPSS: {_top_half_txt}"
     )
+
+    phase_df = rpss_info.get("phase_table")
+    if phase_df is not None and len(phase_df):
+        phase_df = phase_df.copy()
+        phase_df["Avg split (s)"] = pd.to_numeric(phase_df["Avg split (s)"], errors="coerce").round(3)
+        phase_df["Vs std (%)"] = pd.to_numeric(phase_df["Vs std (%)"], errors="coerce").round(2)
+        phase_df["Change vs prior (%)"] = pd.to_numeric(phase_df["Change vs prior (%)"], errors="coerce").round(2)
+        st.dataframe(phase_df, use_container_width=True, hide_index=True)
 
     chart_df = rpss_info["table"].copy()
     st.dataframe(chart_df, use_container_width=True, hide_index=True)
