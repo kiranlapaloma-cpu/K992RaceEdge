@@ -6,6 +6,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+from matplotlib.colors import TwoSlopeNorm
+from matplotlib.lines import Line2D
 
 # ======================= Global NaN/Inf → None guard (JSON-safe, index-safe) =======================
 
@@ -26,7 +29,8 @@ def _san_df(df: pd.DataFrame) -> pd.DataFrame:
     return clean.astype("object")
 
 def _san_ser(s: pd.Series) -> pd.Series:
-    ss = s.replace([np.inf, -np.inf], np.nan).where(s.notna(), None)
+    ss = s.replace([np.inf, -np.inf], np.nan)
+    ss = ss.where(ss.notna(), None)
     ss.index = [None if _is_nanlike(v) else v for v in ss.index.tolist()]
     return ss.astype("object")
 
@@ -105,6 +109,72 @@ def _safe_download_button(*a, **k):
     return _orig_download_button(*a, **k)
 st.download_button = _safe_download_button
 # ======================= /Global guard =======================
+# ----------------------- Global plot helpers -----------------------
+def _repel_labels_builtin(ax, x, y, labels, *, init_shift=0.18, k_attract=0.006, k_repel=0.012, max_iter=250):
+    trans = ax.transData
+    renderer = ax.figure.canvas.get_renderer()
+    xy = np.column_stack([x, y]).astype(float)
+    offs = np.zeros_like(xy)
+    for i, (xi, yi) in enumerate(xy):
+        offs[i] = [init_shift if xi >= 0 else -init_shift, init_shift if yi >= 0 else -init_shift]
+
+    texts, lines = [], []
+    for (xi, yi), (dx, dy), lab in zip(xy, offs, labels):
+        t = ax.text(xi + dx, yi + dy, lab, fontsize=8.4, va="center", ha="left",
+                    bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.75),
+                    zorder=5)
+        texts.append(t)
+        lines.append(ax.plot([xi, xi + dx], [yi, yi + dy], color="gray", lw=0.45, alpha=0.45, zorder=4)[0])
+
+    ax.figure.canvas.draw()
+    for _ in range(max_iter):
+        moved = 0.0
+        bbs = [t.get_window_extent(renderer=renderer).expanded(1.06, 1.12) for t in texts]
+        centers = []
+        for bb in bbs:
+            centers.append(((bb.x0 + bb.x1) / 2, (bb.y0 + bb.y1) / 2))
+
+        for i, t in enumerate(texts):
+            xi, yi = xy[i]
+            tx, ty = t.get_position()
+            px, py = trans.transform((tx, ty))
+            ox, oy = trans.transform((xi, yi))
+
+            fx = (ox - px) * k_attract
+            fy = (oy - py) * k_attract
+
+            for j in range(len(texts)):
+                if i == j:
+                    continue
+                bb_i, bb_j = bbs[i], bbs[j]
+                if not bb_i.overlaps(bb_j):
+                    continue
+                cx_i, cy_i = centers[i]
+                cx_j, cy_j = centers[j]
+                dxp = (cx_i - cx_j) if (cx_i - cx_j) != 0 else (1.0 if i < j else -1.0)
+                dyp = (cy_i - cy_j) if (cy_i - cy_j) != 0 else (1.0 if i < j else -1.0)
+                dist = max((dxp * dxp + dyp * dyp) ** 0.5, 1.0)
+                fx += (dxp / dist) * k_repel * 12.0
+                fy += (dyp / dist) * k_repel * 12.0
+
+            new_tx, new_ty = trans.inverted().transform((px + fx, py + fy))
+            moved += abs(new_tx - tx) + abs(new_ty - ty)
+            t.set_position((new_tx, new_ty))
+            lines[i].set_data([xi, new_tx], [yi, new_ty])
+
+        ax.figure.canvas.draw()
+        renderer = ax.figure.canvas.get_renderer()
+        if moved < 1e-3:
+            break
+
+
+def label_points_neatly(ax, x, y, labels):
+    try:
+        _repel_labels_builtin(ax, x, y, labels)
+    except Exception:
+        for xi, yi, lab in zip(x, y, labels):
+            ax.text(xi, yi, str(lab), fontsize=8.2, va="center", ha="left", zorder=5)
+
 # ----------------------- Page config -----------------------
 st.set_page_config(
     page_title="Race Edge — PI v3.2 + Hidden v2 + Ability v2 + CG + Race Shape + DB",
@@ -245,52 +315,273 @@ def render_profile_badge(label: str, color_hex: str):
         unsafe_allow_html=True
     )
 
+
+def _view_is(*names: str) -> bool:
+    try:
+        return APP_VIEW in names
+    except Exception:
+        return False
+
+
+
+# ----------------------- RPSS helpers -----------------------
+def _benchmark_sec_per_furlong(distance_m: float) -> float:
+    """Practical genuine-tempo benchmark table for RPSS."""
+    knots = [
+        (1000, 12.0), (1160, 12.0), (1200, 12.0),
+        (1400, 12.15), (1450, 12.15),
+        (1600, 12.2), (1750, 12.3), (1800, 12.3),
+        (1900, 12.4), (1950, 12.4), (2000, 12.4),
+        (2200, 12.5),
+        (2400, 12.6), (2450, 12.6),
+        (2600, 12.8), (2800, 12.8),
+        (3000, 13.0), (3200, 13.2),
+    ]
+    d = float(distance_m)
+    if d <= knots[0][0]:
+        return float(knots[0][1])
+    if d >= knots[-1][0]:
+        return float(knots[-1][1])
+    for (a, va), (b, vb) in zip(knots, knots[1:]):
+        if a <= d <= b:
+            if a == b:
+                return float(vb)
+            t = (d - a) / (b - a)
+            return float(va + (vb - va) * t)
+    return 12.2
+
+
+def _robust_center(series: pd.Series, p_lo: float = 0.10, p_hi: float = 0.90) -> float:
+    s = pd.to_numeric(series, errors="coerce")
+    s = s[np.isfinite(s)]
+    if s.empty:
+        return np.nan
+    try:
+        return float(winsorize(s, p_lo=p_lo, p_hi=p_hi).mean())
+    except Exception:
+        return float(s.median())
+
+
+def compute_rpss(metrics_df: pd.DataFrame, distance_m: float, split_step: int, seg_markers: list[int]):
+    """
+    RPSS = Race Pace Strength Score.
+    Uses the tsSPI section only and compares the race's robust average split time
+    to a distance benchmark converted to the current split size (100m or 200m).
+    """
+    if metrics_df is None or len(metrics_df) == 0:
+        return None
+    step = int(split_step)
+    D = float(distance_m)
+    tssp_start = _adaptive_tssp_start(D, step, seg_markers)
+    mid_cols = [c for c in _make_range_cols(D, tssp_start, 600, step) if c in metrics_df.columns]
+    if not mid_cols:
+        return None
+
+    df = metrics_df.copy()
+    vals = df[mid_cols].apply(pd.to_numeric, errors="coerce").replace(0, np.nan)
+    valid_counts = vals.notna().sum(axis=1)
+    avg_split_time = vals.mean(axis=1, skipna=True)
+    df["_RPSS_avg_split_time"] = avg_split_time
+    df["_RPSS_valid_splits"] = valid_counts
+
+    usable = df[(pd.to_numeric(df["_RPSS_avg_split_time"], errors="coerce").notna()) & (df["_RPSS_valid_splits"] > 0)].copy()
+    if usable.empty:
+        return None
+
+    benchmark_sec_f = _benchmark_sec_per_furlong(D)
+    benchmark_split_time = float(benchmark_sec_f * (step / 201.168))
+
+    usable["_RPSS_vs_std_pct"] = 100.0 * (benchmark_split_time / pd.to_numeric(usable["_RPSS_avg_split_time"], errors="coerce"))
+    usable["_RPSS_margin"] = benchmark_split_time - pd.to_numeric(usable["_RPSS_avg_split_time"], errors="coerce")
+
+    finish_col = "Finish_Pos" if "Finish_Pos" in usable.columns else None
+    if finish_col:
+        usable["_FinishSort"] = pd.to_numeric(usable[finish_col], errors="coerce").fillna(1e9)
+        usable = usable.sort_values(["_FinishSort", "Horse" if "Horse" in usable.columns else usable.columns[0]])
+    top_n = max(1, int(np.ceil(len(usable) / 2.0)))
+    top_half = usable.head(top_n).copy() if finish_col else usable.nsmallest(top_n, columns="_RPSS_avg_split_time")
+
+    race_avg = _robust_center(usable["_RPSS_avg_split_time"])
+    top_half_avg = _robust_center(top_half["_RPSS_avg_split_time"])
+    rpss = float(100.0 * (benchmark_split_time / race_avg)) if np.isfinite(race_avg) and race_avg > 0 else np.nan
+    top_half_rpss = float(100.0 * (benchmark_split_time / top_half_avg)) if np.isfinite(top_half_avg) and top_half_avg > 0 else np.nan
+    beaters_pct = float((pd.to_numeric(usable["_RPSS_avg_split_time"], errors="coerce") <= benchmark_split_time).mean() * 100.0)
+    top_half_beaters_pct = float((pd.to_numeric(top_half["_RPSS_avg_split_time"], errors="coerce") <= benchmark_split_time).mean() * 100.0)
+
+    if not np.isfinite(rpss):
+        verdict = "Unavailable"
+    elif rpss < 98.5:
+        verdict = "Weak sustained pace"
+    elif rpss < 99.5:
+        verdict = "Below standard"
+    elif rpss <= 100.5:
+        verdict = "Genuine"
+    elif rpss <= 101.5:
+        verdict = "Strong"
+    else:
+        verdict = "Very strong"
+
+    out_cols = [c for c in ["Horse", "Finish_Pos"] if c in usable.columns]
+    out = usable[out_cols + ["_RPSS_avg_split_time", "_RPSS_vs_std_pct", "_RPSS_margin", "_RPSS_valid_splits"]].copy()
+    out = out.rename(columns={
+        "_RPSS_avg_split_time": "Avg tsSPI split time",
+        "_RPSS_vs_std_pct": "tsSPI vs std (%)",
+        "_RPSS_margin": "Margin vs std (s)",
+        "_RPSS_valid_splits": "tsSPI splits used",
+    })
+
+    return {
+        "distance_m": D,
+        "split_step": step,
+        "mid_cols": mid_cols,
+        "benchmark_sec_f": benchmark_sec_f,
+        "benchmark_split_time": benchmark_split_time,
+        "race_avg_split_time": race_avg,
+        "top_half_avg_split_time": top_half_avg,
+        "rpss": rpss,
+        "top_half_rpss": top_half_rpss,
+        "beaters_pct": beaters_pct,
+        "top_half_beaters_pct": top_half_beaters_pct,
+        "verdict": verdict,
+        "table": out.reset_index(drop=True),
+    }
+
+
+def render_rpss_section(rpss_info: dict | None):
+    st.markdown("## Race Pace Strength Score (RPSS)")
+    st.caption("Race-level sustained pressure score using the tsSPI section only, benchmarked to a standard split time for the trip.")
+    if not rpss_info:
+        st.info("RPSS could not be calculated for this race.")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("RPSS", f"{rpss_info['rpss']:.2f}" if np.isfinite(rpss_info['rpss']) else "-")
+    c2.metric("Std split", f"{rpss_info['benchmark_split_time']:.2f}s")
+    c3.metric("Race avg tsSPI", f"{rpss_info['race_avg_split_time']:.2f}s" if np.isfinite(rpss_info['race_avg_split_time']) else "-")
+    c4.metric("Beaters", f"{rpss_info['beaters_pct']:.1f}%")
+
+    st.markdown(f"**Verdict:** {rpss_info['verdict']}  ")
+    _top_half_txt = f"{rpss_info['top_half_rpss']:.2f}" if np.isfinite(rpss_info['top_half_rpss']) else "-"
+    st.caption(
+        f"Benchmark: {rpss_info['benchmark_sec_f']:.2f} sec/furlong • Top-half RPSS: {_top_half_txt}"
+    )
+
+    chart_df = rpss_info["table"].copy()
+    if not chart_df.empty and "Horse" in chart_df.columns:
+        fig, ax = plt.subplots(figsize=(12, 5.2))
+        x = np.arange(len(chart_df))
+        y = pd.to_numeric(chart_df["Avg tsSPI split time"], errors="coerce")
+        ax.bar(x, y, alpha=0.85)
+        ax.axhline(rpss_info["benchmark_split_time"], linestyle="--", linewidth=1.6)
+        ax.set_xticks(x)
+        ax.set_xticklabels(chart_df["Horse"].astype(str).tolist(), rotation=60, ha="right", fontsize=8)
+        ax.set_ylabel(f"Average tsSPI split time ({int(rpss_info['split_step'])}m)")
+        ax.set_title("tsSPI split times vs benchmark")
+        ax.grid(axis="y", alpha=0.25)
+        st.pyplot(fig, clear_figure=True)
+
+    st.dataframe(chart_df, use_container_width=True, hide_index=True)
+
+def render_dashboard(metrics: pd.DataFrame, split_step: int, distance_m: float, going: str, wind_tag: str):
+    st.markdown("## Dashboard")
+    st.caption("Quick race snapshot — strongest overall profiles and key sectional leaders.")
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Distance", f"{int(distance_m)} m")
+    c2.metric("Split Step", f"{int(split_step)} m")
+    c3.metric("Going", going)
+    c4.metric("Wind", wind_tag if wind_tag not in (None, "", "None") else "None")
+    _rpss = metrics.attrs.get("RPSS")
+    c5.metric("RPSS", f"{float(_rpss):.2f}" if _rpss is not None and np.isfinite(float(_rpss)) else "-")
+
+    pi_col = "PI_RS" if ("PI_RS" in metrics.columns and pd.to_numeric(metrics["PI_RS"], errors="coerce").notna().any()) else ("PI" if "PI" in metrics.columns else None)
+    gci_col = "GCI_RS" if ("GCI_RS" in metrics.columns and pd.to_numeric(metrics["GCI_RS"], errors="coerce").notna().any()) else ("GCI" if "GCI" in metrics.columns else None)
+    gr_col = metrics.attrs.get("GR_COL", "Grind_CG" if "Grind_CG" in metrics.columns else "Grind")
+
+    for c in [pi_col, gci_col, "Accel", "tsSPI", gr_col, "Finish_Pos"]:
+        if c and c not in metrics.columns:
+            metrics[c] = np.nan
+
+    top_cols = [c for c in ["Horse", "Finish_Pos", pi_col, gci_col] if c]
+    if top_cols:
+        st.markdown("### Top overall profiles")
+        top_df = metrics[top_cols].copy()
+        if pi_col:
+            top_df[pi_col] = pd.to_numeric(top_df[pi_col], errors="coerce")
+            top_df = top_df.sort_values(pi_col, ascending=False)
+        st.dataframe(top_df.head(5), use_container_width=True, hide_index=True)
+
+    st.markdown("### Sectional leaders")
+    leaders = []
+    for label, col in [("Best Accel", "Accel"), ("Best Sustain", gr_col), ("Best Travel", "tsSPI")]:
+        if col in metrics.columns:
+            s = pd.to_numeric(metrics[col], errors="coerce")
+            if s.notna().any():
+                idx = s.idxmax()
+                leaders.append({"Category": label, "Horse": metrics.loc[idx, "Horse"], "Score": round(float(s.loc[idx]), 2)})
+    if leaders:
+        st.dataframe(pd.DataFrame(leaders), use_container_width=True, hide_index=True)
+
+    shape = metrics.attrs.get("RACE_PROFILE") or metrics.attrs.get("ShapeTag") or metrics.attrs.get("RSI_Cue") or "Not available"
+    rqs = metrics.attrs.get("RQS")
+    rps = metrics.attrs.get("RPS")
+    badge = metrics.attrs.get("RACE_PROFILE", "Unknown")
+    st.markdown("### Race read")
+    bullets = []
+    bullets.append(f"Profile: **{shape}**")
+    if rqs is not None:
+        bullets.append(f"RQS: **{float(rqs):.1f}/100**")
+    if rps is not None:
+        bullets.append(f"RPS: **{float(rps):.1f}/100**")
+    st.markdown("\n".join([f"- {b}" for b in bullets]))
+
 # ----------------------- Sidebar ---------------------------
 with st.sidebar:
     st.markdown(f"### Race Edge v{APP_VERSION}")
-    st.caption("PI v3.2 with Race Shape (SED/FRA/SCI), CG, Hidden v2, Ability v2, DB")
+    st.caption("Cleaner layout • same calculations")
 
-    st.markdown("#### Upload race")
+    APP_VIEW = st.radio(
+        "App View",
+        ["Dashboard", "Core Metrics", "Visuals", "Advanced Models", "Exports & Notes", "Full Report"],
+        index=0,
+    )
+
+    st.markdown("#### Race Setup")
     up = st.file_uploader(
-        "Upload CSV/XLSX with **100 m** or **200 m** splits.\n"
-        "Finish column variants accepted: `Finish_Time`, `Finish_Split`, or `Finish`.",
-        type=["csv","xlsx","xls"]
+        "Upload CSV/XLSX with 100 m or 200 m splits",
+        type=["csv", "xlsx", "xls"]
     )
     race_distance_input = st.number_input("Race Distance (m)", min_value=800, max_value=4000, step=50, value=1600)
 
-    st.markdown("#### Toggles")
-    USE_CG = st.toggle("Use Corrected Grind (CG)", value=True, help="Adjust Grind when the field finish collapses; preserves finisher credit.")
-    DAMPEN_CG = st.toggle("Dampen Grind weight if collapsed", value=True, help="Shift a little weight Grind→Accel/tsSPI on collapse races.")
-    USE_RACE_SHAPE = st.toggle("Use Race Shape module (SED/FRA/SCI)", value=True,
-                               help="Detect slow-early/sprint-home and apply False-Run Adjustment and consistency guardrails.")
-        # --- Going (affects PI weighting only) ---
-    USE_GOING_ADJUST = st.toggle(
-        "Use Going Adjustment",
-        value=True,
-        help="Adjust PI weighting based on track going (Firm/Good/Soft/Heavy)"
-    )
-    GOING_TYPE = st.selectbox(
-        "Track Going",
-        options=["Good", "Firm", "Soft", "Heavy"],
-        index=0,
-        help="Only affects PI weights; GCI stays independent"
-    ) if USE_GOING_ADJUST else "Good"
-    SHOW_WARNINGS = st.toggle("Show data warnings", value=True)
-    DEBUG = st.toggle("Debug info", value=False)
+    with st.expander("Advanced settings", expanded=False):
+        USE_CG = st.toggle("Use Corrected Grind (CG)", value=True, help="Adjust Grind when the field finish collapses; preserves finisher credit.")
+        DAMPEN_CG = st.toggle("Dampen Grind weight if collapsed", value=True, help="Shift a little weight Grind→Accel/tsSPI on collapse races.")
+        USE_RACE_SHAPE = st.toggle("Use Race Shape module (SED/FRA/SCI)", value=True,
+                                   help="Detect slow-early/sprint-home and apply False-Run Adjustment and consistency guardrails.")
+        USE_GOING_ADJUST = st.toggle(
+            "Use Going Adjustment",
+            value=True,
+            help="Adjust PI weighting based on track going (Firm/Good/Soft/Heavy)"
+        )
+        GOING_TYPE = st.selectbox(
+            "Track Going",
+            options=["Good", "Firm", "Soft", "Heavy"],
+            index=0,
+            help="Only affects PI weights; GCI stays independent"
+        ) if USE_GOING_ADJUST else "Good"
+        WIND_AFFECTED = st.toggle("Wind affected race?", value=False, help="Purely informational (disclaimer only).")
+        WIND_TAG = st.selectbox(
+            "Wind note",
+            options=["Headwind", "Tailwind", "Crosswind", "Negligible"],
+            index=0,
+            disabled=not WIND_AFFECTED,
+        ) if WIND_AFFECTED else "None"
+        SHOW_WARNINGS = st.toggle("Show data warnings", value=True)
+        DEBUG = st.toggle("Debug info", value=False)
 
-    # --- Wind (display-only for now) ---
-    WIND_AFFECTED = st.toggle("Wind affected race?", value=False, help="Purely informational (disclaimer only).")
-    WIND_TAG = st.selectbox(
-        "Wind note",
-        options=["Headwind", "Tailwind", "Crosswind", "Negligible"],
-        index=0,
-        disabled=not WIND_AFFECTED,
-    ) if WIND_AFFECTED else "None"
-
-    st.markdown("---")
-    st.markdown("#### Database")
-    db_path = st.text_input("Database path", value=DB_DEFAULT_PATH)
-    init_btn = st.button("Initialise / Check DB")
+    with st.expander("Database", expanded=False):
+        db_path = st.text_input("Database path", value=DB_DEFAULT_PATH)
+        init_btn = st.button("Initialise / Check DB")
 
 # ----------------------- DB init (races + performances) -------------------
 if init_btn:
@@ -446,8 +737,13 @@ st.markdown(f"**Detected split step:** {split_step} m")
 if alias_notes and SHOW_WARNINGS:
     st.info("Header aliases applied: " + "; ".join(alias_notes))
 
-st.markdown("### Raw Table")
-st.dataframe(work.head(12), use_container_width=True)
+if _view_is("Dashboard", "Exports & Notes", "Full Report"):
+    with st.expander("File preview", expanded=_view_is("Exports & Notes")):
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Rows", len(work))
+        c2.metric("Columns", len(work.columns))
+        c3.metric("Split Step", f"{split_step} m")
+        st.dataframe(work.head(12), use_container_width=True)
 
 # ----------------------- Integrity helpers (odds-aware) -------------------
 def expected_segments_from_df(df: pd.DataFrame) -> list[str]:
@@ -1225,6 +1521,15 @@ except Exception as e:
     st.exception(e)
     st.stop()
 
+# ----------------------- RPSS (race-level tsSPI benchmark strength) -----------------------
+RPSS_INFO = compute_rpss(metrics, float(race_distance_input), int(split_step), seg_markers)
+if RPSS_INFO:
+    metrics.attrs["RPSS"] = RPSS_INFO.get("rpss")
+    metrics.attrs["RPSS_VERDICT"] = RPSS_INFO.get("verdict")
+    metrics.attrs["RPSS_BEATERS_PCT"] = RPSS_INFO.get("beaters_pct")
+    metrics.attrs["RPSS_STD_SPLIT"] = RPSS_INFO.get("benchmark_split_time")
+    metrics.attrs["RPSS_RACE_AVG_SPLIT"] = RPSS_INFO.get("race_avg_split_time")
+
 # ----------------------- Race Quality Score (RQS v2) -----------------------
 def compute_rqs(df: pd.DataFrame, attrs: dict) -> float:
     """
@@ -1480,2097 +1785,1628 @@ if SHOW_WARNINGS and (missing_cols or any(v>0 for v in invalid_counts.values()))
 if split_step == 200:
     st.caption("First panel & F-window adapt to odd 200m distances (e.g., 1160→F160, 1450→F250, 1100→F100). Finish is the 200→0 split.")
 
-st.markdown("## Sectional Metrics (PI v3.2 & GCI + CG + Race Shape)")
-
-GR_COL = metrics.attrs.get("GR_COL", "Grind")
-
-show_cols = [
-    "Horse","Finish_Pos","RaceTime_s",
-    "F200_idx","tsSPI","Accel","Grind","Grind_CG",
-    "EARLY_idx","LATE_idx",
-    "GrindAdjPts","DeltaG",
-    "PI","GCI","GCI_RS",
-    "RSI","RS_Component","RSI_Cue"
-]
-
-# ---- make the column pick robust (no KeyError if some are missing) ----
-tmp = metrics.copy()
-for c in show_cols:
-    if c not in tmp.columns:
-        tmp[c] = np.nan
-display_df = tmp[show_cols].copy()
-
-# prefer sorting by finish as secondary key when present
-_finish_sort = pd.to_numeric(display_df["Finish_Pos"], errors="coerce").fillna(1e9)
-display_df = display_df.assign(_FinishSort=_finish_sort).sort_values(
-    ["PI","_FinishSort"], ascending=[False, True]
-).drop(columns=["_FinishSort"])
-
-st.dataframe(display_df, use_container_width=True)
-
-# Now (optionally) backfill RSI/exposure cue columns from attrs if they were missing
-if "RSI" in metrics.attrs and display_df["RSI"].isna().all():
-    display_df["RSI"] = float(metrics.attrs["RSI"])
-if "RS_Component" in metrics.columns and display_df["RS_Component"].isna().all():
-    display_df["RS_Component"] = metrics["RS_Component"]
-if "RSI_Cue" in metrics.columns and display_df["RSI_Cue"].isna().all():
-    display_df["RSI_Cue"] = metrics["RSI_Cue"]
-# ----- Add RSI & exposure columns to the Sectional Metrics view -----
-display_df["RSI"]          = metrics.attrs.get("RSI", np.nan)
-display_df["RS_Component"] = metrics.get("RS_Component", np.nan)
-display_df["RSI_Cue"]      = metrics.get("RSI_Cue", "")
-# Going note (PI only)
-pi_meta = metrics.attrs.get("PI_GOING_META", {})
-if pi_meta:
-    g = str(pi_meta.get("going","Good"))
-    n = int(pi_meta.get("field_n", len(display_df)))
-    mult = pi_meta.get("multipliers", {})
-    # Compact summary (only show components that actually moved)
-    moved = [f"{k}×{mult[k]:.3f}" for k in ["Accel","F200_idx","tsSPI","Grind"] if abs(mult.get(k,1.0)-1.0) >= 0.005]
-    if moved:
-        st.caption(f"Going: {g} — PI weight multipliers: " + ", ".join(moved) + f" (field={n}).")
-        st.caption("RSI: + = slow-early (late favoured), − = fast-early (early favoured).  RS_Component per horse uses the same axis.  🔵 with shape · 🔴 against shape.")
-
-# ======================= Race Class Summary (pure stats) =======================
-st.markdown("## Race Class Summary")
-
-# Prefer GCI_RS, fall back to GCI
-gci_col = "GCI_RS" if ("GCI_RS" in metrics.columns and pd.to_numeric(metrics["GCI_RS"], errors="coerce").notna().any()) else "GCI"
-s = pd.to_numeric(metrics.get(gci_col, pd.Series(dtype=float)), errors="coerce").dropna()
-
-if s.empty:
-    st.info("No valid GCI values found for this race.")
-else:
-    mean_v   = float(s.mean())
-    med_v    = float(s.median())
-    # Robust spread stats (raw MAD, not 1.4826 scaled; and IQR)
-    mad_raw  = float(np.nanmedian(np.abs(s - med_v)))
-    try:
-        q75, q25 = np.nanpercentile(s, 75), np.nanpercentile(s, 25)
-        iqr_v    = float(q75 - q25)
-    except Exception:
-        iqr_v    = float("nan")
-
-    c1, c2, c3, c4 = st.columns([1,1,1,1])
-    with c1:
-        st.metric("Mean GCI", f"{mean_v:.2f}")
-    with c2:
-        st.metric("Median GCI", f"{med_v:.2f}")
-    with c3:
-        st.metric("Spread (MAD)", f"{mad_raw:.2f}")
-    with c4:
-        st.metric("IQR", f"{iqr_v:.2f}" if np.isfinite(iqr_v) else "—")
-
-    st.caption(f"Source: **{gci_col}** (pure stats; no class labels).")
-# =================== /Race Class Summary ===================
-
-# ======================= Ahead of the Handicap — One-Run Weight Intelligence =======================
-st.markdown("## Ahead of the Handicap — One-Run (Race-local)")
-
-# ---- Safe helpers (local, conflict-free) ----
-def _as_num(s):
-    return pd.to_numeric(s, errors="coerce")
-
-def _field_corr(x, y):
-    x = _as_num(x); y = _as_num(y)
-    df = pd.DataFrame({"x": x, "y": y}).dropna()
-    if len(df) < 6:  # tiny fields → correlation not reliable
-        return np.nan
-    c = df["x"].corr(df["y"])
-    try:
-        return float(c) if np.isfinite(c) else np.nan
-    except Exception:
-        return np.nan
-
-def _beta_base(distance_m: float) -> float:
-    """Baseline PI-per-kg by trip; conservative, race-agnostic."""
-    d = float(distance_m)
-    if d <= 1200: return 0.30
-    if d <= 1600: return 0.35
-    if d <= 2000: return 0.40
-    if d <= 2400: return 0.45
-    return 0.50
-
-def _shape_adjust(beta: float, rsi: float, sci: float) -> float:
-    """Light-touch modulation by race shape (one-run safe)."""
-    if np.isfinite(rsi) and np.isfinite(sci) and sci >= 0.5:
-        if rsi < -0.6:  # fast-early
-            beta *= 1.10
-        elif rsi > 0.6: # slow-early
-            beta *= 0.90
-    return beta
-
-# ---- Inputs / guards ----
-# ---------------- Safe Horse Weight Resolver ----------------
-weight_col_candidates = ["Horse Weight", "Horse_Weight", "Wt", "Weight", "Weight (kg)"]
-weight_col = next((c for c in weight_col_candidates if c in metrics.columns), None)
-
-# if still missing, create it directly before loc[]
-if weight_col is None:
-    st.warning("No weight column found — assigning 60 kg baseline for all horses.")
-    metrics["Horse Weight"] = 60.0
-    weight_col = "Horse Weight"
-else:
-    metrics["Horse Weight"] = pd.to_numeric(metrics[weight_col], errors="coerce").fillna(60.0)
-    weight_col = "Horse Weight"  # standardize name
-# ------------------------------------------------------------
-
-# now this will never KeyError
-df = metrics.loc[:, ["Horse", "PI", weight_col]].copy()
-
-need_cols = {"Horse", "PI"}
-if weight_col: need_cols.add(weight_col)
-missing = [c for c in need_cols if c not in metrics.columns]
-
-if missing:
-    st.warning("Ahead of the Handicap: missing columns → " + ", ".join(missing))
-else:
-    df = metrics.loc[:, ["Horse", "PI", weight_col]].copy()
-    df["PI"] = _as_num(df["PI"])
-    df[weight_col] = _as_num(df[weight_col])
-    df = df.dropna(subset=["PI", weight_col])
-    if df.empty:
-        st.info("No valid PI/weight rows to evaluate.")
-    else:
-        # Distance & shape inputs (safe defaults)
-        D_m  = float(race_distance_input)
-        RSI  = float(metrics.attrs.get("RSI", np.nan))
-        SCI  = float(metrics.attrs.get("SCI", np.nan))
-
-        # 1) Baseline slope (PI per kg)
-        beta0 = _beta_base(D_m)
-
-        # 2) Race-local realism: how much did weight correlate with performance here?
-        #    Use magnitude of correlation as a realism knob, damped for tiny fields.
-        corr_w_pi = _field_corr(df[weight_col], df["PI"])
-        n = df["PI"].notna().sum()
-        tiny_dampen = 0.0 if n < 6 else min(1.0, (n - 5) / 7.0)  # ramps in from n=6 to ~n=12
-        corr_mag = 0.0 if not np.isfinite(corr_w_pi) else abs(corr_w_pi)
-
-        # Blend: mostly baseline, plus up to +40% from race-local signal (scaled by field size)
-        beta_local = beta0 * (1.0 + 0.40 * corr_mag * tiny_dampen)
-
-        # 3) Shape modulation (light touch)
-        beta_eff = _shape_adjust(beta_local, RSI, SCI)
-
-        # 4) Safety rails (avoid crazy kg if β too tiny or huge)
-        beta_eff = float(np.clip(beta_eff, 0.22, 0.70))  # keep within realistic PI/kg bounds
-
-        # 5) Convert each horse’s PI to ΔPI vs field median, then to kg & lb
-        PI_med = float(np.nanmedian(df["PI"]))
-        df["ΔPI_vs_med"] = df["PI"] - PI_med
-        df["RanAbove_kg"] = df["ΔPI_vs_med"] / beta_eff
-        df["RanAbove_MR"] = df["RanAbove_kg"] * 2
-        
-        # 6) Friendly view
-        view = df.copy()
-        view = view.rename(columns={
-            weight_col: "Wt (kg)"
-        })
-        view["β_eff (PI/kg)"] = beta_eff
-        view = view[["Horse", "Wt (kg)", "PI", "ΔPI_vs_med", "RanAbove_kg", "RanAbove_MR", "β_eff (PI/kg)"]]
-        view = view.sort_values("RanAbove_kg", ascending=False)
-
-        # Round for display only (keep raw in df if you need later)
-        for c in ["Wt (kg)", "PI", "ΔPI_vs_med", "RanAbove_kg", "RanAbove_MR", "β_eff (PI/kg)"]:
-            view[c] = pd.to_numeric(view[c], errors="coerce").round(2)
-
-        st.dataframe(view, use_container_width=True)
-
-        # Key readout + tiny legend
-        colA, colB, colC = st.columns([1,1,1])
-        with colA:
-            st.metric("Field median PI", f"{PI_med:.2f}")
-        with colB:
-            corr_str = "n/a" if not np.isfinite(corr_w_pi) else f"{corr_w_pi:+.2f}"
-            st.metric("Weight↔PI correlation (|r| used)", corr_str)
-        with colC:
-            st.metric("β_eff (this race)", f"{beta_eff:.2f} PI per kg")
-
-        st.caption(
-            "Interpretation: **RanAbove (kg)** estimates how many kilograms a horse effectively ran above/below the "
-            "field median, *within this single race*. Positive = ran as if it could carry more and still match median. "
-            "Slope (β_eff) is distance-based, gently adjusted by (i) how weight correlated with PI in this field and "
-            "(ii) race shape (fast-early increases weight bite; slow-early reduces it)."
-        )
-
-        # Optional CSV download (small footprint)
-        csv_bytes = view.to_csv(index=False).encode("utf-8")
-        st.download_button("Download Ahead-of-Handicap table (CSV)", csv_bytes,
-                           file_name="ahead_of_handicap_one_run.csv", mime="text/csv", use_container_width=True)
-# ======================= /Ahead of the Handicap =======================
-# ======================= End of Batch 2 =======================
-
-# ======================= Batch 3 — Visuals + Hidden v2 + Ability v2 =======================
-from matplotlib.patches import Rectangle
-from matplotlib.colors import TwoSlopeNorm
-from matplotlib.lines import Line2D
-
-# ----------------------- Label repel (built-in fallback) -----------------------
-def _repel_labels_builtin(ax, x, y, labels, *, init_shift=0.18, k_attract=0.006, k_repel=0.012, max_iter=250):
-    trans=ax.transData; renderer=ax.figure.canvas.get_renderer()
-    xy=np.column_stack([x,y]).astype(float); offs=np.zeros_like(xy)
-    for i,(xi,yi) in enumerate(xy):
-        offs[i]=[init_shift if xi>=0 else -init_shift, init_shift if yi>=0 else -init_shift]
-    texts,lines=[],[]
-    for (xi,yi),(dx,dy),lab in zip(xy,offs,labels):
-        t=ax.text(xi+dx, yi+dy, lab, fontsize=8.4, va="center", ha="left",
-                  bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.75))
-        texts.append(t)
-        ln=Line2D([xi,xi+dx],[yi,yi+dy], lw=0.75, color="black", alpha=0.9)
-        ax.add_line(ln); lines.append(ln)
-    inv=ax.transData.inverted()
-    for _ in range(max_iter):
-        moved=False
-        bbs=[t.get_window_extent(renderer=renderer).expanded(1.02,1.15) for t in texts]
-        for i in range(len(texts)):
-            for j in range(i+1,len(texts)):
-                if not bbs[i].overlaps(bbs[j]): continue
-                ci=((bbs[i].x0+bbs[i].x1)/2,(bbs[i].y0+bbs[i].y1)/2)
-                cj=((bbs[j].x0+bbs[j].x1)/2,(bbs[j].y0+bbs[j].y1)/2)
-                vx,vy=ci[0]-cj[0],ci[1]-cj[1]
-                if vx==0 and vy==0: vx=1.0
-                n=(vx**2+vy**2)**0.5; dx,dy=(vx/n)*k_repel*72,(vy/n)*k_repel*72
-                for t,s in ((texts[i],+1),(texts[j],-1)):
-                    tx,ty=t.get_position()
-                    px=trans.transform((tx,ty))+s*np.array([dx,dy])
-                    t.set_position(inv.transform(px)); moved=True
-        if not moved: break
-    for t,ln,(xi,yi) in zip(texts,lines,xy):
-        tx,ty=t.get_position(); ln.set_data([xi,tx],[yi,ty])
-
-def label_points_neatly(ax, x, y, names):
-    try:
-        from adjustText import adjust_text
-        texts=[ax.text(xi,yi,nm,fontsize=8.4,
-                       bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.75))
-               for xi,yi,nm in zip(x,y,names)]
-        adjust_text(texts, x=x, y=y, ax=ax,
-                    only_move={'points':'y','text':'xy'},
-                    force_points=0.6, force_text=0.7,
-                    expand_text=(1.05,1.15), expand_points=(1.05,1.15),
-                    arrowprops=dict(arrowstyle="->", lw=0.75, color="black", alpha=0.9,
-                                    shrinkA=0, shrinkB=3))
-    except Exception:
-        _repel_labels_builtin(ax, x, y, names)
-
-# ======================= Visual 1: Sectional Shape Map =======================
-st.markdown("## Sectional Shape Map — Accel (home drive) vs Grind (finish)")
-shape_map_png = None
-GR_COL = metrics.attrs.get("GR_COL","Grind")
-
-need_cols={"Horse","Accel",GR_COL,"tsSPI","PI"}
-if not need_cols.issubset(metrics.columns):
-    st.warning("Shape Map: required columns missing: " + ", ".join(sorted(need_cols - set(metrics.columns))))
-else:
-    dfm = metrics.loc[:, ["Horse","Accel",GR_COL,"tsSPI","PI"]].copy()
-    for c in ["Accel",GR_COL,"tsSPI","PI"]:
-        dfm[c] = pd.to_numeric(dfm[c], errors="coerce")
-    dfm = dfm.dropna(subset=["Accel",GR_COL,"tsSPI"])
-    if dfm.empty:
-        st.info("Not enough data to draw the shape map.")
-    else:
-        dfm["AccelΔ"]=dfm["Accel"]-100.0
-        dfm["GrindΔ"]=dfm[GR_COL]-100.0
-        dfm["tsSPIΔ"]=dfm["tsSPI"]-100.0
-        names=dfm["Horse"].astype(str).to_list()
-        xv=dfm["AccelΔ"].to_numpy(); yv=dfm["GrindΔ"].to_numpy()
-        cv=dfm["tsSPIΔ"].to_numpy(); piv=dfm["PI"].fillna(0).to_numpy()
-
-        span=max(4.5,float(np.nanmax(np.abs(np.concatenate([xv,yv])))))
-        lim=np.ceil(span/1.5)*1.5
-
-        DOT_MIN, DOT_MAX = 40.0, 140.0
-        pmin,pmax=np.nanmin(piv),np.nanmax(piv)
-        sizes=np.full_like(xv,DOT_MIN) if not np.isfinite(pmin) or not np.isfinite(pmax) \
-               else DOT_MIN+(piv-pmin)/(pmax-pmin+1e-9)*(DOT_MAX-DOT_MIN)
-
-        fig, ax = plt.subplots(figsize=(7.8,6.2))
-        # quadrant tint (stronger alpha)
-        TINT=0.12
-        ax.add_patch(Rectangle((0,0),lim,lim,facecolor="#4daf4a",alpha=TINT,zorder=0))
-        ax.add_patch(Rectangle((-lim,0),lim,lim,facecolor="#377eb8",alpha=TINT,zorder=0))
-        ax.add_patch(Rectangle((0,-lim),lim,lim,facecolor="#ff7f00",alpha=TINT,zorder=0))
-        ax.add_patch(Rectangle((-lim,-lim),lim,lim,facecolor="#984ea3",alpha=TINT,zorder=0))
-        ax.axvline(0,color="gray",lw=1.3,ls=(0,(3,3)),zorder=1)
-        ax.axhline(0,color="gray",lw=1.3,ls=(0,(3,3)),zorder=1)
-
-        vmin,vmax=np.nanmin(cv),np.nanmax(cv)
-        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin==vmax:
-            vmin,vmax=-1.0,1.0
-        norm=TwoSlopeNorm(vcenter=0.0,vmin=vmin,vmax=vmax)
-
-        sc=ax.scatter(xv,yv,s=sizes,c=cv,cmap="coolwarm",norm=norm,
-                      edgecolor="black",linewidth=0.6,alpha=0.95)
-        label_points_neatly(ax,xv,yv,names)
-
-        ax.set_xlim(-lim,lim); ax.set_ylim(-lim,lim)
-        ax.set_xlabel("Acceleration vs field (points) →")
-        ax.set_ylabel(("Corrected " if USE_CG else "")+"Grind vs field (points) ↑")
-        ax.set_title("Quadrants: +X=Accel  · +Y="+("Corrected Grind" if USE_CG else "Grind")+" · Colour=tsSPIΔ")
-        s_ex=[DOT_MIN,0.5*(DOT_MIN+DOT_MAX),DOT_MAX]
-        h_ex=[Line2D([0],[0],marker='o',color='w',markerfacecolor='gray',
-                     markersize=np.sqrt(s/np.pi),markeredgecolor='black') for s in s_ex]
-        ax.legend(h_ex,["PI low","PI mid","PI high"],loc="upper left",frameon=False,fontsize=8)
-        cbar=fig.colorbar(sc,ax=ax,fraction=0.046,pad=0.04); cbar.set_label("tsSPI − 100")
-        ax.grid(True,linestyle=":",alpha=0.25)
-        st.pyplot(fig)
-        buf=io.BytesIO(); fig.savefig(buf,format="png",dpi=300,bbox_inches="tight")
-        shape_map_png=buf.getvalue()
-        st.download_button("Download shape map (PNG)",shape_map_png,file_name="shape_map.png",mime="image/png")
-        st.caption(("Y uses Corrected Grind (CG). " if USE_CG else "")+"Size=PI; X=Accel; Colour=tsSPIΔ.")
-
-
-# ======================= Pace Curve — field average (lean version) =======================
-st.markdown("## Pace Curve — field average (black) + Top 10 finishers")
-
-# Optional: toggle PNG export (saves memory if off)
-make_png = st.toggle("Prepare PNG for download (uses more memory)", value=False)
-pace_png = None
-
-step = int(metrics.attrs.get("STEP", 100))
-D = float(race_distance_input)
-marks = _collect_markers(work)
-
-# ---- Build segments ----
-segs = []
-if marks:
-    m1 = int(marks[0])
-    L0 = max(1.0, D - m1)
-    if f"{m1}_Time" in work.columns:
-        segs.append((f"{int(D)}→{m1}", float(L0), f"{m1}_Time"))
-    for a, b in zip(marks, marks[1:]):
-        src = f"{int(b)}_Time"
-        if src in work.columns:
-            segs.append((f"{int(a)}→{int(b)}", float(a - b), src))
-if "Finish_Time" in work.columns:
-    segs.append((f"{step}→0 (Finish)", float(step), "Finish_Time"))
-
-if not segs:
-    st.info("Not enough *_Time columns to draw the pace curve.")
-else:
-    # ---- Compute speeds efficiently ----
-    seg_keys = [f"s{i}" for i in range(len(segs))]
-    arr = np.full((len(work), len(segs)), np.nan, dtype="float32")
-
-    for j, (_, L, col) in enumerate(segs):
-        if col in work.columns:
-            t = pd.to_numeric(work[col], errors="coerce").astype("float32")
-            t = np.where((t > 0) & np.isfinite(t), t, np.nan)
-            arr[:, j] = L / t
-
-    # Field average once
-    field_avg = np.nanmean(arr, axis=0)
-    if not np.isfinite(np.nanmean(field_avg)):
-        st.info("Pace curve: all segments missing/invalid.")
-    else:
-        # ---- Pick Top 10 ----
-        if "Finish_Pos" in metrics.columns and metrics["Finish_Pos"].notna().any():
-            top10 = metrics.nsmallest(10, "Finish_Pos")
-            rule = "Top-10 by Finish_Pos"
-        else:
-            top10 = metrics.nlargest(10, "PI")
-            rule = "Top-10 by PI"
-
-        # ---- Build plot ----
-        x_idx = np.arange(len(segs))
-        x_labels = [lbl for (lbl, _, _) in segs]
-
-        fig, ax = plt.subplots(figsize=(8.0, 5.0))
-        ax.plot(x_idx, field_avg, color="black", lw=2.0, label="Field average")
-
-        palette = color_cycle(len(top10))
-        for i, (_, r) in enumerate(top10.iterrows()):
-            speeds = np.full(len(segs), np.nan, dtype="float32")
-            for j, (_, L, col) in enumerate(segs):
-                t = pd.to_numeric(r.get(col, np.nan), errors="coerce")
-                if np.isfinite(t) and t > 0:
-                    speeds[j] = L / float(t)
-            if np.any(np.isfinite(speeds)):
-                ax.plot(x_idx, speeds, lw=1.0, marker="o", ms=2.5,
-                        color=palette[i], label=str(r.get("Horse", "")))
-
-        # ---- Axes and styling ----
-        ax.set_xticks(x_idx)
-        ax.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
-        ax.set_ylabel("Speed (m/s)")
-        ax.set_title("Pace over segments (left = early, right = home straight)")
-        ax.grid(True, ls="--", alpha=0.3)
-        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18),
-                  ncol=3, frameon=False, fontsize=8)
-        st.pyplot(fig)
-        plt.close(fig)
-
-        # ---- Optional PNG export ----
-        if make_png:
-            buf = io.BytesIO()
-            fig2, ax2 = plt.subplots(figsize=(8.0, 5.0))
-            ax2.plot(x_idx, field_avg, color="black", lw=2.0)
-            for i, (_, r) in enumerate(top10.iterrows()):
-                speeds = np.full(len(segs), np.nan, dtype="float32")
-                for j, (_, L, col) in enumerate(segs):
-                    t = pd.to_numeric(r.get(col, np.nan), errors="coerce")
-                    if np.isfinite(t) and t > 0:
-                        speeds[j] = L / float(t)
-                ax2.plot(x_idx, speeds, lw=1.0, color=palette[i])
-            ax2.set_xticks(x_idx)
-            ax2.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
-            ax2.set_ylabel("Speed (m/s)")
-            ax2.set_title("Pace Curve")
-            ax2.grid(True, ls="--", alpha=0.3)
-            fig2.savefig(buf, format="png", dpi=180, bbox_inches="tight", facecolor="white")
-            plt.close(fig2)
-            pace_png = buf.getvalue()
-            st.download_button("Download pace curve (PNG)",
-                               pace_png, file_name="pace_curve.png", mime="image/png")
-
-        st.caption(f"Top-10 plotted: {rule}. Finish segment included explicitly.")
-# ======================= /Pace Curve (lean version) =======================
-
-# ======================= Winning DNA Matrix — distance-aware & report cards =======================
-st.markdown("## Winning DNA Matrix")
-
-WD = metrics.copy()
-gr_col = metrics.attrs.get("GR_COL", "Grind")
-D_m  = float(race_distance_input)
-RSI  = float(metrics.attrs.get("RSI", 0.0))      # + = slow-early, - = fast-early
-SCI  = float(metrics.attrs.get("SCI", 0.0))      # 0..1 (consensus/strength)
-
-# ---- safety: make sure the columns exist ----
-for c in ["Horse", "F200_idx", "tsSPI", "Accel", gr_col]:
-    if c not in WD.columns:
-        WD[c] = np.nan
-
-# ---- helpers ----
-def _clamp01(x): 
-    return float(max(0.0, min(1.0, x)))
-
-def _lerp(a, b, t): 
-    return a + (b - a) * float(max(0.0, min(1.0, t)))
-
-def _band_knots(metric: str):
-    """
-    Priors for (lo, hi) index bands that map to 0..1.
-    Distance knots: 1000,1100,1200,1400,1600,1800,2000+
-    """
-    if metric == "EZ":  # F200_idx
-        return [
-            (1000, (96.0, 106.0)), (1100, (96.5, 105.5)), (1200, (97.0, 105.0)),
-            (1400, (98.0, 104.0)), (1600, (98.5, 103.5)), (1800, (99.0, 103.0)),
-            (2000, (99.2, 102.8)),
-        ]
-    if metric == "MC":  # tsSPI
-        return [
-            (1000, (98.0, 102.0)), (1100, (98.0, 102.0)), (1200, (98.0, 102.0)),
-            (1400, (98.0, 102.2)), (1600, (97.8, 102.4)), (1800, (97.6, 102.6)),
-            (2000, (97.5, 102.7)),
-        ]
-    if metric == "LP":  # Accel
-        return [
-            (1000, (96.0, 104.0)), (1100, (96.5, 103.8)), (1200, (97.0, 103.5)),
-            (1400, (97.5, 103.0)), (1600, (98.0, 102.5)), (1800, (98.3, 102.3)),
-            (2000, (98.5, 102.0)),
-        ]
-    if metric == "LL":  # Grind (or Grind_CG)
-        return [
-            (1000, (98.5, 101.5)), (1100, (98.0, 102.0)), (1200, (98.0, 102.0)),
-            (1400, (97.5, 102.5)), (1600, (97.0, 103.0)), (1800, (96.5, 103.5)),
-            (2000, (96.0, 104.0)),
-        ]
-    return [(1200, (98.0, 102.0)), (2000, (98.0, 102.0))]
-
-def _prior_band(distance_m: float, metric: str):
-    """Piecewise-linear interpolation over the metric's distance knots."""
-    knots = _band_knots(metric)
-    dm = float(distance_m)
-    if dm <= knots[0][0]: 
-        return knots[0][1]
-    if dm >= knots[-1][0]:
-        return knots[-1][1]
-    for (ad, (alo, ahi)), (bd, (blo, bhi)) in zip(knots, knots[1:]):
-        if ad <= dm <= bd:
-            t = (dm - ad) / (bd - ad)
-            return (_lerp(alo, blo, t), _lerp(ahi, bhi, t))
-    return knots[-1][1]
-
-def _shape_shift(lo, hi, metric: str, rsi: float, sci: float):
-    """
-    Shift band centers by ±(0.2 * SCI) depending on RSI sign.
-    Fast-early (RSI<0): EZ/LP shift up; LL/MC shift down.
-    Slow-early (RSI>0): LL/MC shift up; EZ/LP shift down.
-    """
-    if not np.isfinite(sci) or sci <= 0: 
-        return lo, hi
-    shift = 0.2 * float(min(1.0, max(0.0, sci)))
-    center = 0.5*(lo+hi)
-    half   = 0.5*(hi-lo)
-    if rsi < -1e-9:   # fast-early
-        if metric in ("EZ","LP"): center += shift
-        if metric in ("LL","MC"): center -= shift
-    elif rsi >  1e-9: # slow-early
-        if metric in ("LL","MC"): center += shift
-        if metric in ("EZ","LP"): center -= shift
-    return (center - half, center + half)
-
-def _blend_with_field(lo, hi, series: pd.Series):
-    """Blend priors (70%) with field 10th/90th (30%) if available."""
-    s = pd.to_numeric(series, errors="coerce")
-    if s.notna().any():
-        q10, q90 = np.nanpercentile(s.dropna(), [10, 90])
-        lo = 0.7*lo + 0.3*float(q10)
-        hi = 0.7*hi + 0.3*float(q90)
-    if hi <= lo: 
-        hi = lo + 1.0
-    return lo, hi
-
-def _score01_from_band(x, lo, hi):
-    try:
-        xv = float(x)
-        if not np.isfinite(xv): return 0.0
-        return _clamp01((xv - lo) / (hi - lo))
-    except Exception:
-        return 0.0
-
-# ---- compute distance/shape-aware 0..1 components ----
-bands = {}
-for metric_key, col in [("EZ","F200_idx"), ("MC","tsSPI"), ("LP","Accel"), ("LL",gr_col)]:
-    lo0, hi0 = _prior_band(D_m, metric_key)
-    lo1, hi1 = _shape_shift(lo0, hi0, metric_key, RSI, SCI)
-    lo, hi   = _blend_with_field(lo1, hi1, WD[col])
-    bands[metric_key] = (lo, hi)
-
-WD["EZ01"] = WD["F200_idx"].map(lambda v: _score01_from_band(v, *bands["EZ"]))
-WD["MC01"] = WD["tsSPI"].map(lambda v: _score01_from_band(v, *bands["MC"]))
-WD["LP01"] = WD["Accel" ].map(lambda v: _score01_from_band(v, *bands["LP"]))
-WD["LL01"] = WD[gr_col   ].map(lambda v: _score01_from_band(v, *bands["LL"]))
-
-# ---- SOS (0..1) using your robust z-blend idea ----
-def _sos01_series(df: pd.DataFrame) -> pd.Series:
-    ts = winsorize(pd.to_numeric(df["tsSPI"], errors="coerce"))
-    ac = winsorize(pd.to_numeric(df["Accel"], errors="coerce"))
-    gr = winsorize(pd.to_numeric(df[gr_col],  errors="coerce"))
-    def rz(s):
-        mu, sd = np.nanmedian(s), mad_std(s)
-        sd = sd if (np.isfinite(sd) and sd > 0) else 1.0
-        return (s - mu) / sd
-    raw = 0.45*rz(ts) + 0.35*rz(ac) + 0.20*rz(gr)
-    if raw.notna().any():
-        q5, q95 = np.nanpercentile(raw.dropna(), [5, 95])
-        denom = max(q95 - q5, 1.0)
-        return ((raw - q5) / denom).clip(0.0, 1.0)
-    return pd.Series(0.0, index=df.index)
-
-WD["SOS01"] = _sos01_series(WD)
-
-# ---- weights (distance + shape nudges) ----
-def _wdna_base_weights(distance_m: float) -> dict:
-    knots = [
-        (1000, {"EZ":0.25,"MC":0.21,"LP":0.28,"LL":0.11}),
-        (1100, {"EZ":0.22,"MC":0.22,"LP":0.27,"LL":0.14}),
-        (1200, {"EZ":0.20,"MC":0.22,"LP":0.25,"LL":0.18}),
-        (1400, {"EZ":0.15,"MC":0.24,"LP":0.24,"LL":0.22}),
-        (1600, {"EZ":0.10,"MC":0.26,"LP":0.23,"LL":0.26}),
-        (1800, {"EZ":0.06,"MC":0.28,"LP":0.22,"LL":0.29}),
-        (2000, {"EZ":0.03,"MC":0.30,"LP":0.20,"LL":0.32}),
+if _view_is("Dashboard", "Full Report"):
+    render_dashboard(metrics.copy(), split_step, float(race_distance_input), GOING_TYPE, WIND_TAG)
+
+if _view_is("Core Metrics", "Full Report"):
+    st.markdown("## Sectional Metrics (PI v3.2 & GCI + CG + Race Shape)")
+
+if _view_is("Core Metrics", "Full Report"):
+    GR_COL = metrics.attrs.get("GR_COL", "Grind")
+
+    show_cols = [
+        "Horse","Finish_Pos","RaceTime_s",
+        "F200_idx","tsSPI","Accel","Grind","Grind_CG",
+        "EARLY_idx","LATE_idx",
+        "GrindAdjPts","DeltaG",
+        "PI","GCI","GCI_RS",
+        "RSI","RS_Component","RSI_Cue"
     ]
-    dm = float(distance_m)
-    if dm <= knots[0][0]:  return knots[0][1]
-    if dm >= knots[-1][0]: return knots[-1][1]
-    for (ad, aw), (bd, bw) in zip(knots, knots[1:]):
-        if ad <= dm <= bd:
-            t = (dm - ad) / (bd - ad)
-            return {k: _lerp(aw[k], bw[k], t) for k in aw}
-    return knots[-1][1]
 
-def _apply_shape_nudges(w: dict, rsi: float, sci: float) -> dict:
-    w = w.copy()
-    mag = 0.01 * max(0.0, min(1.0, sci))
-    if rsi < -1e-9:   # fast-early
-        take = mag/2.0
-        w["EZ"] += mag; w["LP"] += mag
-        w["LL"] = max(0.0, w["LL"] - take); w["MC"] = max(0.0, w["MC"] - take)
-    elif rsi >  1e-9: # slow-early
-        take = mag/2.0
-        w["LL"] += mag; w["MC"] += mag
-        w["EZ"] = max(0.0, w["EZ"] - take); w["LP"] = max(0.0, w["LP"] - take)
-    s = sum(w.values()) or 1.0
-    return {k: (v/s)*0.85 for k,v in w.items()}  # SOS fixed outside
+    # ---- make the column pick robust (no KeyError if some are missing) ----
+    tmp = metrics.copy()
+    for c in show_cols:
+        if c not in tmp.columns:
+            tmp[c] = np.nan
+    display_df = tmp[show_cols].copy()
 
-def _wdna_weights(distance_m: float, rsi: float, sci: float) -> dict:
-    base = _wdna_base_weights(distance_m)
-    shaped = _apply_shape_nudges(base, rsi, sci)
-    shaped["SOS"] = 0.15
-    S = sum(shaped.values()) or 1.0
-    return {k: v / S for k, v in shaped.items()}
+    # prefer sorting by finish as secondary key when present
+    _finish_sort = pd.to_numeric(display_df["Finish_Pos"], errors="coerce").fillna(1e9)
+    display_df = display_df.assign(_FinishSort=_finish_sort).sort_values(
+        ["PI","_FinishSort"], ascending=[False, True]
+    ).drop(columns=["_FinishSort"])
 
-W = _wdna_weights(D_m, RSI, SCI)  # EZ/MC/LP/LL/SOS sum to 1.0
+    st.dataframe(display_df, use_container_width=True)
 
-# ---- composite (0..1) -> re-centered 0..10 with median ≈ 5 ----
-comp01 = (
-    W["EZ"]  * WD["EZ01"].fillna(0.0)  +
-    W["MC"]  * WD["MC01"].fillna(0.0)  +
-    W["LP"]  * WD["LP01"].fillna(0.0)  +
-    W["LL"]  * WD["LL01"].fillna(0.0)  +
-    W["SOS"] * WD["SOS01"].fillna(0.0)
-)
-med = float(np.nanmedian(comp01)) if comp01.notna().any() else 0.5
-q10, q90 = (np.nanpercentile(comp01.dropna(), [10,90]) if comp01.notna().any() else (0.3,0.7))
-den = max(q90 - q10, 1e-6)
+    # Now (optionally) backfill RSI/exposure cue columns from attrs if they were missing
+    if "RSI" in metrics.attrs and display_df["RSI"].isna().all():
+        display_df["RSI"] = float(metrics.attrs["RSI"])
+    if "RS_Component" in metrics.columns and display_df["RS_Component"].isna().all():
+        display_df["RS_Component"] = metrics["RS_Component"]
+    if "RSI_Cue" in metrics.columns and display_df["RSI_Cue"].isna().all():
+        display_df["RSI_Cue"] = metrics["RSI_Cue"]
+    # ----- Add RSI & exposure columns to the Sectional Metrics view -----
+    display_df["RSI"]          = metrics.attrs.get("RSI", np.nan)
+    display_df["RS_Component"] = metrics.get("RS_Component", np.nan)
+    display_df["RSI_Cue"]      = metrics.get("RSI_Cue", "")
+    # Going note (PI only)
+    pi_meta = metrics.attrs.get("PI_GOING_META", {})
+    if pi_meta:
+        g = str(pi_meta.get("going","Good"))
+        n = int(pi_meta.get("field_n", len(display_df)))
+        mult = pi_meta.get("multipliers", {})
+        # Compact summary (only show components that actually moved)
+        moved = [f"{k}×{mult[k]:.3f}" for k in ["Accel","F200_idx","tsSPI","Grind"] if abs(mult.get(k,1.0)-1.0) >= 0.005]
+        if moved:
+            st.caption(f"Going: {g} — PI weight multipliers: " + ", ".join(moved) + f" (field={n}).")
+            st.caption("RSI: + = slow-early (late favoured), − = fast-early (early favoured).  RS_Component per horse uses the same axis.  🔵 with shape · 🔴 against shape.")
 
-WD["WinningDNA"] = (5.0 + 5.0 * ((comp01 - med) / den)).clip(0.0, 10.0).round(2)
+    render_rpss_section(RPSS_INFO)
 
-# ---- tags, tiers, summaries ----
-def _top_traits_row(r):
-    pairs = [("Early Zip", r.get("EZ01",0.0)), ("Mid Control", r.get("MC01",0.0)),
-             ("Late Punch", r.get("LP01",0.0)), ("Lasting Lift", r.get("LL01",0.0))]
-    pairs = [(n, float(v if np.isfinite(v) else 0.0)) for n,v in pairs]
-    pairs.sort(key=lambda x: x[1], reverse=True)
-    keep = [n for n,v in pairs[:2] if v >= 0.55]
-    # specialist flags
-    ez, ll = float(r.get("EZ01",0.0)), float(r.get("LL01",0.0))
-    if ez >= 0.70 and ll <= 0.45: keep.append("Sprinter-leaning")
-    if ll >= 0.70 and ez <= 0.45: keep.append("Stayer-leaning")
-    return " · ".join(keep)
+    # ======================= Race Class Summary (pure stats) =======================
+    st.markdown("## Race Class Summary")
 
-def _tier_badge(score):
-    if not np.isfinite(score): return ("", "")
-    if score >= 8.0: return ("🔥 Prime", "A")
-    if score >= 7.0: return ("🟢 Live", "B")
-    if score >= 6.0: return ("⚪ Comp", "C")
-    return ("⚪ Setup", "D")
+    # Prefer GCI_RS, fall back to GCI
+    gci_col = "GCI_RS" if ("GCI_RS" in metrics.columns and pd.to_numeric(metrics["GCI_RS"], errors="coerce").notna().any()) else "GCI"
+    s = pd.to_numeric(metrics.get(gci_col, pd.Series(dtype=float)), errors="coerce").dropna()
 
-def _summary_row(r):
-    name = str(r.get("Horse","")).strip()
-    sc   = float(r.get("WinningDNA",0.0))
-    traits = r.get("DNA_TopTraits","")
-    badge,_ = _tier_badge(sc)
-    parts = [f"{badge} DNA {sc:.2f}/10"]
-    if traits: parts.append(traits)
-    if SCI >= 0.6 and abs(RSI) >= 1.2:
-        with_shape = np.sign(RSI)*(float(r.get("LP01",0.0))-float(r.get("MC01",0.0))) >= 0
-        parts.append("with race shape" if with_shape else "against race shape")
-    return f"{name}: " + " — ".join(parts) + "."
+    if s.empty:
+        st.info("No valid GCI values found for this race.")
+    else:
+        mean_v   = float(s.mean())
+        med_v    = float(s.median())
+        # Robust spread stats (raw MAD, not 1.4826 scaled; and IQR)
+        mad_raw  = float(np.nanmedian(np.abs(s - med_v)))
+        try:
+            q75, q25 = np.nanpercentile(s, 75), np.nanpercentile(s, 25)
+            iqr_v    = float(q75 - q25)
+        except Exception:
+            iqr_v    = float("nan")
 
-WD["DNA_TopTraits"] = WD.apply(_top_traits_row, axis=1)
-WD["DNA_Summary"]   = WD.apply(_summary_row,    axis=1)
+        c1, c2, c3, c4 = st.columns([1,1,1,1])
+        with c1:
+            st.metric("Mean GCI", f"{mean_v:.2f}")
+        with c2:
+            st.metric("Median GCI", f"{med_v:.2f}")
+        with c3:
+            st.metric("Spread (MAD)", f"{mad_raw:.2f}")
+        with c4:
+            st.metric("IQR", f"{iqr_v:.2f}" if np.isfinite(iqr_v) else "—")
 
-# ---- Top-6 report cards ----
-cards = WD.sort_values("WinningDNA", ascending=False).head(6).copy()
-if len(cards) > 0:
-    st.markdown("**Top profiles (report cards)**")
-    cols = st.columns(3)
-    for i, (_, r) in enumerate(cards.iterrows()):
-        col = cols[i % 3]
-        nm  = str(r["Horse"])
-        sc  = float(r["WinningDNA"])
-        ez,mc,lp,ll,sos = [float(r[k]) for k in ["EZ01","MC01","LP01","LL01","SOS01"]]
-        badge, grade = _tier_badge(sc)
-        with col:
-            st.markdown(
-                f"""
-<div style="border:1px solid rgba(255,255,255,0.15); border-radius:10px; padding:10px; margin-bottom:10px;">
-  <div style="font-weight:700; font-size:1.05rem;">{nm}</div>
-  <div style="margin:4px 0;"><span style="font-weight:700;">{badge}</span> · Grade <b>{grade}</b> · DNA <b>{sc:.2f}</b>/10</div>
-  <div style="font-size:0.9rem; opacity:0.9;">{r['DNA_TopTraits']}</div>
-  <div style="margin-top:6px; font-size:0.85rem; opacity:0.8;">
-    EZ {ez:.2f} · MC {mc:.2f} · LP {lp:.2f} · LL {ll:.2f} · SOS {sos:.2f}
-  </div>
-</div>
-""",
-                unsafe_allow_html=True
+        st.caption(f"Source: **{gci_col}** (pure stats; no class labels).")
+    # =================== /Race Class Summary ===================
+
+    # ======================= Ahead of the Handicap — One-Run Weight Intelligence =======================
+    st.markdown("## Ahead of the Handicap — One-Run (Race-local)")
+
+    # ---- Safe helpers (local, conflict-free) ----
+    def _as_num(s):
+        return pd.to_numeric(s, errors="coerce")
+
+    def _field_corr(x, y):
+        x = _as_num(x); y = _as_num(y)
+        df = pd.DataFrame({"x": x, "y": y}).dropna()
+        if len(df) < 6:  # tiny fields → correlation not reliable
+            return np.nan
+        c = df["x"].corr(df["y"])
+        try:
+            return float(c) if np.isfinite(c) else np.nan
+        except Exception:
+            return np.nan
+
+    def _beta_base(distance_m: float) -> float:
+        """Baseline PI-per-kg by trip; conservative, race-agnostic."""
+        d = float(distance_m)
+        if d <= 1200: return 0.30
+        if d <= 1600: return 0.35
+        if d <= 2000: return 0.40
+        if d <= 2400: return 0.45
+        return 0.50
+
+    def _shape_adjust(beta: float, rsi: float, sci: float) -> float:
+        """Light-touch modulation by race shape (one-run safe)."""
+        if np.isfinite(rsi) and np.isfinite(sci) and sci >= 0.5:
+            if rsi < -0.6:  # fast-early
+                beta *= 1.10
+            elif rsi > 0.6: # slow-early
+                beta *= 0.90
+        return beta
+
+    # ---- Inputs / guards ----
+    # ---------------- Safe Horse Weight Resolver ----------------
+    weight_col_candidates = ["Horse Weight", "Horse_Weight", "Wt", "Weight", "Weight (kg)"]
+    weight_col = next((c for c in weight_col_candidates if c in metrics.columns), None)
+
+    # if still missing, create it directly before loc[]
+    if weight_col is None:
+        st.warning("No weight column found — assigning 60 kg baseline for all horses.")
+        metrics["Horse Weight"] = 60.0
+        weight_col = "Horse Weight"
+    else:
+        metrics["Horse Weight"] = pd.to_numeric(metrics[weight_col], errors="coerce").fillna(60.0)
+        weight_col = "Horse Weight"  # standardize name
+    # ------------------------------------------------------------
+
+    # now this will never KeyError
+    df = metrics.loc[:, ["Horse", "PI", weight_col]].copy()
+
+    need_cols = {"Horse", "PI"}
+    if weight_col: need_cols.add(weight_col)
+    missing = [c for c in need_cols if c not in metrics.columns]
+
+    if missing:
+        st.warning("Ahead of the Handicap: missing columns → " + ", ".join(missing))
+    else:
+        df = metrics.loc[:, ["Horse", "PI", weight_col]].copy()
+        df["PI"] = _as_num(df["PI"])
+        df[weight_col] = _as_num(df[weight_col])
+        df = df.dropna(subset=["PI", weight_col])
+        if df.empty:
+            st.info("No valid PI/weight rows to evaluate.")
+        else:
+            # Distance & shape inputs (safe defaults)
+            D_m  = float(race_distance_input)
+            RSI  = float(metrics.attrs.get("RSI", np.nan))
+            SCI  = float(metrics.attrs.get("SCI", np.nan))
+
+            # 1) Baseline slope (PI per kg)
+            beta0 = _beta_base(D_m)
+
+            # 2) Race-local realism: how much did weight correlate with performance here?
+            #    Use magnitude of correlation as a realism knob, damped for tiny fields.
+            corr_w_pi = _field_corr(df[weight_col], df["PI"])
+            n = df["PI"].notna().sum()
+            tiny_dampen = 0.0 if n < 6 else min(1.0, (n - 5) / 7.0)  # ramps in from n=6 to ~n=12
+            corr_mag = 0.0 if not np.isfinite(corr_w_pi) else abs(corr_w_pi)
+
+            # Blend: mostly baseline, plus up to +40% from race-local signal (scaled by field size)
+            beta_local = beta0 * (1.0 + 0.40 * corr_mag * tiny_dampen)
+
+            # 3) Shape modulation (light touch)
+            beta_eff = _shape_adjust(beta_local, RSI, SCI)
+
+            # 4) Safety rails (avoid crazy kg if β too tiny or huge)
+            beta_eff = float(np.clip(beta_eff, 0.22, 0.70))  # keep within realistic PI/kg bounds
+
+            # 5) Convert each horse’s PI to ΔPI vs field median, then to kg & lb
+            PI_med = float(np.nanmedian(df["PI"]))
+            df["ΔPI_vs_med"] = df["PI"] - PI_med
+            df["RanAbove_kg"] = df["ΔPI_vs_med"] / beta_eff
+            df["RanAbove_MR"] = df["RanAbove_kg"] * 2
+        
+            # 6) Friendly view
+            view = df.copy()
+            view = view.rename(columns={
+                weight_col: "Wt (kg)"
+            })
+            view["β_eff (PI/kg)"] = beta_eff
+            view = view[["Horse", "Wt (kg)", "PI", "ΔPI_vs_med", "RanAbove_kg", "RanAbove_MR", "β_eff (PI/kg)"]]
+            view = view.sort_values("RanAbove_kg", ascending=False)
+
+            # Round for display only (keep raw in df if you need later)
+            for c in ["Wt (kg)", "PI", "ΔPI_vs_med", "RanAbove_kg", "RanAbove_MR", "β_eff (PI/kg)"]:
+                view[c] = pd.to_numeric(view[c], errors="coerce").round(2)
+
+            st.dataframe(view, use_container_width=True)
+
+            # Key readout + tiny legend
+            colA, colB, colC = st.columns([1,1,1])
+            with colA:
+                st.metric("Field median PI", f"{PI_med:.2f}")
+            with colB:
+                corr_str = "n/a" if not np.isfinite(corr_w_pi) else f"{corr_w_pi:+.2f}"
+                st.metric("Weight↔PI correlation (|r| used)", corr_str)
+            with colC:
+                st.metric("β_eff (this race)", f"{beta_eff:.2f} PI per kg")
+
+            st.caption(
+                "Interpretation: **RanAbove (kg)** estimates how many kilograms a horse effectively ran above/below the "
+                "field median, *within this single race*. Positive = ran as if it could carry more and still match median. "
+                "Slope (β_eff) is distance-based, gently adjusted by (i) how weight correlated with PI in this field and "
+                "(ii) race shape (fast-early increases weight bite; slow-early reduces it)."
             )
 
-# ---- Full table ----
-show_cols = ["Horse","WinningDNA","EZ01","MC01","LP01","LL01","SOS01","DNA_TopTraits"]
-WD_view = WD.sort_values(["WinningDNA","Accel",gr_col], ascending=[False, False, False])[show_cols]
-st.dataframe(WD_view, use_container_width=True)
+            # Optional CSV download (small footprint)
+            csv_bytes = view.to_csv(index=False).encode("utf-8")
+            st.download_button("Download Ahead-of-Handicap table (CSV)", csv_bytes,
+                               file_name="ahead_of_handicap_one_run.csv", mime="text/csv", use_container_width=True)
+    # ======================= /Ahead of the Handicap =======================
+    # ======================= End of Batch 2 =======================
 
-# ---- Per-horse summaries ----
-with st.expander("Race Pulse — per-horse summaries"):
-    for _, r in WD.sort_values("WinningDNA", ascending=False).iterrows():
-        st.write("• " + r["DNA_Summary"])
+    # ======================= Batch 3 — Visuals + Hidden v2 + Ability v2 =======================
+    from matplotlib.patches import Rectangle
+    from matplotlib.colors import TwoSlopeNorm
+    from matplotlib.lines import Line2D
 
-# ---- footnote: weights & band hints ----
-w_note = ", ".join([f"{k} {W[k]:.2f}" for k in ["EZ","MC","LP","LL","SOS"]])
-st.caption(
-    f"Weights — EZ fades with distance; LL grows; shape nudges via RSI×SCI. Final weights: {w_note}. "
-    f"Bands are distance-aware, shape-shifted, and blended 70/30 with field 10th/90th percentiles; "
-    f"DNA recentered so race median ≈ 5."
-)
-# ======================= /Winning DNA Matrix =======================
+    # ----------------------- Label repel (built-in fallback) -----------------------
+    def _repel_labels_builtin(ax, x, y, labels, *, init_shift=0.18, k_attract=0.006, k_repel=0.012, max_iter=250):
+        trans=ax.transData; renderer=ax.figure.canvas.get_renderer()
+        xy=np.column_stack([x,y]).astype(float); offs=np.zeros_like(xy)
+        for i,(xi,yi) in enumerate(xy):
+            offs[i]=[init_shift if xi>=0 else -init_shift, init_shift if yi>=0 else -init_shift]
+        texts,lines=[],[]
+        for (xi,yi),(dx,dy),lab in zip(xy,offs,labels):
+            t=ax.text(xi+dx, yi+dy, lab, fontsize=8.4, va="center", ha="left",
+                      bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.75))
+            texts.append(t)
+            ln=Line2D([xi,xi+dx],[yi,yi+dy], lw=0.75, color="black", alpha=0.9)
+            ax.add_line(ln); lines.append(ln)
+        inv=ax.transData.inverted()
+        for _ in range(max_iter):
+            moved=False
+            bbs=[t.get_window_extent(renderer=renderer).expanded(1.02,1.15) for t in texts]
+            for i in range(len(texts)):
+                for j in range(i+1,len(texts)):
+                    if not bbs[i].overlaps(bbs[j]): continue
+                    ci=((bbs[i].x0+bbs[i].x1)/2,(bbs[i].y0+bbs[i].y1)/2)
+                    cj=((bbs[j].x0+bbs[j].x1)/2,(bbs[j].y0+bbs[j].y1)/2)
+                    vx,vy=ci[0]-cj[0],ci[1]-cj[1]
+                    if vx==0 and vy==0: vx=1.0
+                    n=(vx**2+vy**2)**0.5; dx,dy=(vx/n)*k_repel*72,(vy/n)*k_repel*72
+                    for t,s in ((texts[i],+1),(texts[j],-1)):
+                        tx,ty=t.get_position()
+                        px=trans.transform((tx,ty))+s*np.array([dx,dy])
+                        t.set_position(inv.transform(px)); moved=True
+            if not moved: break
+        for t,ln,(xi,yi) in zip(texts,lines,xy):
+            tx,ty=t.get_position(); ln.set_data([xi,tx],[yi,ty])
+
+    def label_points_neatly(ax, x, y, names):
+        try:
+            from adjustText import adjust_text
+            texts=[ax.text(xi,yi,nm,fontsize=8.4,
+                           bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.75))
+                   for xi,yi,nm in zip(x,y,names)]
+            adjust_text(texts, x=x, y=y, ax=ax,
+                        only_move={'points':'y','text':'xy'},
+                        force_points=0.6, force_text=0.7,
+                        expand_text=(1.05,1.15), expand_points=(1.05,1.15),
+                        arrowprops=dict(arrowstyle="->", lw=0.75, color="black", alpha=0.9,
+                                        shrinkA=0, shrinkB=3))
+        except Exception:
+            _repel_labels_builtin(ax, x, y, names)
+
+if _view_is("Visuals", "Full Report"):
+    # ======================= Visual 1: Sectional Shape Map =======================
+    st.markdown("## Sectional Shape Map — Accel (home drive) vs Grind (finish)")
+    shape_map_png = None
+    GR_COL = metrics.attrs.get("GR_COL","Grind")
+
+    need_cols={"Horse","Accel",GR_COL,"tsSPI","PI"}
+    if not need_cols.issubset(metrics.columns):
+        st.warning("Shape Map: required columns missing: " + ", ".join(sorted(need_cols - set(metrics.columns))))
+    else:
+        dfm = metrics.loc[:, ["Horse","Accel",GR_COL,"tsSPI","PI"]].copy()
+        for c in ["Accel",GR_COL,"tsSPI","PI"]:
+            dfm[c] = pd.to_numeric(dfm[c], errors="coerce")
+        dfm = dfm.dropna(subset=["Accel",GR_COL,"tsSPI"])
+        if dfm.empty:
+            st.info("Not enough data to draw the shape map.")
+        else:
+            dfm["AccelΔ"]=dfm["Accel"]-100.0
+            dfm["GrindΔ"]=dfm[GR_COL]-100.0
+            dfm["tsSPIΔ"]=dfm["tsSPI"]-100.0
+            names=dfm["Horse"].astype(str).to_list()
+            xv=dfm["AccelΔ"].to_numpy(); yv=dfm["GrindΔ"].to_numpy()
+            cv=dfm["tsSPIΔ"].to_numpy(); piv=dfm["PI"].fillna(0).to_numpy()
+
+            span=max(4.5,float(np.nanmax(np.abs(np.concatenate([xv,yv])))))
+            lim=np.ceil(span/1.5)*1.5
+
+            DOT_MIN, DOT_MAX = 40.0, 140.0
+            pmin,pmax=np.nanmin(piv),np.nanmax(piv)
+            sizes=np.full_like(xv,DOT_MIN) if not np.isfinite(pmin) or not np.isfinite(pmax) \
+                   else DOT_MIN+(piv-pmin)/(pmax-pmin+1e-9)*(DOT_MAX-DOT_MIN)
+
+            fig, ax = plt.subplots(figsize=(7.8,6.2))
+            # quadrant tint (stronger alpha)
+            TINT=0.12
+            ax.add_patch(Rectangle((0,0),lim,lim,facecolor="#4daf4a",alpha=TINT,zorder=0))
+            ax.add_patch(Rectangle((-lim,0),lim,lim,facecolor="#377eb8",alpha=TINT,zorder=0))
+            ax.add_patch(Rectangle((0,-lim),lim,lim,facecolor="#ff7f00",alpha=TINT,zorder=0))
+            ax.add_patch(Rectangle((-lim,-lim),lim,lim,facecolor="#984ea3",alpha=TINT,zorder=0))
+            ax.axvline(0,color="gray",lw=1.3,ls=(0,(3,3)),zorder=1)
+            ax.axhline(0,color="gray",lw=1.3,ls=(0,(3,3)),zorder=1)
+
+            vmin,vmax=np.nanmin(cv),np.nanmax(cv)
+            if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin==vmax:
+                vmin,vmax=-1.0,1.0
+            norm=TwoSlopeNorm(vcenter=0.0,vmin=vmin,vmax=vmax)
+
+            sc=ax.scatter(xv,yv,s=sizes,c=cv,cmap="coolwarm",norm=norm,
+                          edgecolor="black",linewidth=0.6,alpha=0.95)
+            label_points_neatly(ax,xv,yv,names)
+
+            ax.set_xlim(-lim,lim); ax.set_ylim(-lim,lim)
+            ax.set_xlabel("Acceleration vs field (points) →")
+            ax.set_ylabel(("Corrected " if USE_CG else "")+"Grind vs field (points) ↑")
+            ax.set_title("Quadrants: +X=Accel  · +Y="+("Corrected Grind" if USE_CG else "Grind")+" · Colour=tsSPIΔ")
+            s_ex=[DOT_MIN,0.5*(DOT_MIN+DOT_MAX),DOT_MAX]
+            h_ex=[Line2D([0],[0],marker='o',color='w',markerfacecolor='gray',
+                         markersize=np.sqrt(s/np.pi),markeredgecolor='black') for s in s_ex]
+            ax.legend(h_ex,["PI low","PI mid","PI high"],loc="upper left",frameon=False,fontsize=8)
+            cbar=fig.colorbar(sc,ax=ax,fraction=0.046,pad=0.04); cbar.set_label("tsSPI − 100")
+            ax.grid(True,linestyle=":",alpha=0.25)
+            st.pyplot(fig)
+            buf=io.BytesIO(); fig.savefig(buf,format="png",dpi=300,bbox_inches="tight")
+            shape_map_png=buf.getvalue()
+            if _view_is("Exports & Notes", "Full Report"):
+                st.download_button("Download shape map (PNG)",shape_map_png,file_name="shape_map.png",mime="image/png")
+            st.caption(("Y uses Corrected Grind (CG). " if USE_CG else "")+"Size=PI; X=Accel; Colour=tsSPIΔ.")
+
+
+    # ======================= Pace Curve — enhanced detailed version =======================
+    st.markdown("## Pace Curve")
+
+    cpc1, cpc2, cpc3 = st.columns([1.15, 1.0, 1.0])
+    with cpc1:
+        pace_mode = st.selectbox("Curve mode", ["Raw Pace (m/s)", "Vs Field Average"], index=0, key="pace_curve_mode")
+    with cpc2:
+        runner_set = st.selectbox("Runners shown", ["Winner vs Field", "Top 4", "Top 8", "Top 10", "Whole field"], index=2, key="pace_curve_runner_set")
+    with cpc3:
+        show_phase_shading = st.toggle("Phase shading", value=True, key="pace_curve_phase_shading")
+
+    cpc4, cpc5 = st.columns([1,1])
+    with cpc4:
+        show_end_labels = st.toggle("Line-end labels", value=True, key="pace_curve_end_labels")
+    with cpc5:
+        make_png = st.toggle("Prepare PNG for download", value=False, key="pace_curve_png") if _view_is("Exports & Notes", "Full Report") else False
+    pace_png = None
+
+    step = int(metrics.attrs.get("STEP", 100))
+    D = float(race_distance_input)
+    marks = _collect_markers(work)
+
+    def _pace_x_label(v):
+        try:
+            vv = int(round(float(v)))
+            return f"{vv}m" if vv > 0 else "FIN"
+        except Exception:
+            return str(v)
+
+    # ---- Build segments in race order (early -> finish) ----
+    segs = []  # (x_value, seg_len, time_col)
+    if marks:
+        m1 = int(marks[0])
+        L0 = max(1.0, D - m1)
+        if f"{m1}_Time" in work.columns:
+            segs.append((m1, float(L0), f"{m1}_Time"))
+        for a, b in zip(marks, marks[1:]):
+            src = f"{int(b)}_Time"
+            if src in work.columns:
+                segs.append((int(b), float(a - b), src))
+    if "Finish_Time" in work.columns:
+        segs.append((0, float(step), "Finish_Time"))
+
+    if not segs:
+        st.info("Not enough *_Time columns to draw the pace curve.")
+    else:
+        # ---- Compute per-horse segment speeds ----
+        nseg = len(segs)
+        arr = np.full((len(work), nseg), np.nan, dtype="float32")
+        for j, (_, L, col) in enumerate(segs):
+            if col in work.columns:
+                t = pd.to_numeric(work[col], errors="coerce").astype("float32")
+                t = np.where((t > 0) & np.isfinite(t), t, np.nan)
+                arr[:, j] = L / t
+
+        field_avg = np.nanmean(arr, axis=0)
+        if not np.isfinite(np.nanmean(field_avg)):
+            st.info("Pace curve: all segments missing/invalid.")
+        else:
+            # ---- Choose runners ----
+            if "Finish_Pos" in metrics.columns and metrics["Finish_Pos"].notna().any():
+                ranked = metrics.sort_values("Finish_Pos", ascending=True).copy()
+                ranking_rule = "Finish_Pos"
+            elif "PI" in metrics.columns and metrics["PI"].notna().any():
+                ranked = metrics.sort_values("PI", ascending=False).copy()
+                ranking_rule = "PI"
+            else:
+                ranked = metrics.copy()
+                ranking_rule = "table order"
+
+            n_lookup = {"Winner vs Field": 1, "Top 4": 4, "Top 8": 8, "Top 10": 10, "Whole field": len(ranked)}
+            topn = n_lookup.get(runner_set, 8)
+            picked = ranked.head(topn).copy()
+            if picked.empty:
+                st.info("No runners available for pace curve.")
+            else:
+                x_vals = np.arange(nseg)
+                x_labels = [_pace_x_label(xv) for (xv, _, _) in segs]
+
+                picked_names = [str(x) for x in picked.get("Horse", pd.Series(dtype=str)).tolist()]
+                speed_map = {}
+                for _, r in picked.iterrows():
+                    name = str(r.get("Horse", ""))
+                    speeds = np.full(nseg, np.nan, dtype="float32")
+                    for j, (_, L, col) in enumerate(segs):
+                        t = pd.to_numeric(r.get(col, np.nan), errors="coerce")
+                        if np.isfinite(t) and t > 0:
+                            speeds[j] = L / float(t)
+                    speed_map[name] = speeds
+
+                # ---- Display transform ----
+                disp_map = {}
+                if pace_mode == "Vs Field Average":
+                    for nm, spd in speed_map.items():
+                        disp_map[nm] = spd - field_avg
+                    field_line = np.zeros_like(field_avg)
+                    ylab = "Speed vs field avg (m/s)"
+                    title_tail = "relative to field average"
+                else:
+                    disp_map = speed_map
+                    field_line = field_avg
+                    ylab = "Speed (m/s)"
+                    title_tail = "raw pace by segment"
+
+                # ---- Plot ----
+                fig, ax = plt.subplots(figsize=(10.8, 6.4))
+
+                # phase shading: early / sustain / acceleration / grind
+                if show_phase_shading and nseg >= 2:
+                    seg_marks = [int(xv) for (xv, _, _) in segs]
+                    idx_600 = seg_marks.index(600) if 600 in seg_marks else None
+                    idx_200 = seg_marks.index(200) if 200 in seg_marks else None
+                    idx_fin = seg_marks.index(0) if 0 in seg_marks else (nseg - 1)
+
+                    bands = []
+                    # Everything before the acceleration phase
+                    if idx_600 is not None and idx_600 > 0:
+                        if idx_600 >= 2:
+                            mid_cut = max(0, int(round(idx_600 * 0.55)))
+                            mid_cut = min(mid_cut, idx_600)
+                            if mid_cut > 0:
+                                bands.append((-0.5, mid_cut - 0.5, "Early"))
+                            if idx_600 - 0.5 > mid_cut - 0.5:
+                                bands.append((mid_cut - 0.5, idx_600 - 0.5, "Sustain"))
+                        else:
+                            bands.append((-0.5, idx_600 - 0.5, "Early"))
+                    elif idx_fin > 0:
+                        bands.append((-0.5, idx_fin - 0.5, "Race"))
+
+                    # User-defined pace phases
+                    if idx_600 is not None and idx_200 is not None and idx_200 >= idx_600:
+                        bands.append((idx_600 - 0.5, idx_200 + 0.5, "Acceleration"))
+                    if idx_fin is not None:
+                        bands.append((idx_fin - 0.5, idx_fin + 0.5, "Grind"))
+
+                    for idx_b, (x0, x1, lab) in enumerate(bands):
+                        x0 = max(-0.5, x0)
+                        x1 = min(nseg - 0.5, x1)
+                        if x1 > x0:
+                            ax.axvspan(x0, x1, alpha=0.06 if idx_b % 2 == 0 else 0.10, color="grey")
+                            ax.text((x0+x1)/2.0, 0.98, lab, transform=ax.get_xaxis_transform(),
+                                    ha="center", va="top", fontsize=8)
+
+                # field average
+                ax.plot(x_vals, field_line, color="black", lw=2.8, marker="o", ms=4.2, label="Field average", zorder=4)
+
+                # runner lines
+                palette = color_cycle(len(picked))
+                winner_name = picked_names[0] if picked_names else None
+                top4_names = set(picked_names[:min(4, len(picked_names))])
+                end_label_specs = []
+
+                for i, name in enumerate(picked_names):
+                    y = disp_map.get(name)
+                    if y is None or not np.any(np.isfinite(y)):
+                        continue
+                    is_winner = (name == winner_name)
+                    is_top4 = name in top4_names
+                    lw = 2.8 if is_winner else (2.0 if is_top4 else 1.15)
+                    alpha = 1.0 if is_winner else (0.92 if is_top4 else 0.58)
+                    ms = 4.0 if is_winner else (3.2 if is_top4 else 2.4)
+                    z = 6 if is_winner else (5 if is_top4 else 3)
+                    ax.plot(x_vals, y, color=palette[i], lw=lw, alpha=alpha,
+                            marker="o", ms=ms, label=name, zorder=z)
+
+                    # mark strongest segment
+                    finite = np.where(np.isfinite(y))[0]
+                    if len(finite):
+                        jj = finite[np.nanargmax(y[finite])]
+                        ax.scatter([x_vals[jj]], [y[jj]], color=palette[i], s=28 if is_top4 else 20,
+                                   edgecolor="black", linewidth=0.4, zorder=z+1)
+
+                    # store end labels for all shown runners
+                    if show_end_labels and len(finite):
+                        jf = finite[-1]
+                        end_label_specs.append({
+                            "name": name,
+                            "x": float(x_vals[jf]),
+                            "y": float(y[jf]),
+                            "color": palette[i],
+                            "is_winner": is_winner,
+                            "z": z,
+                        })
+
+                # non-overlapping right-edge labels with leader lines
+                if show_end_labels and end_label_specs:
+                    y0, y1 = ax.get_ylim()
+                    yr = max(1e-9, y1 - y0)
+                    min_gap = 0.055 * yr
+                    label_x = len(x_vals) - 1 + 0.10
+
+                    end_label_specs = sorted(end_label_specs, key=lambda d: d["y"])
+                    placed_y = []
+                    for d in end_label_specs:
+                        yy = d["y"]
+                        if placed_y:
+                            yy = max(yy, placed_y[-1] + min_gap)
+                        placed_y.append(yy)
+                    # keep inside axes and back-propagate if needed
+                    upper_cap = y1 - 0.03 * yr
+                    lower_cap = y0 + 0.03 * yr
+                    if placed_y:
+                        if placed_y[-1] > upper_cap:
+                            shift = placed_y[-1] - upper_cap
+                            placed_y = [yy - shift for yy in placed_y]
+                        if placed_y[0] < lower_cap:
+                            shift = lower_cap - placed_y[0]
+                            placed_y = [yy + shift for yy in placed_y]
+                        for k in range(len(placed_y) - 2, -1, -1):
+                            placed_y[k] = min(placed_y[k], placed_y[k + 1] - min_gap)
+                        for k in range(1, len(placed_y)):
+                            placed_y[k] = max(placed_y[k], placed_y[k - 1] + min_gap)
+
+                    for d, yy in zip(end_label_specs, placed_y):
+                        ax.plot([d["x"], label_x - 0.02], [d["y"], yy], color=d["color"], alpha=0.55,
+                                lw=1.0 if d["is_winner"] else 0.8, zorder=d["z"])
+                        ax.text(label_x, yy, d["name"], fontsize=8.2 if d["is_winner"] else 7.8,
+                                fontweight="bold" if d["is_winner"] else "normal",
+                                color=d["color"], va="center", ha="left", zorder=d["z"] + 1,
+                                bbox=dict(boxstyle="round,pad=0.12", facecolor="white", edgecolor="none", alpha=0.7))
+
+                ax.set_xticks(x_vals)
+                ax.set_xticklabels(x_labels, rotation=0, fontsize=9)
+                ax.set_ylabel(ylab)
+                ax.set_title(f"Pace Curve — {title_tail}")
+                ax.grid(True, ls="--", alpha=0.28)
+                ax.set_xlim(-0.35, len(x_vals)-1 + (1.30 if (show_end_labels and len(picked_names) > 12) else (1.05 if show_end_labels else 0.25)))
+
+                # cleaner legend: just field avg + winner + top placers when available
+                handles, labels = ax.get_legend_handles_labels()
+                keep_labels = ["Field average"]
+                if winner_name:
+                    keep_labels.append(winner_name)
+                keep_labels.extend([nm for nm in picked_names[1:min(4, len(picked_names))]])
+                keep = [(h, l) for h, l in zip(handles, labels) if l in keep_labels]
+                if keep:
+                    ax.legend([h for h, _ in keep], [l for _, l in keep],
+                              loc="upper center", bbox_to_anchor=(0.5, -0.14),
+                              ncol=min(4, len(keep)), frameon=False, fontsize=8)
+
+                st.pyplot(fig)
+
+                # caption / interpretation
+                try:
+                    if pace_mode == "Raw Pace (m/s)":
+                        late_slice = slice(max(0, nseg-3), nseg)
+                        early_slice = slice(0, min(2, nseg))
+                        field_early = float(np.nanmean(field_avg[early_slice]))
+                        field_late = float(np.nanmean(field_avg[late_slice]))
+                        race_shape = "quickened late" if field_late > field_early else "strong early, flatter late"
+                        winner_line = disp_map.get(winner_name, np.full(nseg, np.nan)) if winner_name else np.full(nseg, np.nan)
+                        winner_note = ""
+                        if winner_name and np.any(np.isfinite(winner_line)) and np.any(np.isfinite(field_avg)):
+                            wlate = float(np.nanmean(winner_line[late_slice]))
+                            flate = float(np.nanmean(field_avg[late_slice]))
+                            if wlate > flate:
+                                winner_note = f" {winner_name} finished above the field average late."
+                            else:
+                                winner_note = f" {winner_name} tracked the race shape rather than clearly separating late."
+                        st.caption(f"View: {runner_set}. Ranking basis: {ranking_rule}. Race shape looked {race_shape}.{winner_note}")
+                    else:
+                        st.caption(f"View: {runner_set}. Ranking basis: {ranking_rule}. Values above zero indicate segments run faster than the field average.")
+                except Exception:
+                    st.caption(f"View: {runner_set}. Ranking basis: {ranking_rule}.")
+
+                # optional png export
+                if make_png:
+                    buf = io.BytesIO()
+                    fig.savefig(buf, format="png", dpi=220, bbox_inches="tight", facecolor="white")
+                    pace_png = buf.getvalue()
+                    st.download_button("Download pace curve (PNG)", pace_png, file_name="pace_curve.png", mime="image/png")
+                plt.close(fig)
+    # ======================= /Pace Curve (enhanced detailed version) =======================
+
+if _view_is("Advanced Models", "Full Report"):
+    # ======================= Winning DNA Matrix — distance-aware & report cards =======================
+    st.markdown("## Winning DNA Matrix")
+
+    WD = metrics.copy()
+    gr_col = metrics.attrs.get("GR_COL", "Grind")
+    D_m  = float(race_distance_input)
+    RSI  = float(metrics.attrs.get("RSI", 0.0))      # + = slow-early, - = fast-early
+    SCI  = float(metrics.attrs.get("SCI", 0.0))      # 0..1 (consensus/strength)
+
+    # ---- safety: make sure the columns exist ----
+    for c in ["Horse", "F200_idx", "tsSPI", "Accel", gr_col]:
+        if c not in WD.columns:
+            WD[c] = np.nan
+
+    # ---- helpers ----
+    def _clamp01(x): 
+        return float(max(0.0, min(1.0, x)))
+
+    def _lerp(a, b, t): 
+        return a + (b - a) * float(max(0.0, min(1.0, t)))
+
+    def _band_knots(metric: str):
+        """
+        Priors for (lo, hi) index bands that map to 0..1.
+        Distance knots: 1000,1100,1200,1400,1600,1800,2000+
+        """
+        if metric == "EZ":  # F200_idx
+            return [
+                (1000, (96.0, 106.0)), (1100, (96.5, 105.5)), (1200, (97.0, 105.0)),
+                (1400, (98.0, 104.0)), (1600, (98.5, 103.5)), (1800, (99.0, 103.0)),
+                (2000, (99.2, 102.8)),
+            ]
+        if metric == "MC":  # tsSPI
+            return [
+                (1000, (98.0, 102.0)), (1100, (98.0, 102.0)), (1200, (98.0, 102.0)),
+                (1400, (98.0, 102.2)), (1600, (97.8, 102.4)), (1800, (97.6, 102.6)),
+                (2000, (97.5, 102.7)),
+            ]
+        if metric == "LP":  # Accel
+            return [
+                (1000, (96.0, 104.0)), (1100, (96.5, 103.8)), (1200, (97.0, 103.5)),
+                (1400, (97.5, 103.0)), (1600, (98.0, 102.5)), (1800, (98.3, 102.3)),
+                (2000, (98.5, 102.0)),
+            ]
+        if metric == "LL":  # Grind (or Grind_CG)
+            return [
+                (1000, (98.5, 101.5)), (1100, (98.0, 102.0)), (1200, (98.0, 102.0)),
+                (1400, (97.5, 102.5)), (1600, (97.0, 103.0)), (1800, (96.5, 103.5)),
+                (2000, (96.0, 104.0)),
+            ]
+        return [(1200, (98.0, 102.0)), (2000, (98.0, 102.0))]
+
+    def _prior_band(distance_m: float, metric: str):
+        """Piecewise-linear interpolation over the metric's distance knots."""
+        knots = _band_knots(metric)
+        dm = float(distance_m)
+        if dm <= knots[0][0]: 
+            return knots[0][1]
+        if dm >= knots[-1][0]:
+            return knots[-1][1]
+        for (ad, (alo, ahi)), (bd, (blo, bhi)) in zip(knots, knots[1:]):
+            if ad <= dm <= bd:
+                t = (dm - ad) / (bd - ad)
+                return (_lerp(alo, blo, t), _lerp(ahi, bhi, t))
+        return knots[-1][1]
+
+    def _shape_shift(lo, hi, metric: str, rsi: float, sci: float):
+        """
+        Shift band centers by ±(0.2 * SCI) depending on RSI sign.
+        Fast-early (RSI<0): EZ/LP shift up; LL/MC shift down.
+        Slow-early (RSI>0): LL/MC shift up; EZ/LP shift down.
+        """
+        if not np.isfinite(sci) or sci <= 0: 
+            return lo, hi
+        shift = 0.2 * float(min(1.0, max(0.0, sci)))
+        center = 0.5*(lo+hi)
+        half   = 0.5*(hi-lo)
+        if rsi < -1e-9:   # fast-early
+            if metric in ("EZ","LP"): center += shift
+            if metric in ("LL","MC"): center -= shift
+        elif rsi >  1e-9: # slow-early
+            if metric in ("LL","MC"): center += shift
+            if metric in ("EZ","LP"): center -= shift
+        return (center - half, center + half)
+
+    def _blend_with_field(lo, hi, series: pd.Series):
+        """Blend priors (70%) with field 10th/90th (30%) if available."""
+        s = pd.to_numeric(series, errors="coerce")
+        if s.notna().any():
+            q10, q90 = np.nanpercentile(s.dropna(), [10, 90])
+            lo = 0.7*lo + 0.3*float(q10)
+            hi = 0.7*hi + 0.3*float(q90)
+        if hi <= lo: 
+            hi = lo + 1.0
+        return lo, hi
+
+    def _score01_from_band(x, lo, hi):
+        try:
+            xv = float(x)
+            if not np.isfinite(xv): return 0.0
+            return _clamp01((xv - lo) / (hi - lo))
+        except Exception:
+            return 0.0
+
+    # ---- compute distance/shape-aware 0..1 components ----
+    bands = {}
+    for metric_key, col in [("EZ","F200_idx"), ("MC","tsSPI"), ("LP","Accel"), ("LL",gr_col)]:
+        lo0, hi0 = _prior_band(D_m, metric_key)
+        lo1, hi1 = _shape_shift(lo0, hi0, metric_key, RSI, SCI)
+        lo, hi   = _blend_with_field(lo1, hi1, WD[col])
+        bands[metric_key] = (lo, hi)
+
+    WD["EZ01"] = WD["F200_idx"].map(lambda v: _score01_from_band(v, *bands["EZ"]))
+    WD["MC01"] = WD["tsSPI"].map(lambda v: _score01_from_band(v, *bands["MC"]))
+    WD["LP01"] = WD["Accel" ].map(lambda v: _score01_from_band(v, *bands["LP"]))
+    WD["LL01"] = WD[gr_col   ].map(lambda v: _score01_from_band(v, *bands["LL"]))
+
+    # ---- SOS (0..1) using your robust z-blend idea ----
+    def _sos01_series(df: pd.DataFrame) -> pd.Series:
+        ts = winsorize(pd.to_numeric(df["tsSPI"], errors="coerce"))
+        ac = winsorize(pd.to_numeric(df["Accel"], errors="coerce"))
+        gr = winsorize(pd.to_numeric(df[gr_col],  errors="coerce"))
+        def rz(s):
+            mu, sd = np.nanmedian(s), mad_std(s)
+            sd = sd if (np.isfinite(sd) and sd > 0) else 1.0
+            return (s - mu) / sd
+        raw = 0.45*rz(ts) + 0.35*rz(ac) + 0.20*rz(gr)
+        if raw.notna().any():
+            q5, q95 = np.nanpercentile(raw.dropna(), [5, 95])
+            denom = max(q95 - q5, 1.0)
+            return ((raw - q5) / denom).clip(0.0, 1.0)
+        return pd.Series(0.0, index=df.index)
+
+    WD["SOS01"] = _sos01_series(WD)
+
+    # ---- weights (distance + shape nudges) ----
+    def _wdna_base_weights(distance_m: float) -> dict:
+        knots = [
+            (1000, {"EZ":0.25,"MC":0.21,"LP":0.28,"LL":0.11}),
+            (1100, {"EZ":0.22,"MC":0.22,"LP":0.27,"LL":0.14}),
+            (1200, {"EZ":0.20,"MC":0.22,"LP":0.25,"LL":0.18}),
+            (1400, {"EZ":0.15,"MC":0.24,"LP":0.24,"LL":0.22}),
+            (1600, {"EZ":0.10,"MC":0.26,"LP":0.23,"LL":0.26}),
+            (1800, {"EZ":0.06,"MC":0.28,"LP":0.22,"LL":0.29}),
+            (2000, {"EZ":0.03,"MC":0.30,"LP":0.20,"LL":0.32}),
+        ]
+        dm = float(distance_m)
+        if dm <= knots[0][0]:  return knots[0][1]
+        if dm >= knots[-1][0]: return knots[-1][1]
+        for (ad, aw), (bd, bw) in zip(knots, knots[1:]):
+            if ad <= dm <= bd:
+                t = (dm - ad) / (bd - ad)
+                return {k: _lerp(aw[k], bw[k], t) for k in aw}
+        return knots[-1][1]
+
+    def _apply_shape_nudges(w: dict, rsi: float, sci: float) -> dict:
+        w = w.copy()
+        mag = 0.01 * max(0.0, min(1.0, sci))
+        if rsi < -1e-9:   # fast-early
+            take = mag/2.0
+            w["EZ"] += mag; w["LP"] += mag
+            w["LL"] = max(0.0, w["LL"] - take); w["MC"] = max(0.0, w["MC"] - take)
+        elif rsi >  1e-9: # slow-early
+            take = mag/2.0
+            w["LL"] += mag; w["MC"] += mag
+            w["EZ"] = max(0.0, w["EZ"] - take); w["LP"] = max(0.0, w["LP"] - take)
+        s = sum(w.values()) or 1.0
+        return {k: (v/s)*0.85 for k,v in w.items()}  # SOS fixed outside
+
+    def _wdna_weights(distance_m: float, rsi: float, sci: float) -> dict:
+        base = _wdna_base_weights(distance_m)
+        shaped = _apply_shape_nudges(base, rsi, sci)
+        shaped["SOS"] = 0.15
+        S = sum(shaped.values()) or 1.0
+        return {k: v / S for k, v in shaped.items()}
+
+    W = _wdna_weights(D_m, RSI, SCI)  # EZ/MC/LP/LL/SOS sum to 1.0
+
+    # ---- composite (0..1) -> re-centered 0..10 with median ≈ 5 ----
+    comp01 = (
+        W["EZ"]  * WD["EZ01"].fillna(0.0)  +
+        W["MC"]  * WD["MC01"].fillna(0.0)  +
+        W["LP"]  * WD["LP01"].fillna(0.0)  +
+        W["LL"]  * WD["LL01"].fillna(0.0)  +
+        W["SOS"] * WD["SOS01"].fillna(0.0)
+    )
+    med = float(np.nanmedian(comp01)) if comp01.notna().any() else 0.5
+    q10, q90 = (np.nanpercentile(comp01.dropna(), [10,90]) if comp01.notna().any() else (0.3,0.7))
+    den = max(q90 - q10, 1e-6)
+
+    WD["WinningDNA"] = (5.0 + 5.0 * ((comp01 - med) / den)).clip(0.0, 10.0).round(2)
+
+    # ---- tags, tiers, summaries ----
+    def _top_traits_row(r):
+        pairs = [("Early Zip", r.get("EZ01",0.0)), ("Mid Control", r.get("MC01",0.0)),
+                 ("Late Punch", r.get("LP01",0.0)), ("Lasting Lift", r.get("LL01",0.0))]
+        pairs = [(n, float(v if np.isfinite(v) else 0.0)) for n,v in pairs]
+        pairs.sort(key=lambda x: x[1], reverse=True)
+        keep = [n for n,v in pairs[:2] if v >= 0.55]
+        # specialist flags
+        ez, ll = float(r.get("EZ01",0.0)), float(r.get("LL01",0.0))
+        if ez >= 0.70 and ll <= 0.45: keep.append("Sprinter-leaning")
+        if ll >= 0.70 and ez <= 0.45: keep.append("Stayer-leaning")
+        return " · ".join(keep)
+
+    def _tier_badge(score):
+        if not np.isfinite(score): return ("", "")
+        if score >= 8.0: return ("🔥 Prime", "A")
+        if score >= 7.0: return ("🟢 Live", "B")
+        if score >= 6.0: return ("⚪ Comp", "C")
+        return ("⚪ Setup", "D")
+
+    def _summary_row(r):
+        name = str(r.get("Horse","")).strip()
+        sc   = float(r.get("WinningDNA",0.0))
+        traits = r.get("DNA_TopTraits","")
+        badge,_ = _tier_badge(sc)
+        parts = [f"{badge} DNA {sc:.2f}/10"]
+        if traits: parts.append(traits)
+        if SCI >= 0.6 and abs(RSI) >= 1.2:
+            with_shape = np.sign(RSI)*(float(r.get("LP01",0.0))-float(r.get("MC01",0.0))) >= 0
+            parts.append("with race shape" if with_shape else "against race shape")
+        return f"{name}: " + " — ".join(parts) + "."
+
+    WD["DNA_TopTraits"] = WD.apply(_top_traits_row, axis=1)
+    WD["DNA_Summary"]   = WD.apply(_summary_row,    axis=1)
+
+    # ---- Top-6 report cards ----
+    cards = WD.sort_values("WinningDNA", ascending=False).head(6).copy()
+    if len(cards) > 0:
+        st.markdown("**Top profiles (report cards)**")
+        cols = st.columns(3)
+        for i, (_, r) in enumerate(cards.iterrows()):
+            col = cols[i % 3]
+            nm  = str(r["Horse"])
+            sc  = float(r["WinningDNA"])
+            ez,mc,lp,ll,sos = [float(r[k]) for k in ["EZ01","MC01","LP01","LL01","SOS01"]]
+            badge, grade = _tier_badge(sc)
+            with col:
+                st.markdown(
+                    f"""
+    <div style="border:1px solid rgba(255,255,255,0.15); border-radius:10px; padding:10px; margin-bottom:10px;">
+      <div style="font-weight:700; font-size:1.05rem;">{nm}</div>
+      <div style="margin:4px 0;"><span style="font-weight:700;">{badge}</span> · Grade <b>{grade}</b> · DNA <b>{sc:.2f}</b>/10</div>
+      <div style="font-size:0.9rem; opacity:0.9;">{r['DNA_TopTraits']}</div>
+      <div style="margin-top:6px; font-size:0.85rem; opacity:0.8;">
+        EZ {ez:.2f} · MC {mc:.2f} · LP {lp:.2f} · LL {ll:.2f} · SOS {sos:.2f}
+      </div>
+    </div>
+    """,
+                    unsafe_allow_html=True
+                )
+
+    # ---- Full table ----
+    show_cols = ["Horse","WinningDNA","EZ01","MC01","LP01","LL01","SOS01","DNA_TopTraits"]
+    WD_view = WD.sort_values(["WinningDNA","Accel",gr_col], ascending=[False, False, False])[show_cols]
+    st.dataframe(WD_view, use_container_width=True)
+
+    # ---- Per-horse summaries ----
+    with st.expander("Race Pulse — per-horse summaries"):
+        for _, r in WD.sort_values("WinningDNA", ascending=False).iterrows():
+            st.write("• " + r["DNA_Summary"])
+
+    # ---- footnote: weights & band hints ----
+    w_note = ", ".join([f"{k} {W[k]:.2f}" for k in ["EZ","MC","LP","LL","SOS"]])
+    st.caption(
+        f"Weights — EZ fades with distance; LL grows; shape nudges via RSI×SCI. Final weights: {w_note}. "
+        f"Bands are distance-aware, shape-shifted, and blended 70/30 with field 10th/90th percentiles; "
+        f"DNA recentered so race median ≈ 5."
+    )
+    # ======================= /Winning DNA Matrix =======================
     
-        # ======================= Hidden Horses (v2, shape-aware) =======================
-st.markdown("## Hidden Horses v2 (Shape-aware)")
+            # ======================= Hidden Horses (v2, shape-aware) =======================
+    st.markdown("## Hidden Horses v2 (Shape-aware)")
 
-hh = metrics.copy()
-gr_col = metrics.attrs.get("GR_COL", "Grind")
+    hh = metrics.copy()
+    gr_col = metrics.attrs.get("GR_COL", "Grind")
 
-# --- SOS (robust z-score blend) ---
-need_cols = {"tsSPI", "Accel", gr_col}
-if need_cols.issubset(hh.columns) and len(hh) > 0:
-    ts_w = winsorize(pd.to_numeric(hh["tsSPI"], errors="coerce"))
-    ac_w = winsorize(pd.to_numeric(hh["Accel"], errors="coerce"))
-    gr_w = winsorize(pd.to_numeric(hh[gr_col], errors="coerce"))
+    # --- SOS (robust z-score blend) ---
+    need_cols = {"tsSPI", "Accel", gr_col}
+    if need_cols.issubset(hh.columns) and len(hh) > 0:
+        ts_w = winsorize(pd.to_numeric(hh["tsSPI"], errors="coerce"))
+        ac_w = winsorize(pd.to_numeric(hh["Accel"], errors="coerce"))
+        gr_w = winsorize(pd.to_numeric(hh[gr_col], errors="coerce"))
 
-    def rz(s):
-        mu, sd = np.nanmedian(s), mad_std(s)
-        return (s - mu) / (sd if np.isfinite(sd) and sd > 0 else 1.0)
+        def rz(s):
+            mu, sd = np.nanmedian(s), mad_std(s)
+            return (s - mu) / (sd if np.isfinite(sd) and sd > 0 else 1.0)
 
-    z_ts, z_ac, z_gr = rz(ts_w), rz(ac_w), rz(gr_w)
-    hh["SOS_raw"] = 0.45*z_ts + 0.35*z_ac + 0.20*z_gr
-    q5, q95 = hh["SOS_raw"].quantile(0.05), hh["SOS_raw"].quantile(0.95)
-    denom = max(q95 - q5, 1.0)
-    hh["SOS"] = (2.0 * (hh["SOS_raw"] - q5) / denom).clip(0, 2)
-else:
-    hh["SOS"] = 0.0
+        z_ts, z_ac, z_gr = rz(ts_w), rz(ac_w), rz(gr_w)
+        hh["SOS_raw"] = 0.45*z_ts + 0.35*z_ac + 0.20*z_gr
+        q5, q95 = hh["SOS_raw"].quantile(0.05), hh["SOS_raw"].quantile(0.95)
+        denom = max(q95 - q5, 1.0)
+        hh["SOS"] = (2.0 * (hh["SOS_raw"] - q5) / denom).clip(0, 2)
+    else:
+        hh["SOS"] = 0.0
 
-# --- TFS (trip friction) ---  (moved above ASI so ASI can use TFS_plus)
-def tfs_row(r):
-    last_cols = [c for c in ["300_Time", "200_Time", "100_Time"] if c in r.index]
-    spds = [metrics.attrs.get("STEP", 100) / as_num(r.get(c))
-            for c in last_cols if pd.notna(r.get(c)) and as_num(r.get(c)) > 0]
-    if len(spds) < 2:
-        return np.nan
-    sigma = np.std(spds, ddof=0)
-    mid = as_num(r.get("_MID_spd"))
-    return np.nan if not np.isfinite(mid) or mid <= 0 else 100.0 * (sigma / mid)
+    # --- TFS (trip friction) ---  (moved above ASI so ASI can use TFS_plus)
+    def tfs_row(r):
+        last_cols = [c for c in ["300_Time", "200_Time", "100_Time"] if c in r.index]
+        spds = [metrics.attrs.get("STEP", 100) / as_num(r.get(c))
+                for c in last_cols if pd.notna(r.get(c)) and as_num(r.get(c)) > 0]
+        if len(spds) < 2:
+            return np.nan
+        sigma = np.std(spds, ddof=0)
+        mid = as_num(r.get("_MID_spd"))
+        return np.nan if not np.isfinite(mid) or mid <= 0 else 100.0 * (sigma / mid)
 
-hh["TFS"] = hh.apply(tfs_row, axis=1)
-D_rounded = int(np.ceil(float(race_distance_input) / 200.0) * 200)
-_gate = 4.0 if D_rounded <= 1200 else (3.5 if D_rounded < 1800 else 3.0)
-hh["TFS_plus"] = hh["TFS"].apply(lambda x: 0.0 if pd.isna(x) or x < _gate else min(0.6, (x - _gate) / 3.0))
+    hh["TFS"] = hh.apply(tfs_row, axis=1)
+    D_rounded = int(np.ceil(float(race_distance_input) / 200.0) * 200)
+    _gate = 4.0 if D_rounded <= 1200 else (3.5 if D_rounded < 1800 else 3.0)
+    hh["TFS_plus"] = hh["TFS"].apply(lambda x: 0.0 if pd.isna(x) or x < _gate else min(0.6, (x - _gate) / 3.0))
 
 
-# --- ASI (Against-Shape Index, v3; race-local, 0–2 scale) ---
-def _rz(s):
-    s = winsorize(pd.to_numeric(s, errors="coerce"))
-    mu = np.nanmedian(s)
-    mad = np.nanmedian(np.abs(s - mu))
-    sd = 1.4826 * mad if mad > 0 else np.nanstd(s)
-    if not np.isfinite(sd) or sd <= 0:
-        sd = 1.0
-    return (s - mu) / sd
+    # --- ASI (Against-Shape Index, v3; race-local, 0–2 scale) ---
+    def _rz(s):
+        s = winsorize(pd.to_numeric(s, errors="coerce"))
+        mu = np.nanmedian(s)
+        mad = np.nanmedian(np.abs(s - mu))
+        sd = 1.4826 * mad if mad > 0 else np.nanstd(s)
+        if not np.isfinite(sd) or sd <= 0:
+            sd = 1.0
+        return (s - mu) / sd
 
-# 1) Flow strength (FS) from RacePulse if available, else a safe proxy
-RSI = metrics.attrs.get("RSI", np.nan)
-SCI = metrics.attrs.get("SCI", np.nan)
-collapse = float(metrics.attrs.get("CollapseSeverity", 0.0) or 0.0)
+    # 1) Flow strength (FS) from RacePulse if available, else a safe proxy
+    RSI = metrics.attrs.get("RSI", np.nan)
+    SCI = metrics.attrs.get("SCI", np.nan)
+    collapse = float(metrics.attrs.get("CollapseSeverity", 0.0) or 0.0)
 
-if not np.isfinite(RSI) or not np.isfinite(SCI):
-    # Fallback proxy using early/late distribution
+    if not np.isfinite(RSI) or not np.isfinite(SCI):
+        # Fallback proxy using early/late distribution
+        zE = _rz(hh.get("EARLY_idx")) if "EARLY_idx" in hh.columns else pd.Series(0.0, index=hh.index)
+        zL = _rz(hh.get("LATE_idx"))  if "LATE_idx"  in hh.columns else pd.Series(0.0, index=hh.index)
+        RSI = float(np.nanmedian(zE) - np.nanmedian(zL))  # >0 early tilt
+        SCI = 0.50  # neutral clarity if unknown
+
+    _dir = 0 if (not np.isfinite(RSI) or abs(RSI) < 1e-6) else (1 if RSI > 0 else -1)
+    FS = 0.0 if _dir == 0 else (0.6 + 0.4 * max(0.0, min(1.0, float(SCI)))) * min(1.0, abs(float(RSI)) / 2.0)
+    if collapse >= 3.0:
+        FS *= 0.75  # collapse guard
+
+    # 2) Style opposition (SO): early vs late style using Accel vs Grind
+    zA, zG = _rz(hh.get("Accel")), _rz(hh.get(gr_col))
+    if _dir == 1:   # early-favoured race
+        SO = (zG - zA).clip(lower=0)
+    elif _dir == -1:  # late-favoured race
+        SO = (zA - zG).clip(lower=0)
+    else:
+        SO = pd.Series(0.0, index=hh.index)
+
+    # 3) Segment execution opposition (XO): EARLY_idx vs LATE_idx
     zE = _rz(hh.get("EARLY_idx")) if "EARLY_idx" in hh.columns else pd.Series(0.0, index=hh.index)
     zL = _rz(hh.get("LATE_idx"))  if "LATE_idx"  in hh.columns else pd.Series(0.0, index=hh.index)
-    RSI = float(np.nanmedian(zE) - np.nanmedian(zL))  # >0 early tilt
-    SCI = 0.50  # neutral clarity if unknown
-
-_dir = 0 if (not np.isfinite(RSI) or abs(RSI) < 1e-6) else (1 if RSI > 0 else -1)
-FS = 0.0 if _dir == 0 else (0.6 + 0.4 * max(0.0, min(1.0, float(SCI)))) * min(1.0, abs(float(RSI)) / 2.0)
-if collapse >= 3.0:
-    FS *= 0.75  # collapse guard
-
-# 2) Style opposition (SO): early vs late style using Accel vs Grind
-zA, zG = _rz(hh.get("Accel")), _rz(hh.get(gr_col))
-if _dir == 1:   # early-favoured race
-    SO = (zG - zA).clip(lower=0)
-elif _dir == -1:  # late-favoured race
-    SO = (zA - zG).clip(lower=0)
-else:
-    SO = pd.Series(0.0, index=hh.index)
-
-# 3) Segment execution opposition (XO): EARLY_idx vs LATE_idx
-zE = _rz(hh.get("EARLY_idx")) if "EARLY_idx" in hh.columns else pd.Series(0.0, index=hh.index)
-zL = _rz(hh.get("LATE_idx"))  if "LATE_idx"  in hh.columns else pd.Series(0.0, index=hh.index)
-if _dir == 1:
-    XO = (zL - zE).clip(lower=0)
-elif _dir == -1:
-    XO = (zE - zL).clip(lower=0)
-else:
-    XO = pd.Series(0.0, index=hh.index)
-
-# 4) False-positive dampeners (trip friction & grind anomalies)
-tfs_plus = pd.to_numeric(hh.get("TFS_plus"), errors="coerce").fillna(0.0)
-gr_adj  = pd.to_numeric(hh.get("GrindAdjPts"), errors="coerce").fillna(1.0)
-
-D1 = 1.0 - np.minimum(0.35, tfs_plus.clip(lower=0.0))                   # up to -35%
-D2 = 1.0 - np.minimum(0.25, ((gr_adj - 1.0).clip(lower=0.0) / 3.0))      # up to -25%
-D  = D1 * D2
-
-# Combine (more weight on style than execution), scale to 0–10, then to 0–2
-Opp   = 0.6 * SO + 0.4 * XO
-ASI10 = 10.0 * FS * Opp * D
-hh["ASI2"] = (0.2 * ASI10).clip(0.0, 2.0).fillna(0.0)
-# --- UEI (underused engine) ---
-def uei_row(r):
-    ts, ac, gr = [as_num(r.get(k)) for k in ("tsSPI", "Accel", gr_col)]
-    if any(pd.isna([ts,ac,gr])): return 0.0
-    val = 0.0
-    if ts >= 102 and ac <= 98 and gr <= 98:
-        val = 0.3 + 0.3 * min((ts-102)/3.0, 1.0)
-    if ts >= 102 and gr >= 102 and ac <= 100:
-        val = max(val, 0.3 + 0.3 * min(((ts-102)+(gr-102))/6.0, 1.0))
-    return round(val, 3)
-hh["UEI"] = hh.apply(uei_row, axis=1)
-
-# --- HiddenScore ---
-hidden = (0.55*hh["SOS"] + 0.30*hh["ASI2"] + 0.10*hh["TFS_plus"] + 0.05*hh["UEI"]).fillna(0.0)
-if len(hh) <= 6: hidden *= 0.9
-h_med, h_mad = float(np.nanmedian(hidden)), float(np.nanmedian(np.abs(hidden - np.nanmedian(hidden))))
-h_sigma = max(1e-6, 1.4826*h_mad)
-hh["HiddenScore"] = (1.2 + (hidden - h_med) / (2.5*h_sigma)).clip(0.0, 3.0)
-
-# --- Tier logic (race-shape-aware) ---
-def hh_tier_row(r):
-    """Return a tier label for Hidden Horses v2."""
-    hs = as_num(r.get("HiddenScore"))
-    if not np.isfinite(hs):
-        return ""
-
-    # Baseline performance gates (robust to missing GCI_RS)
-    pi_val = as_num(r.get("PI"))
-    gci_rs = as_num(r.get("GCI_RS")) if pd.notna(r.get("GCI_RS")) else as_num(r.get("GCI"))
-
-    # Mild gates so we don't crown complete outliers with zero baseline
-    def baseline_ok_for(top: bool) -> bool:
-        if top:
-            return (
-                (np.isfinite(pi_val)  and pi_val  >= 5.4) or
-                (np.isfinite(gci_rs) and gci_rs >= 4.8)
-            )
-        else:
-            return (
-                (np.isfinite(pi_val)  and pi_val  >= 4.8) or
-                (np.isfinite(gci_rs) and gci_rs >= 4.2)
-            )
-
-    if hs >= 1.8 and baseline_ok_for(top=True):
-        return "🔥 Top Hidden"
-    if hs >= 1.2 and baseline_ok_for(top=False):
-        return "🟡 Notable Hidden"
-    return ""
-hh["Tier"] = hh.apply(hh_tier_row, axis=1)
-
-# --- Descriptive note ---
-def hh_note(r):
-    pi, gci_rs = as_num(r.get("PI")), as_num(r.get("GCI_RS"))
-    bits=[]
-    if np.isfinite(pi) and np.isfinite(gci_rs):
-        bits.append(f"PI {pi:.2f}, GCI_RS {gci_rs:.2f}")
+    if _dir == 1:
+        XO = (zL - zE).clip(lower=0)
+    elif _dir == -1:
+        XO = (zE - zL).clip(lower=0)
     else:
-        if as_num(r.get("SOS")) >= 1.2: bits.append("sectionals superior")
-        asi2 = as_num(r.get("ASI2"))
-        if asi2 >= 0.8: bits.append("ran against strong bias")
-        elif asi2 >= 0.4: bits.append("ran against bias")
-        if as_num(r.get("TFS_plus")) > 0: bits.append("trip friction late")
-        if as_num(r.get("UEI")) >= 0.5: bits.append("latent potential if shape flips")
-    return "; ".join(bits).capitalize()+"."
-hh["Note"] = hh.apply(hh_note, axis=1)
+        XO = pd.Series(0.0, index=hh.index)
 
-# ---- Build ranked, presentation-friendly Hidden Horses table ----
-cols_hh = ["Horse","Finish_Pos","PI","GCI","tsSPI","Accel",gr_col,
-           "SOS","ASI2","TFS","UEI","HiddenScore","Tier","Note"]
-for c in cols_hh:
-    if c not in hh.columns:
-        hh[c] = np.nan
+    # 4) False-positive dampeners (trip friction & grind anomalies)
+    tfs_plus = pd.to_numeric(hh.get("TFS_plus"), errors="coerce").fillna(0.0)
+    gr_adj  = pd.to_numeric(hh.get("GrindAdjPts"), errors="coerce").fillna(1.0)
 
-# numeric hygiene
-num_cols = ["PI","GCI","tsSPI","Accel",gr_col,"SOS","ASI2","TFS","UEI","HiddenScore"]
-for c in num_cols:
-    hh[c] = pd.to_numeric(hh[c], errors="coerce")
+    D1 = 1.0 - np.minimum(0.35, tfs_plus.clip(lower=0.0))                   # up to -35%
+    D2 = 1.0 - np.minimum(0.25, ((gr_adj - 1.0).clip(lower=0.0) / 3.0))      # up to -25%
+    D  = D1 * D2
 
-# explicit tier ordering (for secondary sort / grouping)
-_tier_order = {"🔥 Top Hidden": 0, "🟡 Notable Hidden": 1, "": 2}
-hh["_tier_order"] = hh["Tier"].map(_tier_order).fillna(2)
+    # Combine (more weight on style than execution), scale to 0–10, then to 0–2
+    Opp   = 0.6 * SO + 0.4 * XO
+    ASI10 = 10.0 * FS * Opp * D
+    hh["ASI2"] = (0.2 * ASI10).clip(0.0, 2.0).fillna(0.0)
+    # --- UEI (underused engine) ---
+    def uei_row(r):
+        ts, ac, gr = [as_num(r.get(k)) for k in ("tsSPI", "Accel", gr_col)]
+        if any(pd.isna([ts,ac,gr])): return 0.0
+        val = 0.0
+        if ts >= 102 and ac <= 98 and gr <= 98:
+            val = 0.3 + 0.3 * min((ts-102)/3.0, 1.0)
+        if ts >= 102 and gr >= 102 and ac <= 100:
+            val = max(val, 0.3 + 0.3 * min(((ts-102)+(gr-102))/6.0, 1.0))
+        return round(val, 3)
+    hh["UEI"] = hh.apply(uei_row, axis=1)
 
-# primary sort = HiddenScore (desc), then Tier order, then PI (desc)
-hh_ranked = (
-    hh.sort_values(["HiddenScore", "_tier_order", "PI"],
-                   ascending=[False, True, False])
-      .reset_index(drop=True)
-)
+    # --- HiddenScore ---
+    hidden = (0.55*hh["SOS"] + 0.30*hh["ASI2"] + 0.10*hh["TFS_plus"] + 0.05*hh["UEI"]).fillna(0.0)
+    if len(hh) <= 6: hidden *= 0.9
+    h_med, h_mad = float(np.nanmedian(hidden)), float(np.nanmedian(np.abs(hidden - np.nanmedian(hidden))))
+    h_sigma = max(1e-6, 1.4826*h_mad)
+    hh["HiddenScore"] = (1.2 + (hidden - h_med) / (2.5*h_sigma)).clip(0.0, 3.0)
 
-# --- Build final table -------------------------------------------------
-cols_hh = ["Horse","Finish_Pos","PI","GCI","tsSPI","Accel",gr_col,"SOS","ASI2","TFS","UEI","HiddenScore","Tier","Note"]
-for c in cols_hh:
-    if c not in hh.columns:
-        hh[c] = np.nan
+    # --- Tier logic (race-shape-aware) ---
+    def hh_tier_row(r):
+        """Return a tier label for Hidden Horses v2."""
+        hs = as_num(r.get("HiddenScore"))
+        if not np.isfinite(hs):
+            return ""
 
-# Tier order: put the best at the top
-tier_order = pd.CategoricalDtype(categories=["🔥 Top Hidden","🟡 Notable Hidden",""], ordered=True)
-hh["Tier"] = hh["Tier"].astype(tier_order)
+        # Baseline performance gates (robust to missing GCI_RS)
+        pi_val = as_num(r.get("PI"))
+        gci_rs = as_num(r.get("GCI_RS")) if pd.notna(r.get("GCI_RS")) else as_num(r.get("GCI"))
 
-hh_view = hh[cols_hh].copy()
-hh_view = hh_view.sort_values(["Tier","HiddenScore","PI"], ascending=[True, False, False])
-
-# ---- Safe numeric casting & rounding (no helper, no NameError) ----
-def _cast_round(df, col):
-    if col not in df.columns:
-        return
-    # Make a 1-D Series aligned to df.index regardless of the source shape/type
-    s = pd.Series(np.ravel(df[col].values), index=df.index)
-    df[col] = pd.to_numeric(s, errors="coerce").round(2)
-
-for c in ["PI","GCI","ASI2","SOS","TFS","UEI","Accel",gr_col,"tsSPI","HiddenScore"]:
-    _cast_round(hh_view, c)
-
-st.dataframe(hh_view, use_container_width=True)
-st.caption("Hidden Horses v2 — sorted by Tier, then HiddenScore, then PI (Top first).")
-
-# ======================= PWX + EFI — Robust final build =======================
-st.markdown("## PWX + EFI — Burst vs. Efficiency (field-calibrated)")
-
-import re, numpy as np, pandas as pd
-
-def _nz(s): return pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan)
-def _mad(x): x=np.asarray(x,float); m=np.nanmedian(x); return 1.4826*np.nanmedian(np.abs(x-m))
-def _robust_z(s):
-    v=_nz(s); m=np.nanmedian(v); d=_mad(v); 
-    d = d if (np.isfinite(d) and d>1e-9) else 1.0
-    return (v-m)/d
-def _pct_rank(s):
-    v=_nz(s).to_numpy(); order=np.argsort(v,kind="mergesort")
-    ranks=np.empty_like(order,float); ranks[order]=np.arange(1,len(v)+1)
-    pr=(ranks-0.5)/max(len(v),1); pr[~np.isfinite(v)]=0.5
-    return pd.Series(pr,index=s.index)
-def _cal_0_10(raw):
-    pr=_pct_rank(raw); z=_robust_z(raw); sig=1/(1+np.exp(-0.85*z)); q=0.6*pr+0.4*sig
-    q_src=[0.01,0.05,0.25,0.5,0.75,0.9,0.985,0.995]; y_tgt=[0.6,1.6,3.6,5,6.6,8,9.5,9.9]
-    s=np.interp(q,q_src,y_tgt).clip(0,10)
-    n=len(raw); 
-    if n<10: s=(1-min(0.5,(10-n)/10))*s+min(0.5,(10-n)/10)*5
-    return pd.Series(s,index=raw.index)
-def _norm(x): return re.sub(r"\s+"," ",str(x).strip().lower())
-
-GR_COL = metrics.attrs.get("GR_COL","Grind")
-need={"Horse","Accel",GR_COL,"tsSPI"}
-if not need.issubset(metrics.columns):
-    st.warning("PWX/EFI: missing Accel/Grind/tsSPI")
-else:
-    df=metrics.loc[:,["Horse","Accel",GR_COL,"tsSPI"]].copy()
-    df["HorseKey"]=df["Horse"].map(_norm)
-    df["TSI_tmp"]=np.nan; df["Onset_tmp"]=np.nan
-
-    # --- Safe optional VP merge ---
-    try:
-        if "VP" in globals() and isinstance(VP,pd.DataFrame) and len(VP):
-            vpj=VP.copy()
-            if "Horse" not in vpj.columns: vpj=vpj.reset_index().rename(columns={"index":"Horse"})
-            vpj["HorseKey"]=vpj["Horse"].map(_norm)
-            merge_cols=["HorseKey"]
-            if "TSI" in vpj.columns: merge_cols.append("TSI")
-            if "Onset_from_home_m" in vpj.columns: merge_cols.append("Onset_from_home_m")
-            vpj=vpj[merge_cols].drop_duplicates("HorseKey")
-            df=df.merge(vpj.rename(columns={"TSI":"TSI_tmp","Onset_from_home_m":"Onset_tmp"}),on="HorseKey",how="left")
-    except Exception: pass
-
-    for c in ["Accel",GR_COL,"tsSPI","TSI_tmp","Onset_tmp"]:
-        if c in df.columns: df[c]=_nz(df[c])
-
-    # --- compute ---
-    has_tsi = "TSI_tmp" in df.columns and df["TSI_tmp"].notna().any()
-    has_on  = "Onset_tmp" in df.columns and df["Onset_tmp"].notna().any()
-    z_acc=_robust_z(df["Accel"])
-    z_tsi=_robust_z(df["TSI_tmp"]) if has_tsi else _robust_z(df["tsSPI"])
-    z_on=-_robust_z(df["Onset_tmp"]) if has_on else pd.Series(0.0,index=df.index)
-    PWX_raw=0.70*z_acc+0.25*z_tsi+0.05*z_on
-
-    sm=1-(df["Accel"]-df[GR_COL]).abs()/((df["Accel"]+df[GR_COL]).replace(0,np.nan)/2)
-    z_tss=_robust_z(df["tsSPI"]); z_gr=_robust_z(df[GR_COL]); z_sm=_robust_z(sm)
-    EFI_raw=0.45*z_tss+0.35*z_gr+0.20*z_sm
-
-    df["PWX"]=_cal_0_10(PWX_raw); df["EFI"]=_cal_0_10(EFI_raw)
-    out=df[["Horse","PWX","EFI"]].sort_values(["PWX","EFI"],ascending=[False,False]).reset_index(drop=True)
-    st.dataframe(out,use_container_width=True)
-# ======================= /PWX + EFI =======================
-
-# ======================= Fatigue Gradient — One-Run (refined, RAM-light) =======================
-import numpy as np
-import pandas as pd
-
-try:
-    import streamlit as st
-except Exception:
-    st = None
-
-# ---------- tiny helpers (scalar / vector, RAM-light) ----------
-def _to_num(s):
-    return pd.to_numeric(s, errors="coerce").astype(np.float32)
-
-def _nz(x, alt=0.0):
-    try:
-        v = float(x)
-        return v if np.isfinite(v) else float(alt)
-    except Exception:
-        return float(alt)
-
-def _late_markers_from_cols(cols):
-    """Decide late-window markers from available *_Time columns.
-    100m splits: prefer 500,400,300,200,100,Finish. 200m splits: 400,200,Finish.
-    Returns list of (label, length_m, src_col) in left→right order (early→late)."""
-    want100 = ["500_Time","400_Time","300_Time","200_Time","100_Time","Finish_Time"]
-    want200 = ["400_Time","200_Time","Finish_Time"]
-    have = set(cols)
-
-    # Pick the fuller scheme we can actually support
-    if all(c in have for c in ["200_Time","Finish_Time"]) and any(c in have for c in ["300_Time","100_Time","500_Time","400_Time"]):
-        # Prefer 100m if we can get >=3 points
-        got = [c for c in want100 if c in have]
-        # Require at least 4 points to use the 100m scheme, else fall back to 200m
-        if len(got) >= 4:
-            # segment lengths: 100 for 100_Time legs, Finish leg = STEP (100/200)
-            return [(c.replace("_Time",""), 100.0, c) if c!="Finish_Time" else ("Finish", np.nan, c) for c in got]
-
-    # fallback: 200m
-    got = [c for c in want200 if c in have]
-    if len(got) >= 3:
-        return [(c.replace("_Time",""), 200.0, c) if c!="Finish_Time" else ("Finish", np.nan, c) for c in got]
-
-    # last resort: minimal late pair if exists
-    if "200_Time" in have and "Finish_Time" in have:
-        return [("200", 200.0, "200_Time"), ("Finish", np.nan, "Finish_Time")]
-    return []  # not enough to compute
-
-def _extract_late_speeds(row, segs, step_default=100.0, bend_weight_first=True):
-    """Return np.array of late segment speeds (m/s) for a single horse.
-       segs: list[(label, length_m, src_col)] where length_m for 'Finish' is resolved via step_default.
-       bend_weight_first: if True, we down-weight first late point later (not here)."""
-    spd = []
-    for (lab, L, src) in segs:
-        Lm = float(L) if np.isfinite(L) else float(step_default)  # Finish leg length = STEP
-        t = row.get(src, np.nan)
-        t = _nz(t, np.nan)
-        if np.isfinite(t) and t > 0:
-            spd.append(Lm / t)
-        else:
-            spd.append(np.nan)
-    return np.asarray(spd, dtype=np.float32)
-
-def _theil_sen_slope_per200(x, y):
-    """Robust slope per 200m using Theil–Sen (very small n, so O(n^2) is fine). x is distance index (0..n-1)."""
-    # Use only finite pairs
-    m = np.isfinite(x) & np.isfinite(y)
-    xx, yy = x[m], y[m]
-    n = len(xx)
-    if n < 2:
-        return np.nan
-    # pairwise slopes
-    slopes = []
-    for i in range(n):
-        for j in range(i+1, n):
-            dx = (xx[j] - xx[i])
-            if dx == 0:
-                continue
-            slopes.append( (yy[j] - yy[i]) / (dx * 200.0) )  # scale to per-200m
-    if not slopes:
-        return np.nan
-    return float(np.median(slopes))
-
-def _ols_slope_per200(x, y):
-    m = np.isfinite(x) & np.isfinite(y)
-    xx, yy = x[m], y[m]
-    n = len(xx)
-    if n < 2:
-        return np.nan
-    xm = float(np.mean(xx)); ym = float(np.mean(yy))
-    num = float(np.sum((xx - xm) * (yy - ym)))
-    den = float(np.sum((xx - xm)**2))
-    if den <= 0:
-        return np.nan
-    b = num / den  # per x-step
-    return float(b / 200.0)  # per 200m
-
-def _mono_score(v):
-    """Monotonicity of late speeds: 1 - (#direction flips)/(n-1) in sign of diffs."""
-    w = v[np.isfinite(v)]
-    if len(w) <= 2:
-        return 0.5
-    dif = np.diff(w)
-    sgn = np.sign(dif)
-    flips = np.sum(np.abs(np.diff(sgn)) > 0)
-    denom = max(1, len(sgn) - 1)
-    return float(1.0 - (flips / denom))
-
-def _trip_bucket(dm):
-    dm = float(dm)
-    if dm <= 1200: return "SPRINT"
-    if dm <= 1650: return "MILE"
-    if dm <= 2050: return "MIDDLE"
-    return "STAY"
-
-def _late_scalars_by_trip(dm):
-    """Distance-aware constants (small, stable)."""
-    bucket = _trip_bucket(dm)
-    # late-lift scale (not used directly as m/s scaling here, but reserved)
-    S_norm = {"SPRINT":0.70, "MILE":0.60, "MIDDLE":0.55, "STAY":0.50}[bucket]
-    kappa  = {"SPRINT":0.18, "MILE":0.20, "MIDDLE":0.22, "STAY":0.24}[bucket]
-    return S_norm, kappa
-
-# ---------- main builder ----------
-def build_fatigue_table_refined(metrics: pd.DataFrame) -> pd.DataFrame:
-    df = metrics.copy()
-    # try to locate raw timing table (preferred for *_Time)
-    work = None
-    if st is not None:
-        work = st.session_state.get("work", None)
-    if work is None or not isinstance(work, pd.DataFrame):
-        work = df
-
-    # basics
-    step = _nz(metrics.attrs.get("STEP", 100), 100.0)
-    dm   = _nz(metrics.attrs.get("race_distance_m", st.session_state.get("race_distance_m", 1200) if st else 1200), 1200.0)
-    RSI  = metrics.attrs.get("RSI", np.nan)
-    SCI  = metrics.attrs.get("SCI", np.nan)
-    bend = bool(metrics.attrs.get("LATE_BEND", True))  # default True: many SA tracks bend into the straight
-
-    # late segments
-    segs0 = _late_markers_from_cols(work.columns)
-    if not segs0:
-        # abort gracefully
-        view = pd.DataFrame({"Horse": df.get("Horse", pd.Series(range(len(df))))})
-        view["Note"] = "Not enough *_Time columns to compute fatigue."
-        return view
-
-    # distance-aware constants
-    S_norm, kappa = _late_scalars_by_trip(dm)
-
-    # pull per-horse late speeds
-    late_speeds = []
-    for _, r in work.iterrows():
-        late_speeds.append(_extract_late_speeds(r, segs0, step_default=step, bend_weight_first=bend))
-    late_speeds = np.asarray(late_speeds, dtype=object)  # ragged ok; each row tiny
-
-    # one-split outlier guard & robust slope per horse
-    x_idx = np.arange(len(segs0), dtype=np.float32)
-    slopes = np.full(len(df), np.nan, dtype=np.float32)
-    monos  = np.full(len(df), np.nan, dtype=np.float32)
-
-    for i in range(len(df)):
-        vi = np.asarray(late_speeds[i], dtype=np.float32)
-        if vi.size == 0 or not np.isfinite(vi).any():
-            continue
-
-        # bend-awareness: down-weight first point (applied in slope by nudging toward neighbors)
-        v = vi.copy()
-        if bend and np.isfinite(v[0]) and v.size >= 2 and np.isfinite(v[1]):
-            v[0] = 0.8 * v[0] + 0.2 * v[1]  # small soften; avoids fabricating speed
-
-        # outlier guard: mask the single worst split if >12% from median of finite
-        vf = v[np.isfinite(v)]
-        if vf.size >= 3:
-            med = float(np.median(vf))
-            dev = np.abs(v - med) / (med if med > 0 else 1.0)
-            j = int(np.nanargmax(dev))
-            if np.isfinite(dev[j]) and dev[j] > 0.12:
-                v[j] = np.nan
-
-        # slope per 200m (Theil–Sen if 5+ finite points, else OLS)
-        msk = np.isfinite(v)
-        nfin = int(np.sum(msk))
-        if nfin >= 2:
-            if nfin >= 5:
-                slopes[i] = _theil_sen_slope_per200(x_idx[msk], v[msk])
+        # Mild gates so we don't crown complete outliers with zero baseline
+        def baseline_ok_for(top: bool) -> bool:
+            if top:
+                return (
+                    (np.isfinite(pi_val)  and pi_val  >= 5.4) or
+                    (np.isfinite(gci_rs) and gci_rs >= 4.8)
+                )
             else:
-                slopes[i] = _ols_slope_per200(x_idx[msk], v[msk])
-            monos[i] = _mono_score(v[msk])
+                return (
+                    (np.isfinite(pi_val)  and pi_val  >= 4.8) or
+                    (np.isfinite(gci_rs) and gci_rs >= 4.2)
+                )
+
+        if hs >= 1.8 and baseline_ok_for(top=True):
+            return "🔥 Top Hidden"
+        if hs >= 1.2 and baseline_ok_for(top=False):
+            return "🟡 Notable Hidden"
+        return ""
+    hh["Tier"] = hh.apply(hh_tier_row, axis=1)
+
+    # --- Descriptive note ---
+    def hh_note(r):
+        pi, gci_rs = as_num(r.get("PI")), as_num(r.get("GCI_RS"))
+        bits=[]
+        if np.isfinite(pi) and np.isfinite(gci_rs):
+            bits.append(f"PI {pi:.2f}, GCI_RS {gci_rs:.2f}")
         else:
-            slopes[i] = np.nan
-            monos[i]  = 0.5
+            if as_num(r.get("SOS")) >= 1.2: bits.append("sectionals superior")
+            asi2 = as_num(r.get("ASI2"))
+            if asi2 >= 0.8: bits.append("ran against strong bias")
+            elif asi2 >= 0.4: bits.append("ran against bias")
+            if as_num(r.get("TFS_plus")) > 0: bits.append("trip friction late")
+            if as_num(r.get("UEI")) >= 0.5: bits.append("latent potential if shape flips")
+        return "; ".join(bits).capitalize()+"."
+    hh["Note"] = hh.apply(hh_note, axis=1)
 
-    # FG_rate/200m: slope; more negative = more fade (fatigue)
-    # Convert to "vs field" semantics (positive = MORE fade vs field, to match your earlier sign logic):
-    med_slope = np.nanmedian(slopes)
-    FG_vs_field = -(slopes - med_slope)  # flip so + means "faded more than field"
-    # small-field shrinkage
-    if len(df) <= 7:
-        FG_vs_field = 0.8 * FG_vs_field
+    # ---- Build ranked, presentation-friendly Hidden Horses table ----
+    cols_hh = ["Horse","Finish_Pos","PI","GCI","tsSPI","Accel",gr_col,
+               "SOS","ASI2","TFS","UEI","HiddenScore","Tier","Note"]
+    for c in cols_hh:
+        if c not in hh.columns:
+            hh[c] = np.nan
 
-    # Line_vs_field: use provided if exists, else proxy from LATE_idx - EARLY_idx (median-centered)
-    if "Line_vs_field" in df.columns:
-        line_raw = _to_num(df["Line_vs_field"])
+    # numeric hygiene
+    num_cols = ["PI","GCI","tsSPI","Accel",gr_col,"SOS","ASI2","TFS","UEI","HiddenScore"]
+    for c in num_cols:
+        hh[c] = pd.to_numeric(hh[c], errors="coerce")
+
+    # explicit tier ordering (for secondary sort / grouping)
+    _tier_order = {"🔥 Top Hidden": 0, "🟡 Notable Hidden": 1, "": 2}
+    hh["_tier_order"] = hh["Tier"].map(_tier_order).fillna(2)
+
+    # primary sort = HiddenScore (desc), then Tier order, then PI (desc)
+    hh_ranked = (
+        hh.sort_values(["HiddenScore", "_tier_order", "PI"],
+                       ascending=[False, True, False])
+          .reset_index(drop=True)
+    )
+
+    # --- Build final table -------------------------------------------------
+    cols_hh = ["Horse","Finish_Pos","PI","GCI","tsSPI","Accel",gr_col,"SOS","ASI2","TFS","UEI","HiddenScore","Tier","Note"]
+    for c in cols_hh:
+        if c not in hh.columns:
+            hh[c] = np.nan
+
+    # Tier order: put the best at the top
+    tier_order = pd.CategoricalDtype(categories=["🔥 Top Hidden","🟡 Notable Hidden",""], ordered=True)
+    hh["Tier"] = hh["Tier"].astype(tier_order)
+
+    hh_view = hh[cols_hh].copy()
+    hh_view = hh_view.sort_values(["Tier","HiddenScore","PI"], ascending=[True, False, False])
+
+    # ---- Safe numeric casting & rounding (no helper, no NameError) ----
+    def _cast_round(df, col):
+        if col not in df.columns:
+            return
+        # Make a 1-D Series aligned to df.index regardless of the source shape/type
+        s = pd.Series(np.ravel(df[col].values), index=df.index)
+        df[col] = pd.to_numeric(s, errors="coerce").round(2)
+
+    for c in ["PI","GCI","ASI2","SOS","TFS","UEI","Accel",gr_col,"tsSPI","HiddenScore"]:
+        _cast_round(hh_view, c)
+
+    st.dataframe(hh_view, use_container_width=True)
+    st.caption("Hidden Horses v2 — sorted by Tier, then HiddenScore, then PI (Top first).")
+
+    # ======================= PWX + EFI — Robust final build =======================
+    st.markdown("## PWX + EFI — Burst vs. Efficiency (field-calibrated)")
+
+    import re, numpy as np, pandas as pd
+
+    def _nz(s): return pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    def _mad(x): x=np.asarray(x,float); m=np.nanmedian(x); return 1.4826*np.nanmedian(np.abs(x-m))
+    def _robust_z(s):
+        v=_nz(s); m=np.nanmedian(v); d=_mad(v); 
+        d = d if (np.isfinite(d) and d>1e-9) else 1.0
+        return (v-m)/d
+    def _pct_rank(s):
+        v=_nz(s).to_numpy(); order=np.argsort(v,kind="mergesort")
+        ranks=np.empty_like(order,float); ranks[order]=np.arange(1,len(v)+1)
+        pr=(ranks-0.5)/max(len(v),1); pr[~np.isfinite(v)]=0.5
+        return pd.Series(pr,index=s.index)
+    def _cal_0_10(raw):
+        pr=_pct_rank(raw); z=_robust_z(raw); sig=1/(1+np.exp(-0.85*z)); q=0.6*pr+0.4*sig
+        q_src=[0.01,0.05,0.25,0.5,0.75,0.9,0.985,0.995]; y_tgt=[0.6,1.6,3.6,5,6.6,8,9.5,9.9]
+        s=np.interp(q,q_src,y_tgt).clip(0,10)
+        n=len(raw); 
+        if n<10: s=(1-min(0.5,(10-n)/10))*s+min(0.5,(10-n)/10)*5
+        return pd.Series(s,index=raw.index)
+    def _norm(x): return re.sub(r"\s+"," ",str(x).strip().lower())
+
+    GR_COL = metrics.attrs.get("GR_COL","Grind")
+    need={"Horse","Accel",GR_COL,"tsSPI"}
+    if not need.issubset(metrics.columns):
+        st.warning("PWX/EFI: missing Accel/Grind/tsSPI")
     else:
-        zE = _to_num(df.get("EARLY_idx", np.nan))
-        zL = _to_num(df.get("LATE_idx", np.nan))
-        line_raw = (zL - zE) - np.nanmedian(zL - zE)  # raw sign: negative = stronger late
-    Line_vs_field = line_raw.copy()  # keep raw sign in table for continuity
-    LineEff = (-line_raw).astype(np.float32)         # internal: bigger = stronger late
+        df=metrics.loc[:,["Horse","Accel",GR_COL,"tsSPI"]].copy()
+        df["HorseKey"]=df["Horse"].map(_norm)
+        df["TSI_tmp"]=np.nan; df["Onset_tmp"]=np.nan
 
-    # Early heat (small, fair)
-    EARLY_idx = _to_num(df.get("EARLY_idx", np.nan))
-    EHeat = np.maximum(0.0, EARLY_idx - 104.0)
+        # --- Safe optional VP merge ---
+        try:
+            if "VP" in globals() and isinstance(VP,pd.DataFrame) and len(VP):
+                vpj=VP.copy()
+                if "Horse" not in vpj.columns: vpj=vpj.reset_index().rename(columns={"index":"Horse"})
+                vpj["HorseKey"]=vpj["Horse"].map(_norm)
+                merge_cols=["HorseKey"]
+                if "TSI" in vpj.columns: merge_cols.append("TSI")
+                if "Onset_from_home_m" in vpj.columns: merge_cols.append("Onset_from_home_m")
+                vpj=vpj[merge_cols].drop_duplicates("HorseKey")
+                df=df.merge(vpj.rename(columns={"TSI":"TSI_tmp","Onset_from_home_m":"Onset_tmp"}),on="HorseKey",how="left")
+        except Exception: pass
 
-    # Race-shape factor (bounded, SCI-gated)
-    if np.isfinite(RSI) and np.isfinite(SCI) and SCI >= 0.6:
-        FS = 1.0 + np.sign(RSI) * min(0.12, 0.08 * (abs(float(RSI)) ** 0.8))
+        for c in ["Accel",GR_COL,"tsSPI","TSI_tmp","Onset_tmp"]:
+            if c in df.columns: df[c]=_nz(df[c])
+
+        # --- compute ---
+        has_tsi = "TSI_tmp" in df.columns and df["TSI_tmp"].notna().any()
+        has_on  = "Onset_tmp" in df.columns and df["Onset_tmp"].notna().any()
+        z_acc=_robust_z(df["Accel"])
+        z_tsi=_robust_z(df["TSI_tmp"]) if has_tsi else _robust_z(df["tsSPI"])
+        z_on=-_robust_z(df["Onset_tmp"]) if has_on else pd.Series(0.0,index=df.index)
+        PWX_raw=0.70*z_acc+0.25*z_tsi+0.05*z_on
+
+        sm=1-(df["Accel"]-df[GR_COL]).abs()/((df["Accel"]+df[GR_COL]).replace(0,np.nan)/2)
+        z_tss=_robust_z(df["tsSPI"]); z_gr=_robust_z(df[GR_COL]); z_sm=_robust_z(sm)
+        EFI_raw=0.45*z_tss+0.35*z_gr+0.20*z_sm
+
+        df["PWX"]=_cal_0_10(PWX_raw); df["EFI"]=_cal_0_10(EFI_raw)
+        out=df[["Horse","PWX","EFI"]].sort_values(["PWX","EFI"],ascending=[False,False]).reset_index(drop=True)
+        st.dataframe(out,use_container_width=True)
+    # ======================= /PWX + EFI =======================
+
+
+
+if _view_is("Advanced Models", "Full Report"):
+    # ======================= R&V (CAR) — Context-Aware Reliability =======================
+    st.markdown("## R&V — Context-Aware Reliability (CAR)")
+
+    import numpy as np
+    import pandas as pd
+
+    df = metrics.copy()
+
+    # ---------- Small robust helpers ----------
+    def _nz(x, alt=0.0):
+        try:
+            v = float(x)
+            return v if np.isfinite(v) else alt
+        except Exception:
+            return alt
+
+    def _winsor(s: pd.Series, q: float = 0.02):
+        s = pd.to_numeric(s, errors="coerce")
+        lo, hi = s.quantile(q), s.quantile(1 - q)
+        return s.clip(lo, hi)
+
+    def _mad(x: np.ndarray):
+        x = np.asarray(x, dtype=float)
+        x = x[np.isfinite(x)]
+        if x.size == 0: return np.nan
+        med = np.median(x)
+        mad = np.median(np.abs(x - med))
+        return 1.4826 * mad
+
+    def _robust01(s: pd.Series):
+        """Percentile rank 0–1 using median/MAD for stability."""
+        s = pd.to_numeric(s, errors="coerce")
+        finite = s[np.isfinite(s)]
+        if finite.empty:
+            return pd.Series(0.5, index=s.index)
+        # rank to 0..1
+        r = finite.rank(method="average", pct=True)
+        out = pd.Series(np.nan, index=s.index)
+        out.loc[finite.index] = r
+        return out.fillna(0.5)
+
+    # ---------- If MV / RC not present, compute light versions from splits (exclude first) ----------
+    have_MV = "MV" in df.columns
+    have_RC = "RC" in df.columns
+
+    def _collect_time_cols(_work: pd.DataFrame):
+        # Any '*_Time' plus optional 'Finish_Time'
+        tcols = [c for c in _work.columns if c.endswith("_Time")]
+        # order columns by numeric end marker; keep Finish at the end
+        def _key(c):
+            if c == "Finish_Time": return (10**9)
+            try:
+                return int(c.split("_")[0])
+            except Exception:
+                return 10**8
+        tcols = sorted([c for c in tcols if c != "Finish_Time"], key=_key) + (["Finish_Time"] if "Finish_Time" in _work.columns else [])
+        return tcols
+
+    if not (have_MV and have_RC):
+        # Build per-horse segment speeds (m/s) from times.
+        step = int(metrics.attrs.get("STEP", 100))
+        tcols = _collect_time_cols(work)
+        # exclude the first split to avoid start noise
+        seg_cols = tcols[1:] if len(tcols) > 1 else tcols[:]
+        # guard
+        if len(seg_cols) >= 3:
+            # Compute speeds per segment length
+            seg_lens = []
+            for c in seg_cols:
+                if c == "Finish_Time":
+                    seg_lens.append(float(step))
+                else:
+                    # infer length from column gap; safe default = step
+                    seg_lens.append(float(step))
+            seg_lens = np.asarray(seg_lens, dtype=float)
+
+            # Make a small speed matrix (rows=horses, cols=segments)
+            # Join by horse where possible
+            w = work.copy()
+            if "Horse" in w.columns and "Horse" in df.columns:
+                w = w.set_index("Horse").reindex(df["Horse"]).reset_index()
+
+            spd = []
+            for _, r in w.iterrows():
+                times = pd.to_numeric(r[seg_cols], errors="coerce").to_numpy()
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    v = seg_lens / times
+                # ignore 0/neg/inf
+                v[~np.isfinite(v)] = np.nan
+                spd.append(v)
+            spd = np.asarray(spd, dtype=float)  # shape (N_horse, N_seg)
+
+            # Trim to segments that have at least some data
+            valid_mask = np.isfinite(spd).sum(axis=0) >= 2
+            spd = spd[:, valid_mask]
+            # After trim, require at least 3 segments
+            if spd.shape[1] >= 3:
+                # Fill nan per row with row-median to keep variability meaningful
+                row_med = np.nanmedian(spd, axis=1, keepdims=True)
+                spd_f = np.where(np.isfinite(spd), spd, row_med)
+
+                # MV_raw: variability across segments (lower = steadier).
+                # use coefficient of variation via MAD for robustness.
+                med = np.nanmedian(spd_f, axis=1)
+                mad = np.array([_mad(spd_f[i, :]) for i in range(spd_f.shape[0])])
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    mv_raw = mad / np.where(med > 0, med, np.nan)
+                mv_raw = pd.Series(mv_raw, index=df.index)
+
+                # RC_raw: rebound coefficient — late strength vs late trough.
+                # Find trough over the last ~half of race, compare to mean of final 2 segments.
+                H, S = spd_f.shape
+                late_start = max(1, S // 2)
+                trough = np.nanargmin(np.nanmedian(spd_f[:, late_start:], axis=0)) + late_start  # index in [late_start..S-1]
+                tail = np.nanmean(spd_f[:, max(S-2, 0):S], axis=1)
+                base = spd_f[:, trough]
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    rc_raw = tail / np.where(base > 0, base, np.nan)
+                rc_raw = pd.Series(rc_raw, index=df.index)
+
+                if not have_MV: df["MV"] = mv_raw
+                if not have_RC: df["RC"] = rc_raw
+
+    # ---------- Core normalisations ----------
+    mv = _winsor(df.get("MV", pd.Series(np.nan, index=df.index)), q=0.02)
+    rc = _winsor(df.get("RC", pd.Series(np.nan, index=df.index)), q=0.02)
+
+    # Lower MV is better -> invert after normalising; Higher RC is better.
+    mv01 = 1.0 - _robust01(mv)     # steadiness (0..1, higher = steadier)
+    rc01 = _robust01(rc)           # rebound (0..1, higher = more kick late)
+
+    # Class lens: use PI if available, else GCI
+    if "PI" in df.columns and pd.to_numeric(df["PI"], errors="coerce").notna().any():
+        cls = _winsor(pd.to_numeric(df["PI"], errors="coerce"), q=0.02)
     else:
-        FS = 1.0
+        cls = _winsor(pd.to_numeric(df.get("GCI", np.nan), errors="coerce"), q=0.02)
 
-    # Class anchor (tiny): tsSPI → normalize slow/fast run illusions
-    tsSPI = _to_num(df.get("tsSPI", np.nan))
-    ClassAdj = np.clip((tsSPI - 100.0) / 8.0, -0.2, 0.2)
+    cls01 = _robust01(cls)
 
-    # Efficiency (late minus fade), small penalty for early burn; distance aware captured via slope per 200 already
-    FG_eff = (LineEff - 0.50 * FG_vs_field - 0.03 * EHeat).astype(np.float32)
+    # ---------- Class-aware blending (CAR) ----------
+    # More tolerance for variability when class is high
+    mv_term = np.power(mv01, 1.0 - 0.35*cls01)            # elite horses keep more of their steadiness score
+    rc_term = rc01 * (1.0 + 0.25*cls01)                   # elite kick counts a bit extra
 
-    # Composite fatigue score: late engine vs front-spent (positive = late engine, negative = front-spent)
-    LateCloserScore  = (0.60 * LineEff + 0.30 * (-FG_vs_field)).astype(np.float32)
-    FrontSpentScore  = (0.60 * (-LineEff) + 0.30 * (FG_vs_field)).astype(np.float32)
-    FatigueScore_raw = (LateCloserScore - FrontSpentScore).astype(np.float32)
+    CAR = 10.0 * (0.45*mv_term + 0.35*rc_term + 0.20*cls01)
+    CAR = np.clip(CAR, 0.0, 10.0)
 
-    # shape + class calibration (light touch)
-    FatigueScore = (FS * FatigueScore_raw - 0.10 * ClassAdj).astype(np.float32)
+    # ---------- Risk tag ----------
+    def _risk_tag(car):
+        if not np.isfinite(car): return "None"
+        if car >= 8.0:  return "Reliable"
+        if car >= 6.0:  return "Mostly reliable"
+        if car >= 4.0:  return "Variable"
+        return "Fragile"
 
-    # Reliability = 0.5 completeness + 0.5 monotonicity
-    need_cols = [
-        "Accel", metrics.attrs.get("GR_COL","Grind"),
-        "EARLY_idx", "LATE_idx"
-    ]
-    comp_bits = []
-    for c in need_cols:
-        if c in df.columns:
-            comp_bits.append(np.isfinite(_to_num(df[c])))
-    if comp_bits:
-        comp = np.mean(np.column_stack(comp_bits), axis=1).astype(np.float32)
-    else:
-        comp = np.full(len(df), 0.5, dtype=np.float32)
-    Mono = np.nan_to_num(monos, nan=0.5).astype(np.float32)
-    Reliability = (0.5 * comp + 0.5 * np.clip(Mono, 0.0, 1.0)).astype(np.float32)
+    tags = [ _risk_tag(v) for v in CAR ]
 
-    # ---------- NEW TAG RULE: based ONLY on FatigueScore ----------
-    FS = np.asarray(FatigueScore, float)
-
-    Tag = np.full(len(FS), "balanced", dtype=object)
-    Tag[FS < -3.0] = "late engine"
-    Tag[FS >  3.0] = "front-spent"
-
-    Cue = np.full(len(FS), "repeats", dtype=object)
-    Cue[FS < -3.0] = "↑ trip / stronger pace"
-    Cue[FS >  3.0] = "↓ trip / easier early"
-
-    # Assemble view
-    view = pd.DataFrame({
-        "Horse": df.get("Horse", pd.Series(np.arange(len(df)), dtype=object)),
-        "FG_rate/200m": np.round(slopes, 4),                 # raw slope (m/s per 200m) — diagnostic
-        "FG_vs_field":  np.round(FG_vs_field, 3),            # + = faded more than field
-        "Line_vs_field": np.round(Line_vs_field, 3),         # keep raw sign convention
-        "FG_eff(adjusted)": np.round(FG_eff, 3),
-        "Reliability": np.round(Reliability, 3),
-        "Tag": Tag,
-        "Cue": Cue,
-        "FatigueScore": np.round(FatigueScore, 3),
+    # ---------- Output table ----------
+    out = pd.DataFrame({
+        "Horse": df["Horse"],
+        "R&V": np.round(CAR, 2),
+        "Risk Tag": tags,
+        "MV (↓ steadier)": np.round(pd.to_numeric(df.get("MV", np.nan), errors="coerce"), 3),
+        "RC (↑ better rebound)": np.round(pd.to_numeric(df.get("RC", np.nan), errors="coerce"), 3),
     })
 
-    # Order: late engines first, then balanced, then front-spent; within group by score desc
-    ord_grp = np.where(view["Tag"] == "late engine", 0,
-                np.where(view["Tag"] == "balanced", 1, 2)).astype(np.int16)
-    view = view.assign(_g=ord_grp, _s=-view["FatigueScore"].astype(float))\
-               .sort_values(["_g","_s","Reliability"], ascending=[True, True, False])\
-               .drop(columns=["_g","_s"])\
-               .reset_index(drop=True)
+    # Add PI for context if present
+    if "PI" in df.columns:
+        out["PI"] = np.round(pd.to_numeric(df["PI"], errors="coerce"), 2)
+    elif "GCI" in df.columns:
+        out["GCI"] = np.round(pd.to_numeric(df["GCI"], errors="coerce"), 2)
 
-    return view
+    # Sort by most reliable first, then strongest class
+    sort_cols = ["R&V"]
+    if "PI" in out.columns: sort_cols += ["PI"]
+    elif "GCI" in out.columns: sort_cols += ["GCI"]
+    out = out.sort_values(sort_cols, ascending=[False] + [False]*(len(sort_cols)-1), kind="mergesort").reset_index(drop=True)
 
-# ---------- render ----------
-_ftab = build_fatigue_table_refined(metrics)
-if st is not None:
-    st.markdown("## Fatigue Gradient — refined (one-run)")
-    st.dataframe(_ftab, use_container_width=True)
-# ======================= /Fatigue Gradient (refined) =======================
+    st.dataframe(out, use_container_width=True)
+    st.caption("CAR = class-aware reliability: blends Steadiness (MV), Rebound (RC) and Class (PI/GCI). "
+               "High CAR → repeatable pattern you can trust; low CAR → fragile/shape-dependent.")
+    # ======================= /R&V (CAR) =======================
 
-# ======================= PWR400 MODULE — Late Power under Load (400m) =======================
-# Pure power lens: last 400m speed + weight, no efficiency.
-# PWR400 = distance-aware blend of Speed Index (S400) and Weight Index (W_idx).
-# Uses "Horse Weight" as carried kg and renders its own Streamlit table.
+if _view_is("Advanced Models", "Full Report"):
+    # ======================= xWin — Probability to Win (100-replay view) =======================
+    st.markdown("## xWin — Probability to Win")
 
-import numpy as np
-import pandas as pd
-import streamlit as st
+    XW = metrics.copy()
+    gr_col = metrics.attrs.get("GR_COL", "Grind")
+    D_m    = float(race_distance_input)
+    RSI    = float(metrics.attrs.get("RSI", 0.0))        # + slow-early, − fast-early
+    SCI    = float(metrics.attrs.get("SCI", 0.0))        # 0..1 (shape consensus)
+    going  = str(metrics.attrs.get("GOING", "Good"))
 
-def compute_pwr400(
-    df: pd.DataFrame,
-    distance_m: float,
-    step: int,
-    weight_col: str = "Horse Weight"
-) -> pd.DataFrame:
-    """
-    Compute PWR400 (Late Power Index over last 400m):
+    # ---------- helpers ----------
+    def _clip(x, lo, hi):
+        try:
+            x = float(x); 
+            return lo if x < lo else (hi if x > hi else x)
+        except:
+            return lo
 
-      • S400      = Speed Index over last 400m (median = 100)
-      • W_idx     = Weight Index (field-relative carried weight, median = 100)
-      • alpha(D)  = distance-aware weight importance
-      • PWR400_raw = S400 + alpha(D) * (W_idx - 100)
-      • PWR400    = PWR400_raw reindexed so race median = 100
+    def _lerp(a, b, t): 
+        t = _clip(t, 0.0, 1.0)
+        return a + (b - a) * t
 
-    step = split size (100 or 200).
-    distance_m = race distance in meters.
-    """
+    def _winsor(s: pd.Series, p=0.02):
+        s = pd.to_numeric(s, errors="coerce")
+        lo, hi = s.quantile(p), s.quantile(1-p)
+        return s.clip(lower=lo, upper=hi)
 
-    w = df.copy()
-    step = int(step)
-    D = float(distance_m)
+    def _robust_z(s: pd.Series):
+        """Median / MAD z-score; clipped to ±3 for stability."""
+        x  = _winsor(pd.to_numeric(s, errors="coerce"))
+        mu = np.nanmedian(x)
+        sd = mad_std(x)
+        if not np.isfinite(sd) or sd <= 0:
+            z = (x - mu) / 1.0
+        else:
+            z = (x - mu) / sd
+        return z.clip(-3.0, 3.0)
 
-    # ---------- 1. Last-400m time & speed (v400) ----------
-    fin = pd.to_numeric(w.get("Finish_Time"), errors="coerce")
+    def _weights_for_distance(dm):
+        """Distance-aware weights for Travel/Kick/Sustain (sum=1 before going tweak)."""
+        dm = float(dm)
+        knots = [
+            (1000, dict(T=0.30, K=0.45, S=0.25)),   # sprints → K heavier
+            (1200, dict(T=0.30, K=0.40, S=0.30)),
+            (1400, dict(T=0.32, K=0.36, S=0.32)),
+            (1600, dict(T=0.34, K=0.32, S=0.34)),
+            (1800, dict(T=0.36, K=0.28, S=0.36)),
+            (2000, dict(T=0.38, K=0.25, S=0.37)),
+            (2400, dict(T=0.40, K=0.22, S=0.38)),   # staying → S heavier
+        ]
+        if dm <= knots[0][0]: return knots[0][1]
+        if dm >= knots[-1][0]: return knots[-1][1]
+        for (a_dm, a_w), (b_dm, b_w) in zip(knots, knots[1:]):
+            if a_dm <= dm <= b_dm:
+                t = (dm - a_dm) / (b_dm - a_dm)
+                return {k: _lerp(a_w[k], b_w[k], t) for k in a_w}
+        return knots[-1][1]
 
-    if fin.isna().all():
-        # No finish times → can't do anything
-        w["PWR400_v400"] = np.nan
-        w["PWR400_SIdx"] = np.nan
-        w["PWR400_WIdx"] = np.nan
-        w["PWR400_raw"]  = np.nan
-        w["PWR400"]      = np.nan
-        w.attrs["PWR400_NOTE"] = {"error": "Missing Finish_Time"}
+    def _apply_going_nudge(w, going_str, field_n=12):
+        """Small surface/going tweak; renormalises to 1."""
+        w = w.copy()
+        scale = min(1.0, max(1, int(field_n)) / 12.0)
+        if going_str == "Firm":
+            w["K"] *= (1.00 + 0.04*scale)
+            w["T"] *= (1.00 + 0.02*scale)
+            w["S"] *= (1.00 - 0.04*scale)
+        elif going_str in ("Soft","Heavy"):
+            amp = 0.05 if going_str == "Soft" else 0.08
+            w["S"] *= (1.00 + amp*scale)
+            w["T"] *= (1.00 + 0.02*scale)
+            w["K"] *= (1.00 - amp*scale)
+        S = sum(w.values()) or 1.0
+        for k in w: w[k] /= S
         return w
 
-    # Build last-400m time
-    if step == 200:
-        # Preferred: 400 + Finish (400m window)
-        if "200_Time" in w.columns:
-            t400 = pd.to_numeric(w["200_Time"], errors="coerce")
-            t_last400 = t400 + fin
-            source = "200_Time + Finish_Time"
-        else:
-            # Fallback: only Finish_Time available (best-effort; effectively 200m)
-            t_last400 = fin.copy()
-            source = "Finish_Time only (fallback; <400m)"
-    else:
-        # 100m splits: sum last four 100m segments where available
-        segs = []
-        used_cols = []
-        for col in ["300_Time", "200_Time", "100_Time", "Finish_Time"]:
-            if col in w.columns:
-                segs.append(pd.to_numeric(w[col], errors="coerce"))
-                used_cols.append(col)
-        if segs:
-            t_last400 = sum(segs)
-            source = " + ".join(used_cols)
-        else:
-            t_last400 = fin.copy()
-            source = "Finish_Time only (fallback)"
+    def _temperature(N, accel, grind, dm, tfs_plus=None):
+        """
+        Race 'temperature' τ for softmax: lower = sharper probs (decisive ability gaps),
+        higher = flatter probs (chaos, bunching, traffic).
+        """
+        N = max(1, int(N))
 
-    t_last400 = t_last400.where(t_last400 > 0, np.nan)
+        def _mad01(s):
+            s = pd.to_numeric(s, errors="coerce")
+            d = mad_std(s)
+            if not np.isfinite(d): return 0.0
+            # ~ 1σ ~ 4–5 idx pts → map near 1.0
+            return float(min(1.0, d / 4.5))
 
-    v400 = 400.0 / t_last400
-    v400 = v400.replace([np.inf, -np.inf], np.nan)
-    w["PWR400_v400"] = v400
+        d_ac  = _mad01(accel)
+        d_gr  = _mad01(grind)
+        base  = 0.95
+        size_adj = -0.04*np.log1p(N)                    # bigger fields → lower τ
+        disp_adj = -0.16*(0.5*d_ac + 0.5*d_gr)          # clear sectional separation → lower τ
+        dist_adj = (0.04 if dm <= 1100 else (0.00 if dm <= 1800 else -0.02))
+        tfs_adj  = 0.0
+        if tfs_plus is not None:
+            # more widespread friction → noisier replays → higher τ
+            tp = pd.to_numeric(tfs_plus, errors="coerce").fillna(0.0)
+            tfs_adj = 0.08 * float(np.clip(np.nanmean(np.maximum(0.0, (tp - 0.2)/0.4)), 0.0, 1.0))
 
-    # ---------- 2. Convert speed to km/h ----------
-    # 400 meters = 0.4 km
-    # t_hours = t_seconds / 3600
-    v400_kmh = 0.4 / (t_last400 / 3600.0)
-    v400_kmh = v400_kmh.replace([np.inf, -np.inf], np.nan)
-    w["PWR400_v400"] = v400_kmh
+        tau = base + size_adj + disp_adj + dist_adj + tfs_adj
+        return float(_clip(tau, 0.55, 1.15))
 
-    # ---------- 3. Speed Index from km/h ----------
-    v_med = float(np.nanmedian(v400_kmh))
-    if np.isfinite(v_med) and v_med > 0:
-        w["PWR400_SIdx"] = 100.0 * (v400_kmh / v_med)
-    else:
-        w["PWR400_SIdx"] = np.nan
-
-    # ---------- 4. Weight Index W_idx (field-relative carried weight) ----------
-    W = pd.to_numeric(w.get(weight_col), errors="coerce")
-    W = W.where(W > 0, np.nan)
-
-    if W.notna().any():
-        W_med = float(np.nanmedian(W))
-        if np.isfinite(W_med) and W_med > 0:
-            w["PWR400_WIdx"] = 100.0 * (W / W_med)
-        else:
-            w["PWR400_WIdx"] = np.nan
-    else:
-        W_med = np.nan
-        w["PWR400_WIdx"] = np.nan
-
-    # ---------- 5. Distance-aware alpha(D) ----------
-    # Linear Option A:
-    #   alpha(D) = 0.20 + 0.00025 * (D - 1000), clamped to [0.20, 0.70]
-    alpha = 0.20 + 0.00025 * (D - 1000.0)
-    alpha = max(0.20, min(0.70, alpha))
-
-    # ---------- 6. Raw Power score & indexed PWR400 ----------
-    S400 = pd.to_numeric(w["PWR400_SIdx"], errors="coerce")
-    Widx = pd.to_numeric(w["PWR400_WIdx"], errors="coerce")
-
-    # Need both indices to build raw power
-    mask_valid = S400.notna() & Widx.notna()
-    PWR_raw = pd.Series(np.nan, index=w.index, dtype=float)
-    PWR_raw[mask_valid] = S400[mask_valid] + alpha * (Widx[mask_valid] - 100.0)
-
-    w["PWR400_raw"] = PWR_raw
-
-    raw_med = float(np.nanmedian(PWR_raw))
-    if np.isfinite(raw_med) and raw_med > 0:
-        w["PWR400"] = 100.0 * (PWR_raw / raw_med)
-    else:
-        w["PWR400"] = np.nan
-
-    # ---------- 7. Metadata for UI / PDF / DB ----------
-    w.attrs["PWR400_NOTE"] = {
-        "desc": "PWR400 = distance-aware late power: Speed Index (last 400m) + alpha(D) × (Weight Index − 100); race median = 100.",
-        "distance_m": int(D),
-        "alpha": round(alpha, 4),
-        "weight_col": weight_col,
-        "v400_source": source,
-        "v400_med": round(v_med, 5) if np.isfinite(v_med) else None,
-        "W_med": round(W_med, 3) if np.isfinite(W_med) else None,
-    }
-
-    return w
-
-
-def render_pwr400_table(df: pd.DataFrame):
-    """
-    Render the standalone PWR400 table in Streamlit.
-    """
-
-    note = df.attrs.get("PWR400_NOTE", {}) or {}
-    if "error" in note:
-        st.markdown("## Late Power Index — **PWR400**")
-        st.warning(f"PWR400 could not be computed: {note.get('error')}")
-        return
-
-    trip = note.get("distance_m", None)
-    alpha = note.get("alpha", None)
-    v_src = note.get("v400_source", "last 400m window")
-    weight_col = note.get("weight_col", "Horse Weight")
-
-    st.markdown("## Late Power Index — **PWR400** (Last 400m under Load)")
-    if trip and alpha is not None:
-        st.caption(
-            f"Blend of Speed Index (last 400m) and Weight Index with distance-aware α. "
-            f"Trip: **{trip}m**, α ≈ **{alpha:.3f}**, v₄₀₀ window: **{v_src}**, weight: **{weight_col}**."
-        )
-    else:
-        st.caption("Blend of Speed Index (last 400m) and Weight Index with distance-aware α. Median PWR400 = 100.")
-
-    # Build display columns
-    cols = []
-    for c in [
-        "Horse", "Finish_Pos",
-        weight_col,
-        "PWR400_v400",
-        "PWR400"
-    ]:
-        if c in df.columns:
-            cols.append(c)
-
-    if not cols:
-        st.info("No PWR400 columns to display.")
-        return
-
-    show = df.copy()
-    if "PWR400" in show.columns:
-        show = show.sort_values("PWR400", ascending=False)
-
-    st.dataframe(show[cols], use_container_width=True)
-    st.caption(
-        "Interpretation: PWR400 ≈ 100 = typical late power for this field; 110+ = strong late engine under meaningful weight; "
-        "90–95 = weak late power."
-    )
-
-# ======================= /PWR400 MODULE =======================
-
-# ======================= MODULE INVOCATION EXAMPLE =======================
-# Call this AFTER you have `metrics`, `race_distance_input`, and `split_step` available.
-
-try:
-    metrics = compute_pwr400(
-        metrics,
-        float(race_distance_input),
-        int(split_step),
-        weight_col="Horse Weight"  # adjust if your column name differs
-    )
-    render_pwr400_table(metrics)
-except Exception as e:
-    st.warning("PWR400 module failed.")
-    st.exception(e)
-# ======================= /INVOCATION EXAMPLE =======================
-
-# ======================= Visual: Power–Freshness Map (PWR400 vs Fatigue) =======================
-import matplotlib.pyplot as plt
-from matplotlib.colors import TwoSlopeNorm
-from matplotlib.patches import Rectangle
-from matplotlib.lines import Line2D
-import numpy as np
-import io
-
-st.markdown("## Power–Freshness Map — Late Power vs Fatigue")
-
-# We need from the modules:
-#   metrics: Horse, PI, PWR400
-#   _ftab:   Horse, FatigueScore, Tag   (from build_fatigue_table_refined)
-need_p  = {"Horse", "PI", "PWR400"}
-need_fg = {"Horse", "FatigueScore", "Tag"}
-
-missing_p  = need_p  - set(metrics.columns)
-missing_fg = need_fg - set(_ftab.columns)
-
-if missing_p:
-    st.warning(
-        "Power–Freshness Map: metrics missing columns: "
-        + ", ".join(sorted(missing_p))
-    )
-elif missing_fg:
-    st.warning(
-        "Power–Freshness Map: fatigue table missing columns: "
-        + ", ".join(sorted(missing_fg))
-    )
-else:
-    # Merge power + PI with fatigue table
-    dfm = metrics.loc[:, ["Horse", "PI", "PWR400"]].merge(
-        _ftab.loc[:, ["Horse", "FatigueScore", "Tag"]],
-        on="Horse",
-        how="inner",
-    )
-
-    # numeric casting
-    for c in ["PI", "PWR400", "FatigueScore"]:
-        dfm[c] = pd.to_numeric(dfm[c], errors="coerce")
-
-    dfm = dfm.dropna(subset=["PWR400", "FatigueScore"])
-    if dfm.empty:
-        st.info("Not enough overlapping data to draw the Power–Freshness Map.")
-    else:
-        # ----- Axes -----
-        # X: PWR400Δ = PWR400 - race median (late power vs field)
-        pwr_med = float(np.nanmedian(dfm["PWR400"]))
-        dfm["PWR400Δ"] = dfm["PWR400"] - pwr_med
-
-        # Y: Freshness = -FatigueScore  (higher = stronger late / less fatigue)
-        dfm["Freshness"] = -dfm["FatigueScore"]
-
-        names = dfm["Horse"].astype(str).to_list()
-        xv = dfm["PWR400Δ"].to_numpy()
-        yv = dfm["Freshness"].to_numpy()
-
-        # ----- Colour: map Tag → numeric, for a centred colour scale -----
-        # late engine → +8, balanced/neutral → 0, front-spent → -8
-        tag_map = {
-            "late engine": 3.0,
-            "balanced": 0.0,
-            "neutral": 0.0,
-            "front-spent": -3.0,
-        }
-        dfm["TagVal"] = dfm["Tag"].map(tag_map).fillna(0.0)
-        cv = dfm["TagVal"].to_numpy()
-
-        # ----- Dot sizes from PI (same logic as Shape Map) -----
-        DOT_MIN, DOT_MAX = 40.0, 140.0
-        piv = dfm["PI"].fillna(0).to_numpy()
-        pmin, pmax = np.nanmin(piv), np.nanmax(piv)
-        if (not np.isfinite(pmin)) or (not np.isfinite(pmax)) or pmin == pmax:
-            sizes = np.full_like(xv, DOT_MIN)
-        else:
-            sizes = DOT_MIN + (piv - pmin) / (pmax - pmin + 1e-9) * (DOT_MAX - DOT_MIN)
-
-        # ----- Limits & quadrant tints -----
-        span = max(4.5, float(np.nanmax(np.abs(np.concatenate([xv, yv])))))
-        lim = np.ceil(span / 1.5) * 1.5
-
-        fig, ax = plt.subplots(figsize=(7.8, 6.2))
-
-        TINT = 0.12
-        # Quadrant meanings:
-        #   Q1 (+X, +Y): Big engine & stays on  → "Monsters"
-        #   Q2 (-X, +Y): Efficient grinders     → "Strong late, modest power"
-        #   Q3 (+X, -Y): Fragile engines        → "Power but fatigued"
-        #   Q4 (-X, -Y): Weak & spent          → "Dead zone"
-        ax.add_patch(Rectangle((0, 0),       lim,  lim, facecolor="#4daf4a", alpha=TINT, zorder=0))
-        ax.add_patch(Rectangle((-lim, 0),    lim,  lim, facecolor="#377eb8", alpha=TINT, zorder=0))
-        ax.add_patch(Rectangle((0, -lim),    lim,  lim, facecolor="#ff7f00", alpha=TINT, zorder=0))
-        ax.add_patch(Rectangle((-lim, -lim), lim,  lim, facecolor="#984ea3", alpha=TINT, zorder=0))
-
-        ax.axvline(0, color="gray", lw=1.3, ls=(0, (3, 3)), zorder=1)
-        ax.axhline(0, color="gray", lw=1.3, ls=(0, (3, 3)), zorder=1)
-
-        # Colour scale centred at 0 (balanced)
-        norm = TwoSlopeNorm(vcenter=0.0, vmin=-1.0, vmax=1.0)
-
-        sc = ax.scatter(
-            xv, yv,
-            s=sizes,
-            c=cv,
-            cmap="coolwarm",
-            norm=norm,
-            edgecolor="black",
-            linewidth=0.6,
-            alpha=0.95,
-        )
-
-        # Labels
-        label_points_neatly(ax, xv, yv, names)
-
-        ax.set_xlim(-lim, lim)
-        ax.set_ylim(-lim, lim)
-        ax.set_xlabel("PWR400 − field median (late power under load) →")
-        ax.set_ylabel("Freshness (−FatigueScore) ↑  — higher = stronger late / less fade")
-        ax.set_title("Power–Freshness Map: late power vs fatigue  ·  Size = PI  ·  Colour = Fatigue Tag")
-
-        # Size legend (PI bands)
-        s_ex = [DOT_MIN, 0.5 * (DOT_MIN + DOT_MAX), DOT_MAX]
-        h_ex = [
-            Line2D(
-                [0], [0],
-                marker="o",
-                color="w",
-                markerfacecolor="gray",
-                markersize=np.sqrt(s / np.pi),
-                markeredgecolor="black",
-            )
-            for s in s_ex
-        ]
-        ax.legend(
-            h_ex,
-            ["PI low", "PI mid", "PI high"],
-            loc="upper left",
-            frameon=False,
-            fontsize=8,
-        )
-
-        # Colourbar for fatigue tag
-        cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-        cbar.set_label("Fatigue Tag (−3 front-spent · 0 balanced/neutral · +3 late engine)")
-
-        ax.grid(True, linestyle=":", alpha=0.25)
-        st.pyplot(fig)
-
-        # PNG download
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=300, bbox_inches="tight")
-        powfresh_png = buf.getvalue()
-        st.download_button(
-            "Download Power–Freshness Map (PNG)",
-            powfresh_png,
-            file_name="power_freshness_map.png",
-            mime="image/png",
-        )
-        st.caption(
-            "X = PWR400 vs field (late power under load); "
-            "Y = −FatigueScore (freshness, higher = stronger late); "
-            "Colour = fatigue tag; Size = PI."
-        )
-# ======================= /Power–Freshness Map =======================
-
-# ======================= R&V (CAR) — Context-Aware Reliability =======================
-st.markdown("## R&V — Context-Aware Reliability (CAR)")
-
-import numpy as np
-import pandas as pd
-
-df = metrics.copy()
-
-# ---------- Small robust helpers ----------
-def _nz(x, alt=0.0):
-    try:
-        v = float(x)
-        return v if np.isfinite(v) else alt
-    except Exception:
-        return alt
-
-def _winsor(s: pd.Series, q: float = 0.02):
-    s = pd.to_numeric(s, errors="coerce")
-    lo, hi = s.quantile(q), s.quantile(1 - q)
-    return s.clip(lo, hi)
-
-def _mad(x: np.ndarray):
-    x = np.asarray(x, dtype=float)
-    x = x[np.isfinite(x)]
-    if x.size == 0: return np.nan
-    med = np.median(x)
-    mad = np.median(np.abs(x - med))
-    return 1.4826 * mad
-
-def _robust01(s: pd.Series):
-    """Percentile rank 0–1 using median/MAD for stability."""
-    s = pd.to_numeric(s, errors="coerce")
-    finite = s[np.isfinite(s)]
-    if finite.empty:
-        return pd.Series(0.5, index=s.index)
-    # rank to 0..1
-    r = finite.rank(method="average", pct=True)
-    out = pd.Series(np.nan, index=s.index)
-    out.loc[finite.index] = r
-    return out.fillna(0.5)
-
-# ---------- If MV / RC not present, compute light versions from splits (exclude first) ----------
-have_MV = "MV" in df.columns
-have_RC = "RC" in df.columns
-
-def _collect_time_cols(_work: pd.DataFrame):
-    # Any '*_Time' plus optional 'Finish_Time'
-    tcols = [c for c in _work.columns if c.endswith("_Time")]
-    # order columns by numeric end marker; keep Finish at the end
-    def _key(c):
-        if c == "Finish_Time": return (10**9)
+    def _to_fractional_odds(p):
+        """p in [0,1] → 'x.y/1' (fair fractional style)."""
         try:
-            return int(c.split("_")[0])
-        except Exception:
-            return 10**8
-    tcols = sorted([c for c in tcols if c != "Finish_Time"], key=_key) + (["Finish_Time"] if "Finish_Time" in _work.columns else [])
-    return tcols
+            p = float(p)
+            if p <= 0: return "-"
+            dec = 1.0 / p
+            frac = dec - 1.0
+            return f"{frac:.1f}/1"
+        except:
+            return "-"
 
-if not (have_MV and have_RC):
-    # Build per-horse segment speeds (m/s) from times.
-    step = int(metrics.attrs.get("STEP", 100))
-    tcols = _collect_time_cols(work)
-    # exclude the first split to avoid start noise
-    seg_cols = tcols[1:] if len(tcols) > 1 else tcols[:]
-    # guard
-    if len(seg_cols) >= 3:
-        # Compute speeds per segment length
-        seg_lens = []
-        for c in seg_cols:
-            if c == "Finish_Time":
-                seg_lens.append(float(step))
-            else:
-                # infer length from column gap; safe default = step
-                seg_lens.append(float(step))
-        seg_lens = np.asarray(seg_lens, dtype=float)
+    # ---------- ensure inputs ----------
+    for c in ["tsSPI","Accel",gr_col,"F200_idx","PI"]:
+        if c not in XW.columns: XW[c] = np.nan
 
-        # Make a small speed matrix (rows=horses, cols=segments)
-        # Join by horse where possible
-        w = work.copy()
-        if "Horse" in w.columns and "Horse" in df.columns:
-            w = w.set_index("Horse").reindex(df["Horse"]).reset_index()
+    # ---------- robust sectionals → within-race latent ability (z) ----------
+    zT = _robust_z(XW["tsSPI"])   # Travel
+    zK = _robust_z(XW["Accel"])   # Kick
+    zS = _robust_z(XW[gr_col])    # Sustain
 
-        spd = []
-        for _, r in w.iterrows():
-            times = pd.to_numeric(r[seg_cols], errors="coerce").to_numpy()
-            with np.errstate(divide="ignore", invalid="ignore"):
-                v = seg_lens / times
-            # ignore 0/neg/inf
-            v[~np.isfinite(v)] = np.nan
-            spd.append(v)
-        spd = np.asarray(spd, dtype=float)  # shape (N_horse, N_seg)
+    # pace legitimacy guard (if race crawled mid, trim Travel influence a bit)
+    ts_med = pd.to_numeric(XW["tsSPI"], errors="coerce").median(skipna=True)
+    trim_T = 0.0
+    if np.isfinite(ts_med) and ts_med < 100.0:
+        trim_T = min(0.20, max(0.0, (100.0 - ts_med) / 10.0))  # up to 20%
+    zT_eff = zT * (1.0 - trim_T)
 
-        # Trim to segments that have at least some data
-        valid_mask = np.isfinite(spd).sum(axis=0) >= 2
-        spd = spd[:, valid_mask]
-        # After trim, require at least 3 segments
-        if spd.shape[1] >= 3:
-            # Fill nan per row with row-median to keep variability meaningful
-            row_med = np.nanmedian(spd, axis=1, keepdims=True)
-            spd_f = np.where(np.isfinite(spd), spd, row_med)
+    # ---------- distance + going weights ----------
+    W = _weights_for_distance(D_m)               # {'T','K','S'}
+    W = _apply_going_nudge(W, going, field_n=len(XW))
 
-            # MV_raw: variability across segments (lower = steadier).
-            # use coefficient of variation via MAD for robustness.
-            med = np.nanmedian(spd_f, axis=1)
-            mad = np.array([_mad(spd_f[i, :]) for i in range(spd_f.shape[0])])
-            with np.errstate(divide="ignore", invalid="ignore"):
-                mv_raw = mad / np.where(med > 0, med, np.nan)
-            mv_raw = pd.Series(mv_raw, index=df.index)
+    # ---------- shape de-bias (KSI proxy) ----------
+    # Positive when horse ran AGAINST prevailing shape; negative when WITH shape
+    ksi_raw = -np.sign(RSI) * (pd.to_numeric(XW["Accel"], errors="coerce") - pd.to_numeric(XW["tsSPI"], errors="coerce"))
+    ksi01   = np.tanh((ksi_raw / 6.0).fillna(0.0))        # ~[-1..+1]
+    shape_boost = 0.15 * np.clip(ksi01, 0, 1) * SCI       # up to +15% (against)
+    shape_damp  = 0.08 * np.clip(-ksi01, 0, 1) * SCI      # up to −8%  (with)
 
-            # RC_raw: rebound coefficient — late strength vs late trough.
-            # Find trough over the last ~half of race, compare to mean of final 2 segments.
-            H, S = spd_f.shape
-            late_start = max(1, S // 2)
-            trough = np.nanargmin(np.nanmedian(spd_f[:, late_start:], axis=0)) + late_start  # index in [late_start..S-1]
-            tail = np.nanmean(spd_f[:, max(S-2, 0):S], axis=1)
-            base = spd_f[:, trough]
-            with np.errstate(divide="ignore", invalid="ignore"):
-                rc_raw = tail / np.where(base > 0, base, np.nan)
-            rc_raw = pd.Series(rc_raw, index=df.index)
-
-            if not have_MV: df["MV"] = mv_raw
-            if not have_RC: df["RC"] = rc_raw
-
-# ---------- Core normalisations ----------
-mv = _winsor(df.get("MV", pd.Series(np.nan, index=df.index)), q=0.02)
-rc = _winsor(df.get("RC", pd.Series(np.nan, index=df.index)), q=0.02)
-
-# Lower MV is better -> invert after normalising; Higher RC is better.
-mv01 = 1.0 - _robust01(mv)     # steadiness (0..1, higher = steadier)
-rc01 = _robust01(rc)           # rebound (0..1, higher = more kick late)
-
-# Class lens: use PI if available, else GCI
-if "PI" in df.columns and pd.to_numeric(df["PI"], errors="coerce").notna().any():
-    cls = _winsor(pd.to_numeric(df["PI"], errors="coerce"), q=0.02)
-else:
-    cls = _winsor(pd.to_numeric(df.get("GCI", np.nan), errors="coerce"), q=0.02)
-
-cls01 = _robust01(cls)
-
-# ---------- Class-aware blending (CAR) ----------
-# More tolerance for variability when class is high
-mv_term = np.power(mv01, 1.0 - 0.35*cls01)            # elite horses keep more of their steadiness score
-rc_term = rc01 * (1.0 + 0.25*cls01)                   # elite kick counts a bit extra
-
-CAR = 10.0 * (0.45*mv_term + 0.35*rc_term + 0.20*cls01)
-CAR = np.clip(CAR, 0.0, 10.0)
-
-# ---------- Risk tag ----------
-def _risk_tag(car):
-    if not np.isfinite(car): return "None"
-    if car >= 8.0:  return "Reliable"
-    if car >= 6.0:  return "Mostly reliable"
-    if car >= 4.0:  return "Variable"
-    return "Fragile"
-
-tags = [ _risk_tag(v) for v in CAR ]
-
-# ---------- Output table ----------
-out = pd.DataFrame({
-    "Horse": df["Horse"],
-    "R&V": np.round(CAR, 2),
-    "Risk Tag": tags,
-    "MV (↓ steadier)": np.round(pd.to_numeric(df.get("MV", np.nan), errors="coerce"), 3),
-    "RC (↑ better rebound)": np.round(pd.to_numeric(df.get("RC", np.nan), errors="coerce"), 3),
-})
-
-# Add PI for context if present
-if "PI" in df.columns:
-    out["PI"] = np.round(pd.to_numeric(df["PI"], errors="coerce"), 2)
-elif "GCI" in df.columns:
-    out["GCI"] = np.round(pd.to_numeric(df["GCI"], errors="coerce"), 2)
-
-# Sort by most reliable first, then strongest class
-sort_cols = ["R&V"]
-if "PI" in out.columns: sort_cols += ["PI"]
-elif "GCI" in out.columns: sort_cols += ["GCI"]
-out = out.sort_values(sort_cols, ascending=[False] + [False]*(len(sort_cols)-1), kind="mergesort").reset_index(drop=True)
-
-st.dataframe(out, use_container_width=True)
-st.caption("CAR = class-aware reliability: blends Steadiness (MV), Rebound (RC) and Class (PI/GCI). "
-           "High CAR → repeatable pattern you can trust; low CAR → fragile/shape-dependent.")
-# ======================= /R&V (CAR) =======================
-
-# ======================= xWin — Probability to Win (100-replay view) =======================
-st.markdown("## xWin — Probability to Win")
-
-XW = metrics.copy()
-gr_col = metrics.attrs.get("GR_COL", "Grind")
-D_m    = float(race_distance_input)
-RSI    = float(metrics.attrs.get("RSI", 0.0))        # + slow-early, − fast-early
-SCI    = float(metrics.attrs.get("SCI", 0.0))        # 0..1 (shape consensus)
-going  = str(metrics.attrs.get("GOING", "Good"))
-
-# ---------- helpers ----------
-def _clip(x, lo, hi):
+    # ---------- trip friction (from Hidden Horses if present) ----------
+    tfs_plus = None
     try:
-        x = float(x); 
-        return lo if x < lo else (hi if x > hi else x)
-    except:
-        return lo
+        if 'hh' in locals() and "TFS_plus" in hh.columns and "Horse" in XW.columns:
+            tmp = hh[["Horse","TFS_plus"]].copy()
+            XW = XW.merge(tmp, on="Horse", how="left")
+            tfs_plus = pd.to_numeric(XW["TFS_plus"], errors="coerce").fillna(0.0)
+    except Exception:
+        pass
+    if tfs_plus is None:
+        tfs_plus = pd.Series(0.0, index=XW.index)
 
-def _lerp(a, b, t): 
-    t = _clip(t, 0.0, 1.0)
-    return a + (b - a) * t
+    # harsher in sprints, softer in staying trips
+    if D_m <= 1400:   tfs_cap = 0.12
+    elif D_m >= 1800: tfs_cap = 0.08
+    else:             tfs_cap = _lerp(0.12, 0.08, (D_m-1400)/400.0)
+    tfs_pen = np.minimum(tfs_cap, np.maximum(0.0, (tfs_plus - 0.2)/0.4))
 
-def _winsor(s: pd.Series, p=0.02):
-    s = pd.to_numeric(s, errors="coerce")
-    lo, hi = s.quantile(p), s.quantile(1-p)
-    return s.clip(lower=lo, upper=hi)
+    # ---------- core latent score (no history; pure one-run) ----------
+    # small optional stability from sectionals dispersion (SOS-like)
+    sos = (0.45*zT + 0.35*zK + 0.20*zS).fillna(0.0)
+    sos01 = ((sos - np.nanpercentile(sos, 5)) /
+             max(1e-9, (np.nanpercentile(sos,95) - np.nanpercentile(sos,5))))
+    sos01 = sos01.clip(0, 1)
 
-def _robust_z(s: pd.Series):
-    """Median / MAD z-score; clipped to ±3 for stability."""
-    x  = _winsor(pd.to_numeric(s, errors="coerce"))
-    mu = np.nanmedian(x)
-    sd = mad_std(x)
-    if not np.isfinite(sd) or sd <= 0:
-        z = (x - mu) / 1.0
-    else:
-        z = (x - mu) / sd
-    return z.clip(-3.0, 3.0)
-
-def _weights_for_distance(dm):
-    """Distance-aware weights for Travel/Kick/Sustain (sum=1 before going tweak)."""
-    dm = float(dm)
-    knots = [
-        (1000, dict(T=0.30, K=0.45, S=0.25)),   # sprints → K heavier
-        (1200, dict(T=0.30, K=0.40, S=0.30)),
-        (1400, dict(T=0.32, K=0.36, S=0.32)),
-        (1600, dict(T=0.34, K=0.32, S=0.34)),
-        (1800, dict(T=0.36, K=0.28, S=0.36)),
-        (2000, dict(T=0.38, K=0.25, S=0.37)),
-        (2400, dict(T=0.40, K=0.22, S=0.38)),   # staying → S heavier
-    ]
-    if dm <= knots[0][0]: return knots[0][1]
-    if dm >= knots[-1][0]: return knots[-1][1]
-    for (a_dm, a_w), (b_dm, b_w) in zip(knots, knots[1:]):
-        if a_dm <= dm <= b_dm:
-            t = (dm - a_dm) / (b_dm - a_dm)
-            return {k: _lerp(a_w[k], b_w[k], t) for k in a_w}
-    return knots[-1][1]
-
-def _apply_going_nudge(w, going_str, field_n=12):
-    """Small surface/going tweak; renormalises to 1."""
-    w = w.copy()
-    scale = min(1.0, max(1, int(field_n)) / 12.0)
-    if going_str == "Firm":
-        w["K"] *= (1.00 + 0.04*scale)
-        w["T"] *= (1.00 + 0.02*scale)
-        w["S"] *= (1.00 - 0.04*scale)
-    elif going_str in ("Soft","Heavy"):
-        amp = 0.05 if going_str == "Soft" else 0.08
-        w["S"] *= (1.00 + amp*scale)
-        w["T"] *= (1.00 + 0.02*scale)
-        w["K"] *= (1.00 - amp*scale)
-    S = sum(w.values()) or 1.0
-    for k in w: w[k] /= S
-    return w
-
-def _temperature(N, accel, grind, dm, tfs_plus=None):
-    """
-    Race 'temperature' τ for softmax: lower = sharper probs (decisive ability gaps),
-    higher = flatter probs (chaos, bunching, traffic).
-    """
-    N = max(1, int(N))
-
-    def _mad01(s):
-        s = pd.to_numeric(s, errors="coerce")
-        d = mad_std(s)
-        if not np.isfinite(d): return 0.0
-        # ~ 1σ ~ 4–5 idx pts → map near 1.0
-        return float(min(1.0, d / 4.5))
-
-    d_ac  = _mad01(accel)
-    d_gr  = _mad01(grind)
-    base  = 0.95
-    size_adj = -0.04*np.log1p(N)                    # bigger fields → lower τ
-    disp_adj = -0.16*(0.5*d_ac + 0.5*d_gr)          # clear sectional separation → lower τ
-    dist_adj = (0.04 if dm <= 1100 else (0.00 if dm <= 1800 else -0.02))
-    tfs_adj  = 0.0
-    if tfs_plus is not None:
-        # more widespread friction → noisier replays → higher τ
-        tp = pd.to_numeric(tfs_plus, errors="coerce").fillna(0.0)
-        tfs_adj = 0.08 * float(np.clip(np.nanmean(np.maximum(0.0, (tp - 0.2)/0.4)), 0.0, 1.0))
-
-    tau = base + size_adj + disp_adj + dist_adj + tfs_adj
-    return float(_clip(tau, 0.55, 1.15))
-
-def _to_fractional_odds(p):
-    """p in [0,1] → 'x.y/1' (fair fractional style)."""
-    try:
-        p = float(p)
-        if p <= 0: return "-"
-        dec = 1.0 / p
-        frac = dec - 1.0
-        return f"{frac:.1f}/1"
-    except:
-        return "-"
-
-# ---------- ensure inputs ----------
-for c in ["tsSPI","Accel",gr_col,"F200_idx","PI"]:
-    if c not in XW.columns: XW[c] = np.nan
-
-# ---------- robust sectionals → within-race latent ability (z) ----------
-zT = _robust_z(XW["tsSPI"])   # Travel
-zK = _robust_z(XW["Accel"])   # Kick
-zS = _robust_z(XW[gr_col])    # Sustain
-
-# pace legitimacy guard (if race crawled mid, trim Travel influence a bit)
-ts_med = pd.to_numeric(XW["tsSPI"], errors="coerce").median(skipna=True)
-trim_T = 0.0
-if np.isfinite(ts_med) and ts_med < 100.0:
-    trim_T = min(0.20, max(0.0, (100.0 - ts_med) / 10.0))  # up to 20%
-zT_eff = zT * (1.0 - trim_T)
-
-# ---------- distance + going weights ----------
-W = _weights_for_distance(D_m)               # {'T','K','S'}
-W = _apply_going_nudge(W, going, field_n=len(XW))
-
-# ---------- shape de-bias (KSI proxy) ----------
-# Positive when horse ran AGAINST prevailing shape; negative when WITH shape
-ksi_raw = -np.sign(RSI) * (pd.to_numeric(XW["Accel"], errors="coerce") - pd.to_numeric(XW["tsSPI"], errors="coerce"))
-ksi01   = np.tanh((ksi_raw / 6.0).fillna(0.0))        # ~[-1..+1]
-shape_boost = 0.15 * np.clip(ksi01, 0, 1) * SCI       # up to +15% (against)
-shape_damp  = 0.08 * np.clip(-ksi01, 0, 1) * SCI      # up to −8%  (with)
-
-# ---------- trip friction (from Hidden Horses if present) ----------
-tfs_plus = None
-try:
-    if 'hh' in locals() and "TFS_plus" in hh.columns and "Horse" in XW.columns:
-        tmp = hh[["Horse","TFS_plus"]].copy()
-        XW = XW.merge(tmp, on="Horse", how="left")
-        tfs_plus = pd.to_numeric(XW["TFS_plus"], errors="coerce").fillna(0.0)
-except Exception:
-    pass
-if tfs_plus is None:
-    tfs_plus = pd.Series(0.0, index=XW.index)
-
-# harsher in sprints, softer in staying trips
-if D_m <= 1400:   tfs_cap = 0.12
-elif D_m >= 1800: tfs_cap = 0.08
-else:             tfs_cap = _lerp(0.12, 0.08, (D_m-1400)/400.0)
-tfs_pen = np.minimum(tfs_cap, np.maximum(0.0, (tfs_plus - 0.2)/0.4))
-
-# ---------- core latent score (no history; pure one-run) ----------
-# small optional stability from sectionals dispersion (SOS-like)
-sos = (0.45*zT + 0.35*zK + 0.20*zS).fillna(0.0)
-sos01 = ((sos - np.nanpercentile(sos, 5)) /
-         max(1e-9, (np.nanpercentile(sos,95) - np.nanpercentile(sos,5))))
-sos01 = sos01.clip(0, 1)
-
-core = (
-    W["T"] * zT_eff.fillna(0.0) +
-    W["K"] * zK.fillna(0.0)     +
-    W["S"] * zS.fillna(0.0)     +
-    0.05   * sos01.fillna(0.0)  # very light stabiliser
-)
-
-# multiplicative de-lucking: reward against-shape, damp with-shape, damp friction
-mult_adj = (1.0 + shape_boost - shape_damp) * (1.0 - tfs_pen)
-power = (core * mult_adj).fillna(0.0)
-
-# ---------- field-size shrink & temperature ----------
-N    = int(len(XW.index))
-tau  = _temperature(N, XW["Accel"], XW[gr_col], D_m, tfs_plus=tfs_plus)
-alpha = N / (N + 6.0)              # small-field shrink (same motif you use elsewhere)
-if N <= 6:
-    power = 0.90 * power           # reduce overconfidence in tiny fields
-
-# ---------- softmax → probabilities ----------
-logits   = power / max(1e-6, tau)
-mx       = float(np.nanmax(logits)) if np.isfinite(logits).any() else 0.0
-exps     = np.exp((logits - mx).clip(-50, 50))
-sum_exps = float(np.nansum(exps)) or 1.0
-probs    = (exps / sum_exps) * alpha
-probs    = probs / (probs.sum() or 1.0)     # renormalise after shrink
-
-XW["xWin"] = probs
-
-# ---------- tidy drivers ----------
-def _driver_line(r):
-    bits = []
-    # early hint
-    f200 = float(r.get("F200_idx", np.nan))
-    if np.isfinite(f200):
-        if f200 >= 101: bits.append("Quick early")
-        elif f200 <= 98: bits.append("Slower away")
-
-    # sectional pillars
-    if float(zT_eff.get(r.name, 0)) >= 0.5: bits.append("Travel +")
-    if float(zK.get(r.name,     0)) >= 0.5: bits.append("Kick ++")
-    if float(zS.get(r.name,     0)) >= 0.5: bits.append("Sustain +")
-
-    # shape cue (only if SCI decent)
-    if SCI >= 0.6:
-        k = float(ksi01.get(r.name, 0))
-        if k > 0.35:   bits.append("Against shape")
-        elif k < -0.35: bits.append("With shape")
-
-    # midrace trim note
-    if trim_T > 0: bits.append("(slow mid)")
-
-    return " · ".join(bits)
-
-XW["Drivers"] = XW.apply(_driver_line, axis=1)
-
-# ---------- view ----------
-view = XW.loc[:, ["Horse","xWin","Drivers"]].copy()
-view["xWin"] = (100.0 * view["xWin"]).round(1)
-view["Odds (≈fair)"] = XW["xWin"].apply(lambda p: _to_fractional_odds(p))
-
-view = view.sort_values("xWin", ascending=False).reset_index(drop=True)
-
-st.dataframe(
-    view.style.format({"xWin": "{:.1f}%"}),
-    use_container_width=True
-)
-
-with st.expander("xWin settings & notes"):
-    w_note = ", ".join([f"{k}:{W[k]:.2f}" for k in ["T","K","S"]])
-    st.caption(
-        f"xWin = softmax of within-race latent ability (Travel/Kick/Sustain) with distance/going weights ({w_note}), "
-        f"shape de-bias via RSI×SCI, trip friction damp, and a race 'temperature' τ={tau:.2f} from field size & dispersion. "
-        f"Interpretation: chance to win if this same race were replayed 100 times."
+    core = (
+        W["T"] * zT_eff.fillna(0.0) +
+        W["K"] * zK.fillna(0.0)     +
+        W["S"] * zS.fillna(0.0)     +
+        0.05   * sos01.fillna(0.0)  # very light stabiliser
     )
+
+    # multiplicative de-lucking: reward against-shape, damp with-shape, damp friction
+    mult_adj = (1.0 + shape_boost - shape_damp) * (1.0 - tfs_pen)
+    power = (core * mult_adj).fillna(0.0)
+
+    # ---------- field-size shrink & temperature ----------
+    N    = int(len(XW.index))
+    tau  = _temperature(N, XW["Accel"], XW[gr_col], D_m, tfs_plus=tfs_plus)
+    alpha = N / (N + 6.0)              # small-field shrink (same motif you use elsewhere)
+    if N <= 6:
+        power = 0.90 * power           # reduce overconfidence in tiny fields
+
+    # ---------- softmax → probabilities ----------
+    logits   = power / max(1e-6, tau)
+    mx       = float(np.nanmax(logits)) if np.isfinite(logits).any() else 0.0
+    exps     = np.exp((logits - mx).clip(-50, 50))
+    sum_exps = float(np.nansum(exps)) or 1.0
+    probs    = (exps / sum_exps) * alpha
+    probs    = probs / (probs.sum() or 1.0)     # renormalise after shrink
+
+    XW["xWin"] = probs
+
+    # ---------- tidy drivers ----------
+    def _driver_line(r):
+        bits = []
+        # early hint
+        f200 = float(r.get("F200_idx", np.nan))
+        if np.isfinite(f200):
+            if f200 >= 101: bits.append("Quick early")
+            elif f200 <= 98: bits.append("Slower away")
+
+        # sectional pillars
+        if float(zT_eff.get(r.name, 0)) >= 0.5: bits.append("Travel +")
+        if float(zK.get(r.name,     0)) >= 0.5: bits.append("Kick ++")
+        if float(zS.get(r.name,     0)) >= 0.5: bits.append("Sustain +")
+
+        # shape cue (only if SCI decent)
+        if SCI >= 0.6:
+            k = float(ksi01.get(r.name, 0))
+            if k > 0.35:   bits.append("Against shape")
+            elif k < -0.35: bits.append("With shape")
+
+        # midrace trim note
+        if trim_T > 0: bits.append("(slow mid)")
+
+        return " · ".join(bits)
+
+    XW["Drivers"] = XW.apply(_driver_line, axis=1)
+
+    # ---------- view ----------
+    view = XW.loc[:, ["Horse","xWin","Drivers"]].copy()
+    view["xWin"] = (100.0 * view["xWin"]).round(1)
+    view["Odds (≈fair)"] = XW["xWin"].apply(lambda p: _to_fractional_odds(p))
+
+    view = view.sort_values("xWin", ascending=False).reset_index(drop=True)
+
+    st.dataframe(
+        view.style.format({"xWin": "{:.1f}%"}),
+        use_container_width=True
+    )
+
+    with st.expander("xWin settings & notes"):
+        w_note = ", ".join([f"{k}:{W[k]:.2f}" for k in ["T","K","S"]])
+        st.caption(
+            f"xWin = softmax of within-race latent ability (Travel/Kick/Sustain) with distance/going weights ({w_note}), "
+            f"shape de-bias via RSI×SCI, trip friction damp, and a race 'temperature' τ={tau:.2f} from field size & dispersion. "
+            f"Interpretation: chance to win if this same race were replayed 100 times."
+        )
+
+
+if _view_is("Exports & Notes", "Full Report"):
+    st.markdown("## Notes & Debug")
+    with st.expander("Warnings / debug", expanded=False):
+        st.write({
+            "view": APP_VIEW,
+            "distance": race_distance_input,
+            "split_step": split_step,
+            "going": GOING_TYPE,
+            "wind": WIND_TAG,
+        })
+        if DEBUG:
+            try:
+                st.write(metrics.attrs)
+            except Exception:
+                pass
