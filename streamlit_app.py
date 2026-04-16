@@ -325,18 +325,30 @@ def _view_is(*names: str) -> bool:
 
 
 # ----------------------- RPSS helpers -----------------------
-def _benchmark_sec_per_furlong(distance_m: float) -> float:
-    """Practical genuine-tempo benchmark table for RPSS."""
-    knots = [
-        (1000, 12.0), (1160, 12.0), (1200, 12.0),
-        (1400, 12.15), (1450, 12.15),
-        (1600, 12.2), (1750, 12.3), (1800, 12.3),
-        (1900, 12.4), (1950, 12.4), (2000, 12.4),
-        (2200, 12.5),
-        (2400, 12.6), (2450, 12.6),
-        (2600, 12.8), (2800, 12.8),
-        (3000, 13.0), (3200, 13.2),
-    ]
+DISTANCE_STD_100M = {
+    1000: 5.50,
+    1160: 5.53,
+    1200: 5.55,
+    1400: 5.63,
+    1450: 5.65,
+    1600: 5.70,
+    1750: 5.76,
+    1800: 5.78,
+    1900: 5.83,
+    1950: 5.85,
+    2000: 5.87,
+    2200: 5.95,
+    2400: 6.03,
+    2450: 6.05,
+    2600: 6.13,
+    2800: 6.22,
+    3000: 6.32,
+    3200: 6.42,
+}
+
+def _benchmark_std_100m(distance_m: float) -> float:
+    """Practical trip benchmark ladder anchored at 5.50s per 100m for 1000m races."""
+    knots = sorted((float(k), float(v)) for k, v in DISTANCE_STD_100M.items())
     d = float(distance_m)
     if d <= knots[0][0]:
         return float(knots[0][1])
@@ -348,7 +360,17 @@ def _benchmark_sec_per_furlong(distance_m: float) -> float:
                 return float(vb)
             t = (d - a) / (b - a)
             return float(va + (vb - va) * t)
-    return 12.2
+    return 5.70
+
+
+def _benchmark_split_time(distance_m: float, split_step: int) -> float:
+    std100 = _benchmark_std_100m(distance_m)
+    step = int(split_step)
+    if step == 100:
+        return float(std100)
+    if step == 200:
+        return float(std100 * 2.0)
+    return float(std100 * (step / 100.0))
 
 
 def _robust_center(series: pd.Series, p_lo: float = 0.10, p_hi: float = 0.90) -> float:
@@ -388,8 +410,8 @@ def compute_rpss(metrics_df: pd.DataFrame, distance_m: float, split_step: int, s
     if usable.empty:
         return None
 
-    benchmark_sec_f = _benchmark_sec_per_furlong(D)
-    benchmark_split_time = float(benchmark_sec_f * (step / 201.168))
+    benchmark_std_100m = _benchmark_std_100m(D)
+    benchmark_split_time = _benchmark_split_time(D, step)
 
     usable["_RPSS_vs_std_pct"] = 100.0 * (benchmark_split_time / pd.to_numeric(usable["_RPSS_avg_split_time"], errors="coerce"))
     usable["_RPSS_margin"] = benchmark_split_time - pd.to_numeric(usable["_RPSS_avg_split_time"], errors="coerce")
@@ -434,7 +456,7 @@ def compute_rpss(metrics_df: pd.DataFrame, distance_m: float, split_step: int, s
         "distance_m": D,
         "split_step": step,
         "mid_cols": mid_cols,
-        "benchmark_sec_f": benchmark_sec_f,
+        "benchmark_std_100m": benchmark_std_100m,
         "benchmark_split_time": benchmark_split_time,
         "race_avg_split_time": race_avg,
         "top_half_avg_split_time": top_half_avg,
@@ -463,23 +485,10 @@ def render_rpss_section(rpss_info: dict | None):
     st.markdown(f"**Verdict:** {rpss_info['verdict']}  ")
     _top_half_txt = f"{rpss_info['top_half_rpss']:.2f}" if np.isfinite(rpss_info['top_half_rpss']) else "-"
     st.caption(
-        f"Benchmark: {rpss_info['benchmark_sec_f']:.2f} sec/furlong • Top-half RPSS: {_top_half_txt}"
+        f"Benchmark: {rpss_info['benchmark_std_100m']:.2f}s per 100m • Top-half RPSS: {_top_half_txt}"
     )
 
     chart_df = rpss_info["table"].copy()
-    if not chart_df.empty and "Horse" in chart_df.columns:
-        fig, ax = plt.subplots(figsize=(12, 5.2))
-        x = np.arange(len(chart_df))
-        y = pd.to_numeric(chart_df["Avg tsSPI split time"], errors="coerce")
-        ax.bar(x, y, alpha=0.85)
-        ax.axhline(rpss_info["benchmark_split_time"], linestyle="--", linewidth=1.6)
-        ax.set_xticks(x)
-        ax.set_xticklabels(chart_df["Horse"].astype(str).tolist(), rotation=60, ha="right", fontsize=8)
-        ax.set_ylabel(f"Average tsSPI split time ({int(rpss_info['split_step'])}m)")
-        ax.set_title("tsSPI split times vs benchmark")
-        ax.grid(axis="y", alpha=0.25)
-        st.pyplot(fig, clear_figure=True)
-
     st.dataframe(chart_df, use_container_width=True, hide_index=True)
 
 def render_dashboard(metrics: pd.DataFrame, split_step: int, distance_m: float, going: str, wind_tag: str):
