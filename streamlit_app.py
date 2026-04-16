@@ -540,8 +540,7 @@ def render_rpss_section(rpss_info: dict | None):
         phase_df["Change vs prior (%)"] = pd.to_numeric(phase_df["Change vs prior (%)"], errors="coerce").round(2)
         st.dataframe(phase_df, use_container_width=True, hide_index=True)
 
-    chart_df = rpss_info["table"].copy()
-    st.dataframe(chart_df, use_container_width=True, hide_index=True)
+    # Runner-level tsSPI detail table intentionally removed to keep the app lighter and faster.
 
 def render_dashboard(metrics: pd.DataFrame, split_step: int, distance_m: float, going: str, wind_tag: str):
     st.markdown("## Dashboard")
