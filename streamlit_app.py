@@ -648,7 +648,7 @@ def render_dashboard(metrics: pd.DataFrame, split_step: int, distance_m: float, 
 
     st.markdown("### Sectional leaders")
     leaders = []
-    for label, col in [("Best Accel", "Accel"), ("Best Sustain", gr_col), ("Best Travel", "tsSPI")]:
+    for label, col in [("Best Accel", "Accel"), ("Best Sustain", gr_col), ("Best Travel", "tsSPI"), ("Best SRI", "SRI")]:
         if col in metrics.columns:
             s = pd.to_numeric(metrics[col], errors="coerce")
             if s.notna().any():
@@ -677,7 +677,7 @@ with st.sidebar:
 
     APP_VIEW = st.radio(
         "App View",
-        ["Dashboard", "Core Metrics", "Visuals", "Advanced Models", "Exports & Notes", "Full Report", "Presentation Mode"],
+        ["Dashboard", "Core Metrics", "Visuals", "Advanced Models", "Exports & Notes", "Full Report"],
         index=0,
     )
 
@@ -1182,6 +1182,75 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         w[f"spd_{m}"] = (step * 1.0) / pd.to_numeric(w.get(f"{m}_Time"), errors="coerce")
     w["spd_Finish"] = ((100.0 if step == 100 else 200.0) /
                        pd.to_numeric(w.get("Finish_Time"), errors="coerce")) if "Finish_Time" in w.columns else np.nan
+
+    # ----- SRI: Speed Retention Index -----
+    # Peak_Speed = fastest sectional speed
+    # Peak_Location = section where the peak happened (remaining metres marker, FIN for finish split)
+    # SRI = average speed from the peak section through the finish ÷ peak speed × 100
+    # This works for both 100m and 200m files, including odd first panels.
+    def _sri_profile(val):
+        if pd.isna(val): return "-"
+        try:
+            x = float(val)
+        except Exception:
+            return "-"
+        if x >= 96.0: return "Elite sustainer"
+        if x >= 94.0: return "Strong sustainer"
+        if x >= 92.0: return "Balanced"
+        if x >= 90.0: return "Tactical"
+        return "Peak-and-fade"
+
+    sri_segments = []  # race order: early -> finish, each as (location_label, length_m, time_col)
+    if seg_markers:
+        first_m = int(seg_markers[0])
+        first_len = max(1.0, D - first_m)
+        first_col = f"{first_m}_Time"
+        if first_col in w.columns:
+            sri_segments.append((str(first_m), float(first_len), first_col))
+        for a, b in zip(seg_markers, seg_markers[1:]):
+            col = f"{int(b)}_Time"
+            if col in w.columns:
+                sri_segments.append((str(int(b)), float(a - b), col))
+    if "Finish_Time" in w.columns:
+        sri_segments.append(("FIN", float(100.0 if step == 100 else 200.0), "Finish_Time"))
+
+    def _sri_row(r):
+        speeds, labels = [], []
+        for lab, dist_m, col in sri_segments:
+            t = pd.to_numeric(r.get(col), errors="coerce")
+            if pd.notna(t) and t > 0 and dist_m > 0:
+                speeds.append(float(dist_m) / float(t))
+                labels.append(lab)
+            else:
+                speeds.append(np.nan)
+                labels.append(lab)
+        arr = np.asarray(speeds, dtype=float)
+        if arr.size == 0 or not np.isfinite(arr).any():
+            return pd.Series({"Peak_Speed": np.nan, "Peak_Location": "-", "SRI": np.nan, "SRI_Profile": "-"})
+        peak_i = int(np.nanargmax(arr))
+        peak = float(arr[peak_i])
+        tail = arr[peak_i:]
+        tail = tail[np.isfinite(tail)]
+        if peak <= 0 or tail.size == 0:
+            sri = np.nan
+        else:
+            sri = float(np.nanmean(tail) / peak * 100.0)
+        return pd.Series({
+            "Peak_Speed": round(peak, 3),
+            "Peak_Location": labels[peak_i],
+            "SRI": round(sri, 2) if np.isfinite(sri) else np.nan,
+            "SRI_Profile": _sri_profile(sri)
+        })
+
+    if sri_segments:
+        sri_out = w.apply(_sri_row, axis=1)
+        for c in ["Peak_Speed", "Peak_Location", "SRI", "SRI_Profile"]:
+            w[c] = sri_out[c]
+    else:
+        w["Peak_Speed"] = np.nan
+        w["Peak_Location"] = "-"
+        w["SRI"] = np.nan
+        w["SRI_Profile"] = "-"
 
     # RaceTime = sum of segments (incl Finish)
     if seg_markers:
@@ -1866,265 +1935,65 @@ def _integrity_scan(df: pd.DataFrame, distance_m: float, step: int):
 
 integrity_text, missing_cols, invalid_counts = _integrity_scan(work, race_distance_input, split_step)
 
+# ======================= Header with RQS + RPS + Badge =======================
+_hdr = (
+    f"## Race Distance: **{int(race_distance_input)}m**  |  "
+    f"Split step: **{split_step}m**  |  "
+    f"Shape: **{metrics.attrs.get('SHAPE_TAG','EVEN')}**  |  "
+    f"RSI: **{metrics.attrs.get('RSI',0.0):+.2f} / 10**  |  "
+    f"Finish: **{metrics.attrs.get('FINISH_FLAV','Balanced Finish')}**  |  "
+    f"SCI: **{metrics.attrs.get('SCI',0.0):.2f}**  |  "
+    f"FRA: **{'Yes' if metrics.attrs.get('FRA_APPLIED',0)==1 else 'No'}**"
+)
+rqs_v = metrics.attrs.get("RQS", None)
+rps_v = metrics.attrs.get("RPS", None)
+if rqs_v is not None:
+    _hdr += f"  |  **RQS:** {float(rqs_v):.1f}/100"
+if rps_v is not None:
+    _hdr += f"  |  **RPS:** {float(rps_v):.1f}/100"
 
-# ======================= Presentation Mode =======================
-if _view_is("Presentation Mode"):
-    st.markdown("""
-    <style>
-    .pres-card {background: linear-gradient(135deg,#07111f 0%,#0a1a2e 100%); border:1px solid rgba(97,145,200,0.35); border-radius:14px; padding:14px 18px; margin:4px 0 10px 0;}
-    .pres-card .lab {color:#8da8c7; font-size:0.78rem; text-transform:uppercase; letter-spacing:0.08em; margin-bottom:4px;}
-    .pres-card .val {color:white; font-size:1.45rem; font-weight:700; line-height:1.1;}
-    .pres-note {color:#98a9bc; font-size:0.9rem;}
-    .pres-wrap {background: linear-gradient(180deg,#04101d 0%,#07111f 100%); border:1px solid rgba(112,145,188,0.22); border-radius:18px; padding:14px 18px 18px 18px; margin-top:10px; box-shadow: 0 8px 30px rgba(0,0,0,.18);}
-    .pres-title {color:white; font-size:3rem; font-weight:800; letter-spacing:0.01em; margin:0 0 0.2rem 0;}
-    .pres-sub {color:#9eb1c7; font-size:1.05rem; margin:0 0 0.8rem 0;}
-    .pres-rank-title {color:white; font-size:2rem; font-weight:800; margin:0 0 0.5rem 0;}
-    .pres-table {width:100%; border-collapse:collapse; font-size:1rem; overflow:hidden; border-radius:14px;}
-    .pres-table th {background:#0e1e32; color:#dbe7f3; padding:12px 10px; text-align:center; font-weight:700; border-bottom:1px solid rgba(255,255,255,0.09);}
-    .pres-table td {padding:12px 10px; text-align:center; color:white; border-bottom:1px solid rgba(255,255,255,0.06);}
-    .pres-table td.horse, .pres-table th.horse {text-align:left;}
-    .pres-table tr:nth-child(odd) td {background:rgba(8,21,36,0.85);}
-    .pres-table tr:nth-child(even) td {background:rgba(5,16,29,0.85);}
-    .pres-table tr.top td {background:linear-gradient(90deg, rgba(88,10,16,0.92), rgba(42,8,16,0.88));}
-    .pres-footer {color:#8095ac; font-size:0.9rem; margin-top:8px;}
-    </style>
-    """, unsafe_allow_html=True)
+metrics.attrs["WIND_AFFECTED"] = bool(WIND_AFFECTED)
+metrics.attrs["WIND_TAG"] = str(WIND_TAG)
 
-    h1, h2, h3, h4 = st.columns([1.15, 1.0, 1.0, 0.9])
-    with h1:
-        pres_course = st.text_input("Course", value=st.session_state.get("pres_course", ""), key="pres_course")
-    with h2:
-        pres_distance = st.text_input("Distance", value=st.session_state.get("pres_distance", f"{int(race_distance_input)}m"), key="pres_distance")
-    with h3:
-        _pres_default_going = GOING_TYPE if isinstance(GOING_TYPE, str) and GOING_TYPE else "Good"
-        pres_going = st.text_input("Going", value=st.session_state.get("pres_going", _pres_default_going), key="pres_going")
-    with h4:
-        pres_date = st.date_input("Date", value=st.session_state.get("pres_date", datetime.today().date()), key="pres_date")
+st.markdown(_hdr)
 
-    st.markdown('<div class="pres-wrap">', unsafe_allow_html=True)
-    st.markdown('<div class="pres-title">PACE CURVE</div>', unsafe_allow_html=True)
-    st.markdown('<div class="pres-sub">Raw speed by segment (m/s) &nbsp; | &nbsp; Field average in white</div>', unsafe_allow_html=True)
+# Badge + short legend line
+render_profile_badge(
+    metrics.attrs.get("RACE_PROFILE","Unknown"),
+    metrics.attrs.get("RACE_PROFILE_COLOR","#7f8c8d")
+)
+st.caption("RQS = field depth/consistency • RPS = peak performance • Badge = depth vs dominance")
+# ----------------------- RQS Badge -----------------------
+rqs_val = float(metrics.attrs.get("RQS", 0.0))
+if rqs_val >= 80:
+    badge_color, badge_label = "#27AE60", "Elite Class"
+elif rqs_val >= 65:
+    badge_color, badge_label = "#F39C12", "Competitive Field"
+elif rqs_val >= 45:
+    badge_color, badge_label = "#E67E22", "Moderate Class"
+else:
+    badge_color, badge_label = "#C0392B", "Weak Field"
 
-    step = int(metrics.attrs.get("STEP", 100))
-    D = float(race_distance_input)
-    marks = _collect_markers(work)
+st.markdown(
+    f"<div style='display:inline-block;padding:4px 10px;border-radius:6px;"
+    f"background-color:{badge_color};color:white;font-weight:bold;'>"
+    f"RQS {rqs_val:.1f} / 100 — {badge_label}</div>",
+    unsafe_allow_html=True
+)
+if SHOW_WARNINGS and (missing_cols or any(v>0 for v in invalid_counts.values())):
+    bads = [f"{k} ({v} rows)" for k,v in invalid_counts.items() if v > 0]
+    warn = []
+    if missing_cols: warn.append("Missing: " + ", ".join(missing_cols))
+    if bads: warn.append("Invalid/zero times → treated as missing: " + ", ".join(bads))
+    if warn: st.markdown(f"*(⚠ {' • '.join(warn)})*")
+if split_step == 200:
+    st.caption("First panel & F-window adapt to odd 200m distances (e.g., 1160→F160, 1450→F250, 1100→F100). Finish is the 200→0 split.")
 
-    def _pace_x_label(v):
-        try:
-            vv = int(round(float(v)))
-            return f"{vv}m" if vv > 0 else "FINISH"
-        except Exception:
-            return str(v)
-
-    segs = []
-    if marks:
-        m1 = int(marks[0])
-        L0 = max(1.0, D - m1)
-        if f"{m1}_Time" in work.columns:
-            segs.append((m1, float(L0), f"{m1}_Time"))
-        for a, b in zip(marks, marks[1:]):
-            src = f"{int(b)}_Time"
-            if src in work.columns:
-                segs.append((int(b), float(a - b), src))
-    if "Finish_Time" in work.columns:
-        segs.append((0, float(step), "Finish_Time"))
-
-    if not segs:
-        st.info("Not enough *_Time columns to draw the pace curve.")
-    else:
-        nseg = len(segs)
-        arr = np.full((len(work), nseg), np.nan, dtype="float32")
-        for j, (_, L, col) in enumerate(segs):
-            if col in work.columns:
-                t = pd.to_numeric(work[col], errors="coerce").astype("float32")
-                t = np.where((t > 0) & np.isfinite(t), t, np.nan)
-                arr[:, j] = L / t
-
-        field_avg = np.nanmean(arr, axis=0)
-        ranked_pres = metrics.sort_values("PI", ascending=False).copy() if "PI" in metrics.columns else metrics.copy()
-        pres_top = ranked_pres.head(min(5, len(ranked_pres))).copy()
-        picked_names = [str(x) for x in pres_top.get("Horse", pd.Series(dtype=str)).tolist()]
-
-        x_vals = np.arange(nseg)
-        x_labels = [_pace_x_label(xv) for (xv, _, _) in segs]
-        speed_map = {}
-        for _, r in pres_top.iterrows():
-            name = str(r.get("Horse", ""))
-            speeds = np.full(nseg, np.nan, dtype="float32")
-            for j, (_, L, col) in enumerate(segs):
-                t = pd.to_numeric(r.get(col, np.nan), errors="coerce")
-                if np.isfinite(t) and t > 0:
-                    speeds[j] = L / float(t)
-            speed_map[name] = speeds
-
-        fig, ax = plt.subplots(figsize=(13.8, 7.6), facecolor="#04101d")
-        ax.set_facecolor("#07111f")
-
-        seg_marks = [int(xv) for (xv, _, _) in segs]
-        idx_600 = seg_marks.index(600) if 600 in seg_marks else None
-        idx_200 = seg_marks.index(200) if 200 in seg_marks else None
-        idx_fin = seg_marks.index(0) if 0 in seg_marks else (nseg - 1)
-        bands = []
-        if idx_600 is not None and idx_600 > 0:
-            if idx_600 >= 2:
-                mid_cut = max(0, int(round(idx_600 * 0.55)))
-                mid_cut = min(mid_cut, idx_600)
-                if mid_cut > 0:
-                    bands.append((-0.5, mid_cut - 0.5))
-                if idx_600 - 0.5 > mid_cut - 0.5:
-                    bands.append((mid_cut - 0.5, idx_600 - 0.5))
-            else:
-                bands.append((-0.5, idx_600 - 0.5))
-        elif idx_fin > 0:
-            bands.append((-0.5, idx_fin - 0.5))
-        if idx_600 is not None and idx_200 is not None and idx_200 >= idx_600:
-            bands.append((idx_600 - 0.5, idx_200 + 0.5))
-        if idx_fin is not None:
-            bands.append((idx_fin - 0.5, idx_fin + 0.5))
-        for idx_b, (x0, x1) in enumerate(bands):
-            x0 = max(-0.5, x0)
-            x1 = min(nseg - 0.5, x1)
-            if x1 > x0:
-                ax.axvspan(x0, x1, alpha=0.06 if idx_b % 2 == 0 else 0.11, color="#9db5cf")
-
-        ax.plot(x_vals, field_avg, color="white", lw=3.2, marker="o", ms=5.2, label="Field average", zorder=4, alpha=0.95)
-
-        palette = ["#ff3b30", "#ff9f1a", "#3da5ff", "#7ed957", "#b084ff"]
-        end_label_specs = []
-        for i, name in enumerate(picked_names):
-            y = speed_map.get(name)
-            if y is None or not np.any(np.isfinite(y)):
-                continue
-            lw = 3.4 if i == 0 else 2.6
-            alpha = 0.98 if i < 3 else 0.90
-            ms = 6.0 if i == 0 else 4.4
-            z = 6 if i == 0 else 5
-            color = palette[i % len(palette)]
-            ax.plot(x_vals, y, color=color, lw=lw, alpha=alpha, marker="o", ms=ms, zorder=z)
-            finite = np.where(np.isfinite(y))[0]
-            if len(finite):
-                jf = finite[-1]
-                end_label_specs.append({"name": name, "x": float(x_vals[jf]), "y": float(y[jf]), "color": color, "rank": i+1, "z": z})
-
-        y0, y1 = ax.get_ylim()
-        yr = max(1e-9, y1 - y0)
-        min_gap = 0.065 * yr
-        label_x = len(x_vals) - 1 + 0.22
-        end_label_specs = sorted(end_label_specs, key=lambda d: d["y"], reverse=True)
-        placed = []
-        for d in end_label_specs:
-            yy = d["y"] if not placed else min(d["y"], placed[-1] - min_gap)
-            placed.append(yy)
-        lower_cap = y0 + 0.08 * yr
-        if placed and placed[-1] < lower_cap:
-            shift = lower_cap - placed[-1]
-            placed = [yy + shift for yy in placed]
-        for d, yy in zip(end_label_specs, placed):
-            ax.plot([d["x"], label_x - 0.04], [d["y"], yy], color=d["color"], alpha=0.65, lw=1.2, zorder=d["z"])
-            ax.text(label_x, yy, f"{d['rank']}  {d['name']}", color=d["color"], fontsize=12.8 if d['rank']==1 else 11.8,
-                    fontweight="bold" if d['rank']<=2 else "normal", va="center", ha="left", zorder=d["z"]+1)
-
-        ax.set_xticks(x_vals)
-        ax.set_xticklabels(x_labels, rotation=0, fontsize=11.5, color="white")
-        ax.set_ylabel("SPEED (m/s)", color="white", fontsize=13.5)
-        ax.tick_params(axis='y', colors='white', labelsize=11.5)
-        ax.tick_params(axis='x', colors='white')
-        for spine in ['bottom','left']:
-            ax.spines[spine].set_color('#9bb0c6')
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-        ax.grid(True, axis='y', ls='--', alpha=0.14, color='white')
-        ax.grid(False, axis='x')
-        ax.set_xlim(-0.35, len(x_vals)-1 + 1.55)
-        st.pyplot(fig, use_container_width=True)
-        plt.close(fig)
-
-        st.markdown('<div class="pres-rank-title">PERFORMANCE RANKING</div>', unsafe_allow_html=True)
-        GR_COL = metrics.attrs.get("GR_COL", "Grind")
-        rank_df = ranked_pres[[c for c in ["Horse","PI","F200_idx","tsSPI","Accel",GR_COL] if c in ranked_pres.columns]].head(min(5, len(ranked_pres))).copy()
-        rank_df.insert(0, "Rank", np.arange(1, len(rank_df)+1))
-        rename_map = {"F200_idx":"F200", GR_COL:"Grind"}
-        rank_df = rank_df.rename(columns=rename_map)
-        for c in ["PI","F200","tsSPI","Accel","Grind"]:
-            if c in rank_df.columns:
-                rank_df[c] = pd.to_numeric(rank_df[c], errors="coerce").round(2)
-        rows_html = []
-        for i, r in rank_df.iterrows():
-            tr_class = ' class="top"' if int(r.get("Rank", 99)) == 1 else ''
-            rows_html.append(f"<tr{tr_class}><td>{int(r['Rank'])}</td><td class='horse'>{r['Horse']}</td><td>{r.get('PI','')}</td><td>{r.get('F200','')}</td><td>{r.get('tsSPI','')}</td><td>{r.get('Accel','')}</td><td>{r.get('Grind','')}</td></tr>")
-        table_html = f"""
-        <table class='pres-table'>
-          <thead><tr>
-            <th>RANK</th><th class='horse'>HORSE</th><th>PI</th><th>F200</th><th>tsSPI</th><th>ACCEL</th><th>GRIND</th>
-          </tr></thead>
-          <tbody>{''.join(rows_html)}</tbody>
-        </table>
-        <div class='pres-footer'>PI = Performance Index &nbsp; | &nbsp; F200 = Final 200m speed &nbsp; | &nbsp; tsSPI = late Sustained Pace Index &nbsp; | &nbsp; Accel = Acceleration vs field &nbsp; | &nbsp; Grind = Corrected Grind vs field</div>
-        """
-        st.markdown(table_html, unsafe_allow_html=True)
-
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-if _view_is("Presentation Mode"):
-    # ======================= Header with RQS + RPS + Badge =======================
-    _hdr = (
-        f"## Race Distance: **{int(race_distance_input)}m**  |  "
-        f"Split step: **{split_step}m**  |  "
-        f"Shape: **{metrics.attrs.get('SHAPE_TAG','EVEN')}**  |  "
-        f"RSI: **{metrics.attrs.get('RSI',0.0):+.2f} / 10**  |  "
-        f"Finish: **{metrics.attrs.get('FINISH_FLAV','Balanced Finish')}**  |  "
-        f"SCI: **{metrics.attrs.get('SCI',0.0):.2f}**  |  "
-        f"FRA: **{'Yes' if metrics.attrs.get('FRA_APPLIED',0)==1 else 'No'}**"
-    )
-    rqs_v = metrics.attrs.get("RQS", None)
-    rps_v = metrics.attrs.get("RPS", None)
-    if rqs_v is not None:
-        _hdr += f"  |  **RQS:** {float(rqs_v):.1f}/100"
-    if rps_v is not None:
-        _hdr += f"  |  **RPS:** {float(rps_v):.1f}/100"
-
-    metrics.attrs["WIND_AFFECTED"] = bool(WIND_AFFECTED)
-    metrics.attrs["WIND_TAG"] = str(WIND_TAG)
-
-    st.markdown(_hdr)
-
-    # Badge + short legend line
-    render_profile_badge(
-        metrics.attrs.get("RACE_PROFILE","Unknown"),
-        metrics.attrs.get("RACE_PROFILE_COLOR","#7f8c8d")
-    )
-    st.caption("RQS = field depth/consistency • RPS = peak performance • Badge = depth vs dominance")
-    # ----------------------- RQS Badge -----------------------
-    rqs_val = float(metrics.attrs.get("RQS", 0.0))
-    if rqs_val >= 80:
-        badge_color, badge_label = "#27AE60", "Elite Class"
-    elif rqs_val >= 65:
-        badge_color, badge_label = "#F39C12", "Competitive Field"
-    elif rqs_val >= 45:
-        badge_color, badge_label = "#E67E22", "Moderate Class"
-    else:
-        badge_color, badge_label = "#C0392B", "Weak Field"
-
-    st.markdown(
-        f"<div style='display:inline-block;padding:4px 10px;border-radius:6px;"
-        f"background-color:{badge_color};color:white;font-weight:bold;'>"
-        f"RQS {rqs_val:.1f} / 100 — {badge_label}</div>",
-        unsafe_allow_html=True
-    )
-    if SHOW_WARNINGS and (missing_cols or any(v>0 for v in invalid_counts.values())):
-        bads = [f"{k} ({v} rows)" for k,v in invalid_counts.items() if v > 0]
-        warn = []
-        if missing_cols: warn.append("Missing: " + ", ".join(missing_cols))
-        if bads: warn.append("Invalid/zero times → treated as missing: " + ", ".join(bads))
-        if warn: st.markdown(f"*(⚠ {' • '.join(warn)})*")
-    if split_step == 200:
-        st.caption("First panel & F-window adapt to odd 200m distances (e.g., 1160→F160, 1450→F250, 1100→F100). Finish is the 200→0 split.")
 if _view_is("Dashboard", "Full Report"):
     render_dashboard(metrics.copy(), split_step, float(race_distance_input), GOING_TYPE, WIND_TAG)
 
 if _view_is("Core Metrics", "Full Report"):
-    st.markdown("## Sectional Metrics (PI v3.2 & GCI + CG + Race Shape)")
+    st.markdown("## Sectional Metrics (PI v3.2 & GCI + CG + Race Shape + SRI)")
 
 if _view_is("Core Metrics", "Full Report"):
     GR_COL = metrics.attrs.get("GR_COL", "Grind")
@@ -2133,6 +2002,7 @@ if _view_is("Core Metrics", "Full Report"):
         "Horse","Finish_Pos","RaceTime_s",
         "F200_idx","tsSPI","Accel","Grind","Grind_CG",
         "EARLY_idx","LATE_idx",
+        "Peak_Speed","Peak_Location","SRI","SRI_Profile",
         "GrindAdjPts","DeltaG",
         "PI","GCI","GCI_RS",
         "RSI","RS_Component","RSI_Cue"
@@ -2468,6 +2338,40 @@ if _view_is("Visuals", "Full Report"):
             if _view_is("Exports & Notes", "Full Report"):
                 st.download_button("Download shape map (PNG)",shape_map_png,file_name="shape_map.png",mime="image/png")
             st.caption(("Y uses Corrected Grind (CG). " if USE_CG else "")+"Size=PI; X=Accel; Colour=tsSPIΔ.")
+
+
+    # ======================= SRI Map — Peak Speed vs Speed Retention =======================
+    st.markdown("## SRI Map — Peak Speed vs Speed Retention")
+    need_sri = {"Horse", "Peak_Speed", "SRI"}
+    if not need_sri.issubset(metrics.columns):
+        st.info("SRI Map: Peak Speed and SRI are not available for this file.")
+    else:
+        dfs = metrics.loc[:, ["Horse", "Peak_Speed", "Peak_Location", "SRI", "PI"]].copy()
+        dfs["Peak_Speed"] = pd.to_numeric(dfs["Peak_Speed"], errors="coerce")
+        dfs["SRI"] = pd.to_numeric(dfs["SRI"], errors="coerce")
+        dfs["PI"] = pd.to_numeric(dfs.get("PI", np.nan), errors="coerce")
+        dfs = dfs.dropna(subset=["Peak_Speed", "SRI"])
+        if dfs.empty:
+            st.info("Not enough SRI data to draw the map.")
+        else:
+            fig, ax = plt.subplots(figsize=(7.8, 5.8))
+            names = dfs["Horse"].astype(str).to_list()
+            x = dfs["Peak_Speed"].to_numpy()
+            y = dfs["SRI"].to_numpy()
+            pi_vals = dfs["PI"].fillna(dfs["PI"].median()).to_numpy()
+            pmin, pmax = np.nanmin(pi_vals), np.nanmax(pi_vals)
+            sizes = np.full_like(x, 70.0) if not np.isfinite(pmin) or pmin == pmax else 45.0 + (pi_vals-pmin)/(pmax-pmin+1e-9)*115.0
+            ax.scatter(x, y, s=sizes, alpha=0.92, edgecolor="black", linewidth=0.6)
+            label_points_neatly(ax, x, y, names)
+            ax.axhline(96, color="gray", lw=1.0, ls=(0,(3,3)))
+            ax.axhline(94, color="gray", lw=0.8, ls=":")
+            ax.axhline(92, color="gray", lw=0.8, ls=":")
+            ax.set_xlabel("Peak speed (m/s)")
+            ax.set_ylabel("SRI — speed retained after peak (%)")
+            ax.set_title("Top-right = high peak speed + high retention")
+            ax.grid(True, linestyle=":", alpha=0.25)
+            st.pyplot(fig)
+            st.caption("SRI = average speed from the horse’s peak sectional through the finish ÷ peak speed × 100. Size=PI.")
 
 
     # ======================= Pace Curve — enhanced detailed version =======================
