@@ -633,7 +633,7 @@ def render_dashboard(metrics: pd.DataFrame, split_step: int, distance_m: float, 
     gci_col = "GCI_RS" if ("GCI_RS" in metrics.columns and pd.to_numeric(metrics["GCI_RS"], errors="coerce").notna().any()) else ("GCI" if "GCI" in metrics.columns else None)
     gr_col = metrics.attrs.get("GR_COL", "Grind_CG" if "Grind_CG" in metrics.columns else "Grind")
 
-    for c in [pi_col, gci_col, "Accel", "tsSPI", gr_col, "Finish_Pos"]:
+    for c in [pi_col, gci_col, "Accel", "tsSPI", "TOF", gr_col, "Finish_Pos"]:
         if c and c not in metrics.columns:
             metrics[c] = np.nan
 
@@ -648,7 +648,7 @@ def render_dashboard(metrics: pd.DataFrame, split_step: int, distance_m: float, 
 
     st.markdown("### Sectional leaders")
     leaders = []
-    for label, col in [("Best Accel", "Accel"), ("Best Sustain", gr_col), ("Best Travel", "tsSPI"), ("Best SRI", "SRI")]:
+    for label, col in [("Best Accel", "Accel"), ("Best TOF", "TOF"), ("Best Sustain", gr_col), ("Best Travel", "tsSPI"), ("Best SRI", "SRI")]:
         if col in metrics.columns:
             s = pd.to_numeric(metrics[col], errors="coerce")
             if s.notna().any():
@@ -1281,6 +1281,28 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     w["tsSPI"]    = _speed_to_idx(w["_MID_spd"])
     w["Accel"]    = _speed_to_idx(w["_ACC_spd"])
     w["Grind"]    = _speed_to_idx(w["_GR_spd"])
+
+    # ----- TOF: Turn of Foot Differential -----
+    # tsSPI and Accel both sit around 100, so division adds little signal.
+    # TOF = Accel - tsSPI isolates how much sharper the horse became in the acceleration phase
+    # compared with its sustained/travel phase.
+    w["TOF"] = (pd.to_numeric(w["Accel"], errors="coerce") -
+                pd.to_numeric(w["tsSPI"], errors="coerce")).round(2)
+
+    def _tof_profile(val):
+        if pd.isna(val): return "-"
+        try:
+            x = float(val)
+        except Exception:
+            return "-"
+        if x >= 3.0: return "Explosive turn of foot"
+        if x >= 1.5: return "Sharp accelerator"
+        if x >= 0.5: return "Tactical kick"
+        if x > -0.5: return "Balanced"
+        if x > -1.5: return "Sustainer"
+        return "Builder / grinder"
+
+    w["TOF_Profile"] = w["TOF"].map(_tof_profile)
 
     # ----- Corrected Grind (CG) -----
     ACC_field = pd.to_numeric(w["_ACC_spd"], errors="coerce").mean(skipna=True)
@@ -1993,14 +2015,14 @@ if _view_is("Dashboard", "Full Report"):
     render_dashboard(metrics.copy(), split_step, float(race_distance_input), GOING_TYPE, WIND_TAG)
 
 if _view_is("Core Metrics", "Full Report"):
-    st.markdown("## Sectional Metrics (PI v3.2 & GCI + CG + Race Shape + SRI)")
+    st.markdown("## Sectional Metrics (PI v3.2 & GCI + CG + Race Shape + SRI + TOF)")
 
 if _view_is("Core Metrics", "Full Report"):
     GR_COL = metrics.attrs.get("GR_COL", "Grind")
 
     show_cols = [
         "Horse","Finish_Pos","RaceTime_s",
-        "F200_idx","tsSPI","Accel","Grind","Grind_CG",
+        "F200_idx","tsSPI","Accel","TOF","TOF_Profile","Grind","Grind_CG",
         "EARLY_idx","LATE_idx",
         "Peak_Speed","Peak_Location","SRI","SRI_Profile",
         "GrindAdjPts","DeltaG",
@@ -2339,6 +2361,40 @@ if _view_is("Visuals", "Full Report"):
                 st.download_button("Download shape map (PNG)",shape_map_png,file_name="shape_map.png",mime="image/png")
             st.caption(("Y uses Corrected Grind (CG). " if USE_CG else "")+"Size=PI; X=Accel; Colour=tsSPIΔ.")
 
+
+    # ======================= TOF Map — Acceleration vs Travel =======================
+    st.markdown("## TOF Map — Turn of Foot vs Travel")
+    need_tof = {"Horse", "Accel", "tsSPI", "TOF"}
+    if not need_tof.issubset(metrics.columns):
+        st.info("TOF Map: Accel, tsSPI and TOF are not available for this file.")
+    else:
+        dft = metrics.loc[:, ["Horse", "Accel", "tsSPI", "TOF", "SRI", "PI"]].copy()
+        for c in ["Accel", "tsSPI", "TOF", "SRI", "PI"]:
+            dft[c] = pd.to_numeric(dft.get(c, np.nan), errors="coerce")
+        dft = dft.dropna(subset=["Accel", "tsSPI", "TOF"])
+        if dft.empty:
+            st.info("Not enough TOF data to draw the map.")
+        else:
+            fig, ax = plt.subplots(figsize=(7.8, 5.8))
+            names = dft["Horse"].astype(str).to_list()
+            x = (dft["tsSPI"] - 100.0).to_numpy()
+            y = (dft["Accel"] - 100.0).to_numpy()
+            tof_vals = dft["TOF"].to_numpy()
+            pi_vals = dft["PI"].fillna(dft["PI"].median()).to_numpy()
+            pmin, pmax = np.nanmin(pi_vals), np.nanmax(pi_vals)
+            sizes = np.full_like(x, 70.0) if not np.isfinite(pmin) or pmin == pmax else 45.0 + (pi_vals-pmin)/(pmax-pmin+1e-9)*115.0
+            sc = ax.scatter(x, y, c=tof_vals, s=sizes, alpha=0.92, edgecolor="black", linewidth=0.6, cmap="coolwarm")
+            label_points_neatly(ax, x, y, names)
+            ax.axhline(0, color="gray", lw=1.0, ls=(0,(3,3)))
+            ax.axvline(0, color="gray", lw=1.0, ls=(0,(3,3)))
+            ax.set_xlabel("tsSPI − 100 / travel strength")
+            ax.set_ylabel("Accel − 100 / acceleration strength")
+            ax.set_title("Top-left = sharp kick; top-right = complete accelerator")
+            ax.grid(True, linestyle=":", alpha=0.25)
+            cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label("TOF = Accel − tsSPI")
+            st.pyplot(fig)
+            st.caption("TOF isolates acceleration above/below the horse’s travel strength. Size=PI; colour=TOF.")
 
     # ======================= SRI Map — Peak Speed vs Speed Retention =======================
     st.markdown("## SRI Map — Peak Speed vs Speed Retention")
