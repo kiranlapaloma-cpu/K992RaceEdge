@@ -183,7 +183,7 @@ st.set_page_config(
 
 # ----------------------- Globals ---------------------------
 DB_DEFAULT_PATH = "race_edge.db"
-APP_VERSION = "3.2"
+APP_VERSION = "3.3"
 
 # ----------------------- Small helpers ---------------------
 def as_num(x):
@@ -677,7 +677,7 @@ with st.sidebar:
 
     APP_VIEW = st.radio(
         "App View",
-        ["Dashboard", "Core Metrics", "Visuals", "Advanced Models", "Exports & Notes", "Full Report"],
+        ["Dashboard", "Core Metrics", "Visuals", "Phase PI Analysis", "Race Plane Analysis", "Advanced Models", "Exports & Notes", "Full Report"],
         index=0,
     )
 
@@ -1523,6 +1523,53 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     sigma = mad_std(centered)
     sigma = 0.75 if (not np.isfinite(sigma) or sigma < 0.75) else sigma
     w["PI"] = (5.0 + 2.2 * (centered / sigma)).clip(0.0, 10.0).round(2)
+
+    # ----- Phase PI decomposition -----
+    # Uses the exact same PI primitives, weights, field centre and scaling as PI.
+    # These are additive contributions to the final PI scale, not separate new ratings.
+    # Rebuild check: PI ≈ clip(PI_Base + F200_PIc + tsSPI_PIc + Accel_PIc + Grind_PIc + Mass_PIc, 0, 10)
+    total_pi_w = sum(PI_W.values()) or 1.0
+    pi_scale = 2.2 / (sigma if (np.isfinite(sigma) and sigma > 0) else 1.0)
+    pi_intercept = 5.0 - (2.2 * med / (sigma if (np.isfinite(sigma) and sigma > 0) else 1.0))
+
+    def _phase_component(series, weight):
+        vals = pd.to_numeric(series, errors="coerce")
+        raw = (weight * (vals - 100.0)) / total_pi_w
+        return pi_scale * raw
+
+    w["PI_Base"] = round(float(pi_intercept), 4) if np.isfinite(pi_intercept) else np.nan
+    w["F200_PIc"] = _phase_component(w.get("F200_idx"), PI_W.get("F200_idx", 0.0)).round(3)
+    w["tsSPI_PIc"] = _phase_component(w.get("tsSPI"), PI_W.get("tsSPI", 0.0)).round(3)
+    w["Accel_PIc"] = _phase_component(w.get("Accel"), PI_W.get("Accel", 0.0)).round(3)
+    w["Grind_PIc"] = _phase_component(w.get(GR_COL), PI_W.get("Grind", 0.0)).round(3)
+    try:
+        w["Mass_PIc"] = (pi_scale * (-PER_KG_PTS * mass_delta)).round(3)
+    except Exception:
+        w["Mass_PIc"] = 0.0
+
+    phase_cols_calc = ["F200_PIc", "tsSPI_PIc", "Accel_PIc", "Grind_PIc"]
+    w["PI_Phase_Total"] = (
+        pd.to_numeric(w["PI_Base"], errors="coerce")
+        + w[phase_cols_calc].apply(pd.to_numeric, errors="coerce").fillna(0).sum(axis=1)
+        + pd.to_numeric(w.get("Mass_PIc", 0.0), errors="coerce").fillna(0)
+    ).clip(0.0, 10.0).round(2)
+
+    def _main_phase_from_row(r):
+        vals = {
+            "F200": r.get("F200_PIc"),
+            "tsSPI": r.get("tsSPI_PIc"),
+            "Accel": r.get("Accel_PIc"),
+            "Grind": r.get("Grind_PIc"),
+        }
+        vals = {k: float(v) for k, v in vals.items() if pd.notna(v) and np.isfinite(float(v))}
+        if not vals:
+            return "-"
+        return max(vals, key=vals.get)
+
+    w["Main_PI_Phase"] = w.apply(_main_phase_from_row, axis=1)
+    w.attrs["PI_PHASE_WEIGHTS"] = PI_W.copy()
+    w.attrs["PI_PHASE_SCALE"] = float(pi_scale) if np.isfinite(pi_scale) else np.nan
+    w.attrs["PI_PHASE_BASE"] = float(pi_intercept) if np.isfinite(pi_intercept) else np.nan
 # ---------- /Mass-aware PI points ----------
 
     # ----- GCI (time + shape + efficiency) -----
@@ -2703,6 +2750,420 @@ if _view_is("Visuals", "Full Report"):
                     st.download_button("Download pace curve (PNG)", pace_png, file_name="pace_curve.png", mime="image/png")
                 plt.close(fig)
     # ======================= /Pace Curve (enhanced detailed version) =======================
+
+
+
+# ======================= Phase PI Analysis =======================
+if _view_is("Phase PI Analysis", "Full Report"):
+    st.markdown("## Phase PI Analysis")
+    st.caption(
+        "Breaks each horse's PI into the same weighted phase contributions used in the PI calculation. "
+        "This shows how each horse built its PI and where the race separated."
+    )
+
+    phase_map = {
+        "F200": "F200_PIc",
+        "tsSPI": "tsSPI_PIc",
+        "Accel": "Accel_PIc",
+        "Grind": "Grind_PIc",
+    }
+    phase_cols = list(phase_map.values())
+
+    if not all(c in metrics.columns for c in phase_cols):
+        st.warning("Phase PI Analysis needs F200_PIc, tsSPI_PIc, Accel_PIc and Grind_PIc. Re-run metrics with the updated app file.")
+    else:
+        phase_df = metrics.copy()
+        for c in phase_cols + ["PI", "PI_Phase_Total", "Mass_PIc", "Finish_Pos"]:
+            if c in phase_df.columns:
+                phase_df[c] = pd.to_numeric(phase_df[c], errors="coerce")
+
+        # Race-level phase separation: where the field was split most.
+        phase_summary_rows = []
+        for phase, col in phase_map.items():
+            vals = pd.to_numeric(phase_df[col], errors="coerce")
+            avg = float(vals.mean()) if vals.notna().any() else np.nan
+            spread = float(vals.std(ddof=1)) if vals.notna().sum() > 1 else np.nan
+            avg_abs = float(vals.abs().mean()) if vals.notna().any() else np.nan
+            phase_summary_rows.append({
+                "Phase": phase,
+                "Avg PI contribution": avg,
+                "Avg absolute contribution": avg_abs,
+                "Separation": spread,
+            })
+        phase_summary = pd.DataFrame(phase_summary_rows)
+
+        valid_sep = phase_summary.dropna(subset=["Separation"])
+        winning_phase = "-"
+        if not valid_sep.empty:
+            winning_phase = str(valid_sep.loc[valid_sep["Separation"].idxmax(), "Phase"])
+
+        sep_sum = phase_summary["Separation"].replace([np.inf, -np.inf], np.nan).fillna(0).sum()
+        if sep_sum > 0:
+            phase_summary["Separation share"] = phase_summary["Separation"] / sep_sum * 100.0
+        else:
+            phase_summary["Separation share"] = np.nan
+
+        def _phase_meaning(row):
+            phase = row["Phase"]
+            if phase == winning_phase:
+                return "Race separated here"
+            if pd.notna(row.get("Separation")) and sep_sum > 0 and row.get("Separation share", 0) >= 25:
+                return "Important support phase"
+            return "Secondary phase"
+
+        phase_summary["Race meaning"] = phase_summary.apply(_phase_meaning, axis=1)
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        card_map = {"F200": c1, "tsSPI": c2, "Accel": c3, "Grind": c4}
+        for phase, col in phase_map.items():
+            vals = pd.to_numeric(phase_df[col], errors="coerce")
+            avg = vals.mean() if vals.notna().any() else np.nan
+            spread = vals.std(ddof=1) if vals.notna().sum() > 1 else np.nan
+            card_map[phase].metric(
+                f"{phase} avg",
+                "-" if not np.isfinite(avg) else f"{avg:+.2f}",
+                "spread -" if not np.isfinite(spread) else f"spread {spread:.2f}"
+            )
+        c5.metric("Winning phase", winning_phase)
+
+        st.info(
+            f"**Race read:** The largest Phase PI separation was in **{winning_phase}**. "
+            "That is the phase where the field's PI profiles spread out most, so it is the most likely phase where the race was won or lost."
+        )
+
+        st.markdown("### Horse Phase PI table")
+        horse_cols = ["Horse", "Finish_Pos", "F200_PIc", "tsSPI_PIc", "Accel_PIc", "Grind_PIc", "Mass_PIc", "PI_Phase_Total", "PI", "Main_PI_Phase"]
+        horse_cols = [c for c in horse_cols if c in phase_df.columns]
+        view_df = phase_df[horse_cols].copy()
+        sort_col = "PI" if "PI" in view_df.columns else "PI_Phase_Total"
+        if sort_col in view_df.columns:
+            view_df = view_df.sort_values(sort_col, ascending=False).reset_index(drop=True)
+        for c in ["F200_PIc", "tsSPI_PIc", "Accel_PIc", "Grind_PIc", "Mass_PIc", "PI_Phase_Total", "PI"]:
+            if c in view_df.columns:
+                view_df[c] = pd.to_numeric(view_df[c], errors="coerce").round(2)
+        st.dataframe(view_df, use_container_width=True, hide_index=True)
+
+        st.markdown("### Race Phase PI table")
+        show_summary = phase_summary.copy()
+        for c in ["Avg PI contribution", "Avg absolute contribution", "Separation", "Separation share"]:
+            show_summary[c] = pd.to_numeric(show_summary[c], errors="coerce").round(2)
+        st.dataframe(show_summary, use_container_width=True, hide_index=True)
+
+        csv_phase = view_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download Phase PI table (CSV)",
+            data=csv_phase,
+            file_name="phase_pi_analysis.csv",
+            mime="text/csv"
+        )
+
+        st.markdown("### Race phase separation")
+        try:
+            fig, ax = plt.subplots(figsize=(7.8, 4.8))
+            phases = phase_summary["Phase"].astype(str).to_list()
+            sep_vals = pd.to_numeric(phase_summary["Separation"], errors="coerce").fillna(0).to_numpy(dtype=float)
+            ax.bar(phases, sep_vals)
+            ax.set_ylabel("Std dev of phase PI contribution")
+            ax.set_title("Where the race separated")
+            ax.grid(axis="y", linestyle=":", alpha=0.35)
+            for i, v in enumerate(sep_vals):
+                ax.text(i, v, f"{v:.2f}", ha="center", va="bottom", fontsize=9)
+            st.pyplot(fig)
+            st.caption("The highest bar is the phase where the field spread out most on the PI scale.")
+        except Exception as e:
+            st.info(f"Race phase separation chart could not be drawn: {e}")
+
+        st.markdown("### Horse phase contribution heatmap")
+        try:
+            dplot = phase_df[["Horse"] + phase_cols].copy()
+            for c in phase_cols:
+                dplot[c] = pd.to_numeric(dplot[c], errors="coerce")
+            dplot["_total_abs"] = dplot[phase_cols].abs().sum(axis=1)
+            dplot = dplot.sort_values("_total_abs", ascending=False).head(16).reset_index(drop=True)
+            mat = dplot[phase_cols].to_numpy(dtype=float)
+            vmax = float(np.nanmax(np.abs(mat))) if np.isfinite(mat).any() else 1.0
+            vmax = max(vmax, 0.5)
+            fig, ax = plt.subplots(figsize=(8.5, max(4.8, 0.38 * len(dplot) + 1.6)))
+            im = ax.imshow(mat, aspect="auto", cmap="coolwarm", vmin=-vmax, vmax=vmax)
+            ax.set_xticks(range(len(phase_map)))
+            ax.set_xticklabels(list(phase_map.keys()))
+            ax.set_yticks(range(len(dplot)))
+            ax.set_yticklabels(dplot["Horse"].astype(str).to_list())
+            ax.set_title("How each horse built its PI")
+            for i in range(mat.shape[0]):
+                for j in range(mat.shape[1]):
+                    val = mat[i, j]
+                    if np.isfinite(val):
+                        ax.text(j, i, f"{val:+.2f}", ha="center", va="center", fontsize=8)
+            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label("PI contribution")
+            st.pyplot(fig)
+            st.caption("Positive cells show where a horse added to PI. Negative cells show where it lost PI.")
+        except Exception as e:
+            st.info(f"Phase contribution heatmap could not be drawn: {e}")
+
+        with st.expander("How to read Phase PI"):
+            st.markdown(
+                """
+- **F200 PIc / tsSPI PIc / Accel PIc / Grind PIc** are additive PI-scale contributions using the same weights, centre and scaling as the main PI.
+- **Main PI Phase** is the phase that added the most to that horse's PI.
+- **Avg PI contribution** shows what the field generally gained or lost in that phase.
+- **Separation** is the standard deviation of that phase's contribution. The highest separation is where the race most likely split.
+- **PI Phase Total** is a rebuild check against the displayed PI. Small differences can occur because the official PI is clipped to 0–10 and rounded.
+                """
+            )
+
+# ======================= Race Plane Analysis — Experimental =======================
+if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
+    st.markdown("## Race Plane Analysis")
+    st.caption(
+        "Experimental module. The Race Plane Formula describes what this race rewarded from tsSPI and Accel, "
+        "then the residual ranks horses by how far above or below that race expectation they sustained."
+    )
+
+    req = {"Horse", "tsSPI", "Accel", "Grind"}
+    if not req.issubset(metrics.columns):
+        st.warning("Race Plane Analysis needs Horse, tsSPI, Accel and Grind columns.")
+    else:
+        cpa1, cpa2, cpa3 = st.columns([1.1, 1.0, 1.0])
+        with cpa1:
+            grind_options = ["Grind"]
+            if "Grind_CG" in metrics.columns:
+                grind_options.append("Grind_CG")
+            plane_grind_col = st.selectbox(
+                "Grind target",
+                grind_options,
+                index=0,
+                help="Use raw Grind by default. Grind_CG is available if you want the plane to use corrected grind."
+            )
+        with cpa2:
+            centre_values = st.toggle(
+                "Use centred values",
+                value=True,
+                help="Recommended. Fits tsSPI−100, Accel−100 and Grind−100 for cleaner coefficients."
+            )
+        with cpa3:
+            show_3d_plane = st.toggle("Show 3D plane", value=True)
+
+        plane_df = metrics.loc[:, ["Horse", "tsSPI", "Accel", plane_grind_col]].copy()
+        extra_cols = [c for c in ["TOF", "PI", "SRI", "Peak_Location", "Finish_Pos"] if c in metrics.columns]
+        for c in extra_cols:
+            plane_df[c] = metrics[c]
+
+        for c in ["tsSPI", "Accel", plane_grind_col, "TOF", "PI", "SRI", "Finish_Pos"]:
+            if c in plane_df.columns:
+                plane_df[c] = pd.to_numeric(plane_df[c], errors="coerce")
+
+        plane_df = plane_df.dropna(subset=["tsSPI", "Accel", plane_grind_col]).reset_index(drop=True)
+
+        if len(plane_df) < 4:
+            st.info("Need at least 4 runners with tsSPI, Accel and Grind to fit a stable plane.")
+        else:
+            if centre_values:
+                x = (plane_df["tsSPI"] - 100.0).to_numpy(dtype=float)
+                y = (plane_df["Accel"] - 100.0).to_numpy(dtype=float)
+                z = (plane_df[plane_grind_col] - 100.0).to_numpy(dtype=float)
+                x_label = "tsSPI − 100"
+                y_label = "Accel − 100"
+                z_label = f"{plane_grind_col} − 100"
+                formula_target = f"{plane_grind_col}Δ"
+            else:
+                x = plane_df["tsSPI"].to_numpy(dtype=float)
+                y = plane_df["Accel"].to_numpy(dtype=float)
+                z = plane_df[plane_grind_col].to_numpy(dtype=float)
+                x_label = "tsSPI"
+                y_label = "Accel"
+                z_label = plane_grind_col
+                formula_target = plane_grind_col
+
+            Xmat = np.column_stack([np.ones(len(plane_df)), x, y])
+            coef, residuals, rank, singular_vals = np.linalg.lstsq(Xmat, z, rcond=None)
+            intercept, b_tsspi, c_accel = [float(v) for v in coef]
+            expected_z = Xmat @ coef
+
+            if centre_values:
+                plane_df["Expected_Grind"] = 100.0 + expected_z
+                plane_df["Class_Residual"] = plane_df[plane_grind_col] - plane_df["Expected_Grind"]
+            else:
+                plane_df["Expected_Grind"] = expected_z
+                plane_df["Class_Residual"] = plane_df[plane_grind_col] - plane_df["Expected_Grind"]
+
+            z_mean = float(np.nanmean(z))
+            ss_res = float(np.nansum((z - expected_z) ** 2))
+            ss_tot = float(np.nansum((z - z_mean) ** 2))
+            r2 = np.nan if ss_tot <= 1e-12 else 1.0 - ss_res / ss_tot
+
+            def _cr_profile(v):
+                try:
+                    v = float(v)
+                except Exception:
+                    return "-"
+                if v >= 3.0:
+                    return "🔥 Major above-plane"
+                if v >= 1.5:
+                    return "🟢 Above expectation"
+                if v > -1.5:
+                    return "⚪ Around expectation"
+                if v > -3.0:
+                    return "🟠 Below expectation"
+                return "🔴 Emptied / weak sustain"
+
+            plane_df["CR_Profile"] = plane_df["Class_Residual"].map(_cr_profile)
+            plane_df["Expected_Grind"] = plane_df["Expected_Grind"].round(2)
+            plane_df["Class_Residual"] = plane_df["Class_Residual"].round(2)
+
+            # --- Race DNA: relative contribution of each race-plane input ---
+            denom = abs(b_tsspi) + abs(c_accel)
+            if denom > 1e-12:
+                travel_share = abs(b_tsspi) / denom
+                accel_share = abs(c_accel) / denom
+            else:
+                travel_share = np.nan
+                accel_share = np.nan
+
+            residual_std = float(np.nanstd(plane_df["Class_Residual"].to_numpy(dtype=float), ddof=1)) if len(plane_df) > 1 else np.nan
+            residual_range = float(np.nanmax(plane_df["Class_Residual"]) - np.nanmin(plane_df["Class_Residual"])) if len(plane_df) else np.nan
+
+            def _influence_label(coef, name):
+                sign = "positive" if coef > 0 else "negative" if coef < 0 else "neutral"
+                return f"{name} {sign}"
+
+            def _race_identity(r2_val, travel_sh, accel_sh, b_coef, c_coef):
+                if not np.isfinite(r2_val):
+                    return "Unclear race plane"
+                if r2_val < 0.30:
+                    return "Low-explainability / hidden-quality race"
+                if np.isfinite(accel_sh) and accel_sh >= 0.70 and c_coef > 0:
+                    return "Acceleration-dominated race"
+                if np.isfinite(travel_sh) and travel_sh >= 0.70 and b_coef > 0:
+                    return "Travel-dominated race"
+                if b_coef > 0 and c_coef > 0:
+                    return "Balanced travel + acceleration race"
+                if c_coef > 0 and b_coef <= 0:
+                    return "Acceleration-led / travel not rewarded"
+                return "Mixed race plane"
+
+            race_identity = _race_identity(r2, travel_share, accel_share, b_tsspi, c_accel)
+
+            st.markdown("### Race Plane Formula")
+            st.code(
+                f"{formula_target} = {intercept:.3f} + ({b_tsspi:.3f} × {x_label}) + ({c_accel:.3f} × {y_label})",
+                language="text"
+            )
+            st.caption(
+                f"R² = {r2:.3f} · runners used = {len(plane_df)} · rank = {rank}. "
+                "Class Residual = Actual Grind − Expected Grind. Positive means the horse sustained better than the race plane predicted."
+            )
+
+            st.markdown("### Race DNA")
+            dna_cols = st.columns(4)
+            dna_cols[0].metric("Travel influence", "-" if not np.isfinite(travel_share) else f"{travel_share*100:.0f}%", f"coef {b_tsspi:+.2f}")
+            dna_cols[1].metric("Acceleration influence", "-" if not np.isfinite(accel_share) else f"{accel_share*100:.0f}%", f"coef {c_accel:+.2f}")
+            dna_cols[2].metric("Explainability", "-" if not np.isfinite(r2) else f"{r2*100:.0f}%", "R²")
+            dna_cols[3].metric("Residual spread", "-" if not np.isfinite(residual_std) else f"{residual_std:.2f}", "std dev")
+
+            st.info(
+                f"**Race identity:** {race_identity}. "
+                f"Travel coefficient is {b_tsspi:+.3f}; Accel coefficient is {c_accel:+.3f}. "
+                "The percentages use absolute coefficient size, while the sign tells whether that influence was positive or negative."
+            )
+            if rank < 3:
+                st.warning("The plane is not fully stable because the points are close to collinear. Treat residuals cautiously.")
+
+            st.markdown("### Class Residual ranking")
+            out_cols = ["Horse", "Finish_Pos", "tsSPI", "Accel", plane_grind_col, "Expected_Grind", "Class_Residual", "CR_Profile"]
+            out_cols += [c for c in ["TOF", "SRI", "Peak_Location", "PI"] if c in plane_df.columns and c not in out_cols]
+            rank_df = plane_df.sort_values("Class_Residual", ascending=False).reset_index(drop=True)
+            st.dataframe(rank_df[out_cols], use_container_width=True, hide_index=True)
+
+            csv = rank_df[out_cols].to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download Race Plane table (CSV)",
+                data=csv,
+                file_name="race_plane_analysis.csv",
+                mime="text/csv"
+            )
+
+            st.markdown("### TOF vs Race Residual")
+            if "TOF" not in plane_df.columns:
+                st.info("TOF is not available, so the TOF vs CR map cannot be drawn.")
+            else:
+                d2 = plane_df.dropna(subset=["TOF", "Class_Residual"]).copy()
+                if d2.empty:
+                    st.info("Not enough TOF/CR data to draw the map.")
+                else:
+                    fig, ax = plt.subplots(figsize=(8.2, 5.8))
+                    xv = d2["TOF"].to_numpy(dtype=float)
+                    yv = d2["Class_Residual"].to_numpy(dtype=float)
+                    pi_vals = pd.to_numeric(d2.get("PI", pd.Series(np.nan, index=d2.index)), errors="coerce")
+                    if pi_vals.notna().any() and float(pi_vals.max()) != float(pi_vals.min()):
+                        sizes = 50.0 + (pi_vals.fillna(pi_vals.median()).to_numpy() - float(pi_vals.min())) / (float(pi_vals.max()) - float(pi_vals.min()) + 1e-9) * 120.0
+                    else:
+                        sizes = np.full(len(d2), 80.0)
+                    cv = yv
+                    vmax = float(np.nanmax(np.abs(cv))) if np.isfinite(cv).any() else 1.0
+                    vmax = max(vmax, 1.0)
+                    sc = ax.scatter(xv, yv, c=cv, s=sizes, cmap="coolwarm", vmin=-vmax, vmax=vmax,
+                                    alpha=0.92, edgecolor="black", linewidth=0.6)
+                    label_points_neatly(ax, xv, yv, d2["Horse"].astype(str).to_list())
+                    ax.axhline(0, color="gray", lw=1.0, ls=(0, (3, 3)))
+                    ax.axvline(0, color="gray", lw=1.0, ls=(0, (3, 3)))
+                    ax.set_xlabel("TOF = Accel − tsSPI")
+                    ax.set_ylabel("Class Residual")
+                    ax.set_title("Top-right = turn of foot + above-plane sustain")
+                    ax.grid(True, linestyle=":", alpha=0.25)
+                    cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+                    cbar.set_label("Class Residual")
+                    st.pyplot(fig)
+                    st.caption("High TOF + high CR = acceleration weapon that still sustained better than expected.")
+
+            if show_3d_plane:
+                st.markdown("### 3D Race Plane")
+                try:
+                    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+                    fig = plt.figure(figsize=(8.8, 6.6))
+                    ax = fig.add_subplot(111, projection="3d")
+
+                    cr_vals = plane_df["Class_Residual"].to_numpy(dtype=float)
+                    vmax = float(np.nanmax(np.abs(cr_vals))) if np.isfinite(cr_vals).any() else 1.0
+                    vmax = max(vmax, 1.0)
+                    sc = ax.scatter(x, y, z, c=cr_vals, cmap="coolwarm", vmin=-vmax, vmax=vmax,
+                                    s=55, edgecolor="black", linewidth=0.5, depthshade=True)
+
+                    for xi, yi, zi, name in zip(x, y, z, plane_df["Horse"].astype(str)):
+                        ax.text(xi, yi, zi, name, fontsize=7)
+
+                    x_grid = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 15)
+                    y_grid = np.linspace(float(np.nanmin(y)), float(np.nanmax(y)), 15)
+                    Xg, Yg = np.meshgrid(x_grid, y_grid)
+                    Zg = intercept + b_tsspi * Xg + c_accel * Yg
+                    ax.plot_surface(Xg, Yg, Zg, alpha=0.22, linewidth=0, antialiased=True)
+
+                    ax.set_xlabel(x_label)
+                    ax.set_ylabel(y_label)
+                    ax.set_zlabel(z_label)
+                    ax.set_title("Race-specific race plane")
+                    cbar = fig.colorbar(sc, ax=ax, shrink=0.65, pad=0.08)
+                    cbar.set_label("Class Residual")
+                    st.pyplot(fig)
+                    st.caption("Points above the race plane sustained better than expected after their travel and acceleration effort.")
+                except Exception as e:
+                    st.info(f"3D plane could not be rendered: {e}")
+
+            with st.expander("How to read this module"):
+                st.markdown(
+                    """
+- **Race Plane Formula:** the race-specific expected relationship between travel strength, acceleration strength and grind.
+- **Expected Grind:** what the model predicts a horse should have produced from its tsSPI and Accel.
+- **Class Residual:** actual Grind minus expected Grind.
+- **Positive CR:** the horse sustained better than expected.
+- **Negative CR:** the horse did less late than its travel/acceleration profile suggested.
+
+- **Race DNA:** relative contribution of tsSPI and Accel to the formula, plus R² explainability and residual spread.
+
+This is experimental. In small fields or unusual race shapes, use it as a guide rather than a final rating.
+                    """
+                )
 
 if _view_is("Advanced Models", "Full Report"):
     # ======================= Winning DNA Matrix — distance-aware & report cards =======================
