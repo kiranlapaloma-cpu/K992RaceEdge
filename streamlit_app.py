@@ -677,7 +677,7 @@ with st.sidebar:
 
     APP_VIEW = st.radio(
         "App View",
-        ["Dashboard", "Core Metrics", "Visuals", "Phase PI Analysis", "Ability Radar", "Race Plane Analysis", "Advanced Models", "Exports & Notes", "Full Report"],
+        ["Dashboard", "Core Metrics", "Visuals", "Ability Radar", "Race Plane Analysis", "Advanced Models", "Exports & Notes", "Full Report"],
         index=0,
     )
 
@@ -2754,271 +2754,71 @@ if _view_is("Visuals", "Full Report"):
             st.caption("SRI = average speed from the horse’s peak sectional through the finish ÷ peak speed × 100. Size=PI.")
 
 
-# ======================= Phase PI Analysis =======================
-if _view_is("Phase PI Analysis", "Full Report"):
-    st.markdown("## Phase PI Analysis")
-    st.caption(
-        "Breaks each horse's PI into the same weighted phase contributions used in the PI calculation. "
-        "This shows how each horse built its PI and where the race separated."
-    )
-
-    phase_map = {
-        "F200": "F200_PIc",
-        "tsSPI": "tsSPI_PIc",
-        "Accel": "Accel_PIc",
-        "Grind": "Grind_PIc",
-    }
-    phase_cols = list(phase_map.values())
-
-    if not all(c in metrics.columns for c in phase_cols):
-        st.warning("Phase PI Analysis needs F200_PIc, tsSPI_PIc, Accel_PIc and Grind_PIc. Re-run metrics with the updated app file.")
-    else:
-        phase_df = metrics.copy()
-        for c in phase_cols + ["PI", "PI_Phase_Total", "Mass_PIc", "Finish_Pos"]:
-            if c in phase_df.columns:
-                phase_df[c] = pd.to_numeric(phase_df[c], errors="coerce")
-
-        # Race-level phase separation: where the field was split most.
-        phase_summary_rows = []
-        for phase, col in phase_map.items():
-            vals = pd.to_numeric(phase_df[col], errors="coerce")
-            avg = float(vals.mean()) if vals.notna().any() else np.nan
-            spread = float(vals.std(ddof=1)) if vals.notna().sum() > 1 else np.nan
-            avg_abs = float(vals.abs().mean()) if vals.notna().any() else np.nan
-            phase_summary_rows.append({
-                "Phase": phase,
-                "Avg PI contribution": avg,
-                "Avg absolute contribution": avg_abs,
-                "Separation": spread,
-            })
-        phase_summary = pd.DataFrame(phase_summary_rows)
-
-        valid_sep = phase_summary.dropna(subset=["Separation"])
-        winning_phase = "-"
-        if not valid_sep.empty:
-            winning_phase = str(valid_sep.loc[valid_sep["Separation"].idxmax(), "Phase"])
-
-        sep_sum = phase_summary["Separation"].replace([np.inf, -np.inf], np.nan).fillna(0).sum()
-        if sep_sum > 0:
-            phase_summary["Separation share"] = phase_summary["Separation"] / sep_sum * 100.0
-        else:
-            phase_summary["Separation share"] = np.nan
-
-        def _phase_meaning(row):
-            phase = row["Phase"]
-            if phase == winning_phase:
-                return "Race separated here"
-            if pd.notna(row.get("Separation")) and sep_sum > 0 and row.get("Separation share", 0) >= 25:
-                return "Important support phase"
-            return "Secondary phase"
-
-        phase_summary["Race meaning"] = phase_summary.apply(_phase_meaning, axis=1)
-
-        c1, c2, c3, c4, c5 = st.columns(5)
-        card_map = {"F200": c1, "tsSPI": c2, "Accel": c3, "Grind": c4}
-        for phase, col in phase_map.items():
-            vals = pd.to_numeric(phase_df[col], errors="coerce")
-            avg = vals.mean() if vals.notna().any() else np.nan
-            spread = vals.std(ddof=1) if vals.notna().sum() > 1 else np.nan
-            card_map[phase].metric(
-                f"{phase} avg",
-                "-" if not np.isfinite(avg) else f"{avg:+.2f}",
-                "spread -" if not np.isfinite(spread) else f"spread {spread:.2f}"
-            )
-        c5.metric("Winning phase", winning_phase)
-
-        st.info(
-            f"**Race read:** The largest Phase PI separation was in **{winning_phase}**. "
-            "That is the phase where the field's PI profiles spread out most, so it is the most likely phase where the race was won or lost."
-        )
-
-        st.markdown("### Horse Phase PI table")
-        horse_cols = ["Horse", "Finish_Pos", "F200_PIc", "tsSPI_PIc", "Accel_PIc", "Grind_PIc", "Mass_PIc", "PI_Phase_Total", "PI", "Main_PI_Phase"]
-        horse_cols = [c for c in horse_cols if c in phase_df.columns]
-        view_df = phase_df[horse_cols].copy()
-        sort_col = "PI" if "PI" in view_df.columns else "PI_Phase_Total"
-        if sort_col in view_df.columns:
-            view_df = view_df.sort_values(sort_col, ascending=False).reset_index(drop=True)
-        for c in ["F200_PIc", "tsSPI_PIc", "Accel_PIc", "Grind_PIc", "Mass_PIc", "PI_Phase_Total", "PI"]:
-            if c in view_df.columns:
-                view_df[c] = pd.to_numeric(view_df[c], errors="coerce").round(2)
-        st.dataframe(view_df, use_container_width=True, hide_index=True)
-
-        st.markdown("### Race Phase PI table")
-        show_summary = phase_summary.copy()
-        for c in ["Avg PI contribution", "Avg absolute contribution", "Separation", "Separation share"]:
-            show_summary[c] = pd.to_numeric(show_summary[c], errors="coerce").round(2)
-        st.dataframe(show_summary, use_container_width=True, hide_index=True)
-
-        csv_phase = view_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download Phase PI table (CSV)",
-            data=csv_phase,
-            file_name="phase_pi_analysis.csv",
-            mime="text/csv"
-        )
-
-        st.markdown("### Race phase separation")
-        try:
-            fig, ax = plt.subplots(figsize=(7.8, 4.8))
-            phases = phase_summary["Phase"].astype(str).to_list()
-            sep_vals = pd.to_numeric(phase_summary["Separation"], errors="coerce").fillna(0).to_numpy(dtype=float)
-            ax.bar(phases, sep_vals)
-            ax.set_ylabel("Std dev of phase PI contribution")
-            ax.set_title("Where the race separated")
-            ax.grid(axis="y", linestyle=":", alpha=0.35)
-            for i, v in enumerate(sep_vals):
-                ax.text(i, v, f"{v:.2f}", ha="center", va="bottom", fontsize=9)
-            st.pyplot(fig)
-            st.caption("The highest bar is the phase where the field spread out most on the PI scale.")
-        except Exception as e:
-            st.info(f"Race phase separation chart could not be drawn: {e}")
-
-        st.markdown("### Horse phase contribution heatmap")
-        try:
-            dplot = phase_df[["Horse"] + phase_cols].copy()
-            for c in phase_cols:
-                dplot[c] = pd.to_numeric(dplot[c], errors="coerce")
-            dplot["_total_abs"] = dplot[phase_cols].abs().sum(axis=1)
-            dplot = dplot.sort_values("_total_abs", ascending=False).head(16).reset_index(drop=True)
-            mat = dplot[phase_cols].to_numpy(dtype=float)
-            vmax = float(np.nanmax(np.abs(mat))) if np.isfinite(mat).any() else 1.0
-            vmax = max(vmax, 0.5)
-            fig, ax = plt.subplots(figsize=(8.5, max(4.8, 0.38 * len(dplot) + 1.6)))
-            im = ax.imshow(mat, aspect="auto", cmap="coolwarm", vmin=-vmax, vmax=vmax)
-            ax.set_xticks(range(len(phase_map)))
-            ax.set_xticklabels(list(phase_map.keys()))
-            ax.set_yticks(range(len(dplot)))
-            ax.set_yticklabels(dplot["Horse"].astype(str).to_list())
-            ax.set_title("How each horse built its PI")
-            for i in range(mat.shape[0]):
-                for j in range(mat.shape[1]):
-                    val = mat[i, j]
-                    if np.isfinite(val):
-                        ax.text(j, i, f"{val:+.2f}", ha="center", va="center", fontsize=8)
-            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-            cbar.set_label("PI contribution")
-            st.pyplot(fig)
-            st.caption("Positive cells show where a horse added to PI. Negative cells show where it lost PI.")
-        except Exception as e:
-            st.info(f"Phase contribution heatmap could not be drawn: {e}")
-
-        with st.expander("How to read Phase PI"):
-            st.markdown(
-                """
-- **F200 PIc / tsSPI PIc / Accel PIc / Grind PIc** are additive PI-scale contributions using the same weights, centre and scaling as the main PI.
-- **Main PI Phase** is the phase that added the most to that horse's PI.
-- **Avg PI contribution** shows what the field generally gained or lost in that phase.
-- **Separation** is the standard deviation of that phase's contribution. The highest separation is where the race most likely split.
-- **PI Phase Total** is a rebuild check against the displayed PI. Small differences can occur because the official PI is clipped to 0–10 and rounded.
-                """
-            )
-
-
 # ======================= Ability Radar =======================
 if _view_is("Ability Radar", "Full Report"):
     st.markdown("## Ability Radar")
     st.caption(
-        "Compare horses from the same race using the four Race Edge ability pillars: F200, tsSPI, Accel and Grind. "
-        "The default radar uses Phase PI contributions shifted onto a 0–10 display scale, so it stays tied to the PI calculation."
+        "Compare horses from the same race using the core Race Edge indexed values. "
+        "The radar uses F200, tsSPI, Accel and Grind on an 80–110 scale, where 100 is race-average/par."
     )
 
     radar_phases = ["F200", "tsSPI", "Accel", "Grind"]
-    phase_cols_for_radar = {
-        "F200": "F200_PIc",
-        "tsSPI": "tsSPI_PIc",
-        "Accel": "Accel_PIc",
-        "Grind": "Grind_PIc",
-    }
-    raw_cols_for_radar = {
+    radar_cols = {
         "F200": "F200_idx",
         "tsSPI": "tsSPI",
         "Accel": "Accel",
-        "Grind": gr_col if "gr_col" in globals() else "Grind",
+        "Grind": metrics.attrs.get("GR_COL", "Grind_CG" if "Grind_CG" in metrics.columns else "Grind"),
     }
 
-    def _ability_profile_label(row):
-        vals = {p: row.get(f"{p}_Radar") for p in radar_phases}
-        vals = {k: float(v) for k, v in vals.items() if pd.notna(v) and np.isfinite(float(v))}
-        if not vals:
-            return "Unknown"
-        avg = float(np.mean(list(vals.values())))
-        spread = float(np.nanmax(list(vals.values())) - np.nanmin(list(vals.values())))
-        top_phase = max(vals, key=vals.get)
-        f = vals.get("F200", np.nan)
-        t = vals.get("tsSPI", np.nan)
-        a = vals.get("Accel", np.nan)
-        g = vals.get("Grind", np.nan)
-
-        if avg >= 7.0 and min(vals.values()) >= 6.2:
-            return "Complete horse"
-        if np.isfinite(a) and np.isfinite(g) and a >= 6.7 and g >= 6.7:
-            return "Power finisher"
-        if np.isfinite(t) and np.isfinite(g) and t >= 6.5 and g >= 6.5:
-            return "Sustained galloper"
-        if np.isfinite(f) and np.isfinite(a) and f >= 6.5 and a >= 6.5:
-            return "Speed / tactical horse"
-        if top_phase == "Accel":
-            return "Turn-of-foot horse"
-        if top_phase == "Grind":
-            return "Grinder / sustainer"
-        if top_phase == "tsSPI":
-            return "Strong traveller"
-        if top_phase == "F200":
-            return "Early-speed horse"
-        if spread <= 1.0:
-            return "Balanced profile"
-        return "Mixed profile"
-
-    def _radar_scores_from_phase_pi(df):
-        out = pd.DataFrame(index=df.index)
-        for phase, col in phase_cols_for_radar.items():
-            comp = pd.to_numeric(df[col], errors="coerce")
-            # 5 is neutral. Positive Phase PI contribution pushes outward; negative pulls inward.
-            out[f"{phase}_Radar"] = (5.0 + comp).clip(0.0, 10.0)
-        return out
-
-    def _radar_scores_from_raw_metrics(df):
-        out = pd.DataFrame(index=df.index)
-        for phase, col in raw_cols_for_radar.items():
-            vals = pd.to_numeric(df[col], errors="coerce")
-            med = float(np.nanmedian(vals)) if vals.notna().any() else 100.0
-            sig = mad_std(vals)
-            if not np.isfinite(sig) or sig < 0.35:
-                sig = float(vals.std(ddof=1)) if vals.notna().sum() > 1 else 1.0
-            if not np.isfinite(sig) or sig < 0.35:
-                sig = 1.0
-            out[f"{phase}_Radar"] = (5.0 + 1.7 * ((vals - med) / sig)).clip(0.0, 10.0)
-        return out
-
-    have_phase_radar = all(c in metrics.columns for c in phase_cols_for_radar.values())
-    have_raw_radar = all(c in metrics.columns for c in raw_cols_for_radar.values())
-
-    if not (have_phase_radar or have_raw_radar):
-        st.warning("Ability Radar needs either Phase PI columns or raw F200_idx, tsSPI, Accel and Grind columns.")
+    missing = [label for label, col in radar_cols.items() if col not in metrics.columns]
+    if missing:
+        st.warning(
+            "Ability Radar needs F200_idx, tsSPI, Accel and Grind/Grind_CG columns. "
+            f"Missing: {', '.join(missing)}"
+        )
     else:
-        radar_mode_options = []
-        if have_phase_radar:
-            radar_mode_options.append("Phase PI radar — 5 + PI contribution")
-        if have_raw_radar:
-            radar_mode_options.append("Race-local raw metric radar")
-        radar_mode = st.selectbox("Radar scoring", radar_mode_options, index=0)
-
         radar_df = metrics.copy()
-        if radar_mode.startswith("Phase PI"):
-            radar_scores = _radar_scores_from_phase_pi(radar_df)
-            radar_note = "Neutral = 5. A phase contribution of +2.0 appears as 7.0; -1.0 appears as 4.0."
-        else:
-            radar_scores = _radar_scores_from_raw_metrics(radar_df)
-            radar_note = "Each phase is normalised within this race: 5 = field average, above 5 = stronger than field average."
+        for phase, col in radar_cols.items():
+            radar_df[f"{phase}_Radar"] = pd.to_numeric(radar_df[col], errors="coerce")
+            radar_df[f"{phase}_Plot"] = radar_df[f"{phase}_Radar"].clip(80, 110)
 
-        for c in radar_scores.columns:
-            radar_df[c] = radar_scores[c]
+        def _radar_profile_100(row):
+            vals = {p: row.get(f"{p}_Radar") for p in radar_phases}
+            vals = {k: float(v) for k, v in vals.items() if pd.notna(v) and np.isfinite(float(v))}
+            if not vals:
+                return "Unknown"
+            f = vals.get("F200", np.nan)
+            t = vals.get("tsSPI", np.nan)
+            a = vals.get("Accel", np.nan)
+            g = vals.get("Grind", np.nan)
+            avg = float(np.mean(list(vals.values())))
+            spread = float(np.nanmax(list(vals.values())) - np.nanmin(list(vals.values())))
+            top_phase = max(vals, key=vals.get)
+
+            if avg >= 101.0 and min(vals.values()) >= 100.0:
+                return "Complete horse"
+            if np.isfinite(a) and np.isfinite(g) and a >= 101.0 and g >= 101.0:
+                return "Power finisher"
+            if np.isfinite(t) and np.isfinite(g) and t >= 101.0 and g >= 101.0:
+                return "Sustained galloper"
+            if np.isfinite(f) and np.isfinite(a) and f >= 101.0 and a >= 101.0:
+                return "Speed / tactical horse"
+            if top_phase == "Accel" and vals[top_phase] >= 100.5:
+                return "Turn-of-foot horse"
+            if top_phase == "Grind" and vals[top_phase] >= 100.5:
+                return "Grinder / sustainer"
+            if top_phase == "tsSPI" and vals[top_phase] >= 100.5:
+                return "Strong traveller"
+            if top_phase == "F200" and vals[top_phase] >= 100.5:
+                return "Early-speed horse"
+            if spread <= 1.0:
+                return "Balanced / neutral"
+            return "Mixed profile"
 
         radar_df["Radar_Avg"] = radar_df[[f"{p}_Radar" for p in radar_phases]].mean(axis=1)
         radar_df["Radar_Spread"] = radar_df[[f"{p}_Radar" for p in radar_phases]].max(axis=1) - radar_df[[f"{p}_Radar" for p in radar_phases]].min(axis=1)
         radar_df["Main Weapon"] = radar_df[[f"{p}_Radar" for p in radar_phases]].idxmax(axis=1).str.replace("_Radar", "", regex=False)
-        radar_df["Profile"] = radar_df.apply(_ability_profile_label, axis=1)
+        radar_df["Profile"] = radar_df.apply(_radar_profile_100, axis=1)
 
         # Sensible default: top PI horses if available, otherwise first few horses.
         horse_list = radar_df["Horse"].astype(str).tolist() if "Horse" in radar_df.columns else []
@@ -3040,13 +2840,23 @@ if _view_is("Ability Radar", "Full Report"):
             st.warning("For readability, the radar chart shows the first 5 selected horses.")
             selected_horses = selected_horses[:5]
 
-        st.caption(radar_note)
+        c1, c2, c3, c4 = st.columns(4)
+        leaders = []
+        for phase in radar_phases:
+            vals = pd.to_numeric(radar_df[f"{phase}_Radar"], errors="coerce")
+            if vals.notna().any():
+                idx = vals.idxmax()
+                leaders.append((phase, radar_df.loc[idx, "Horse"], float(vals.loc[idx])))
+        for col, item in zip([c1, c2, c3, c4], leaders):
+            phase, horse, score = item
+            col.metric(f"Best {phase}", str(horse), f"{score:.2f}")
+
+        st.caption("Radar scale: 80–110. The 100 ring is race-average/par. Values outside 80–110 are clipped on the chart only; the table keeps the real values.")
 
         if not selected_horses:
             st.info("Select at least one horse to draw the Ability Radar.")
         else:
             plot_df = radar_df[radar_df["Horse"].astype(str).isin(selected_horses)].copy()
-            # Preserve selection order.
             order_map = {h: i for i, h in enumerate(selected_horses)}
             plot_df["_sel_order"] = plot_df["Horse"].astype(str).map(order_map)
             plot_df = plot_df.sort_values("_sel_order")
@@ -3057,18 +2867,22 @@ if _view_is("Ability Radar", "Full Report"):
                 angles = np.linspace(0, 2 * np.pi, n, endpoint=False).tolist()
                 angles += angles[:1]
 
-                fig, ax = plt.subplots(figsize=(7.6, 7.6), subplot_kw=dict(polar=True))
+                fig, ax = plt.subplots(figsize=(7.8, 7.8), subplot_kw=dict(polar=True))
                 ax.set_theta_offset(np.pi / 2)
                 ax.set_theta_direction(-1)
                 ax.set_xticks(angles[:-1])
                 ax.set_xticklabels(labels, fontsize=11)
-                ax.set_ylim(0, 10)
-                ax.set_yticks([2, 4, 6, 8, 10])
-                ax.set_yticklabels(["2", "4", "6", "8", "10"], fontsize=8, alpha=0.75)
+                ax.set_ylim(80, 110)
+                ax.set_yticks([80, 90, 100, 105, 110])
+                ax.set_yticklabels(["80", "90", "100", "105", "110"], fontsize=8, alpha=0.78)
                 ax.grid(True, linestyle=":", alpha=0.45)
 
+                # Emphasise the 100/par ring.
+                theta = np.linspace(0, 2 * np.pi, 240)
+                ax.plot(theta, np.full_like(theta, 100.0), linewidth=1.6, linestyle="--", alpha=0.65)
+
                 for _, row in plot_df.iterrows():
-                    values = [float(row.get(f"{p}_Radar", np.nan)) for p in radar_phases]
+                    values = [float(row.get(f"{p}_Plot", np.nan)) for p in radar_phases]
                     if not all(np.isfinite(values)):
                         continue
                     values += values[:1]
@@ -3076,7 +2890,7 @@ if _view_is("Ability Radar", "Full Report"):
                     ax.plot(angles, values, linewidth=2.2, marker="o", label=label)
                     ax.fill(angles, values, alpha=0.10)
 
-                ax.set_title("Ability Radar — F200 / tsSPI / Accel / Grind", pad=24, fontsize=15)
+                ax.set_title("Ability Radar — indexed values", pad=24, fontsize=15)
                 ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.18), ncol=2, frameon=False)
                 st.pyplot(fig)
             except Exception as e:
@@ -3084,17 +2898,31 @@ if _view_is("Ability Radar", "Full Report"):
 
             st.markdown("### Radar comparison table")
             show_cols = ["Horse", "Finish_Pos"] if "Finish_Pos" in radar_df.columns else ["Horse"]
-            show_cols += [f"{p}_Radar" for p in radar_phases]
-            show_cols += ["Radar_Avg", "Main Weapon", "Profile"]
             if "PI" in radar_df.columns:
-                show_cols.insert(2 if "Finish_Pos" in show_cols else 1, "PI")
+                show_cols.append("PI")
+            show_cols += [f"{p}_Radar" for p in radar_phases]
+            show_cols += ["Radar_Avg", "Radar_Spread", "Main Weapon", "Profile"]
             view = plot_df[[c for c in show_cols if c in plot_df.columns]].copy()
-            rename_map = {f"{p}_Radar": f"{p} Radar" for p in radar_phases}
+            rename_map = {f"{p}_Radar": p for p in radar_phases}
             view = view.rename(columns=rename_map)
-            for c in ["F200 Radar", "tsSPI Radar", "Accel Radar", "Grind Radar", "Radar_Avg", "PI"]:
+            for c in ["F200", "tsSPI", "Accel", "Grind", "Radar_Avg", "Radar_Spread", "PI"]:
                 if c in view.columns:
                     view[c] = pd.to_numeric(view[c], errors="coerce").round(2)
             st.dataframe(view, use_container_width=True, hide_index=True)
+
+        st.markdown("### Full Ability Radar table")
+        full_cols = ["Horse", "Finish_Pos"] if "Finish_Pos" in radar_df.columns else ["Horse"]
+        if "PI" in radar_df.columns:
+            full_cols.append("PI")
+        full_cols += [f"{p}_Radar" for p in radar_phases]
+        full_cols += ["Radar_Avg", "Radar_Spread", "Main Weapon", "Profile"]
+        full_view = radar_df[[c for c in full_cols if c in radar_df.columns]].copy().rename(columns={f"{p}_Radar": p for p in radar_phases})
+        for c in ["F200", "tsSPI", "Accel", "Grind", "Radar_Avg", "Radar_Spread", "PI"]:
+            if c in full_view.columns:
+                full_view[c] = pd.to_numeric(full_view[c], errors="coerce").round(2)
+        if "Radar_Avg" in full_view.columns:
+            full_view = full_view.sort_values("Radar_Avg", ascending=False).reset_index(drop=True)
+        st.dataframe(full_view, use_container_width=True, hide_index=True)
 
         with st.expander("How to read Ability Radar"):
             st.markdown(
@@ -3103,9 +2931,11 @@ if _view_is("Ability Radar", "Full Report"):
 - **tsSPI** = sustained travelling strength.
 - **Accel** = ability to quicken when the race lifts.
 - **Grind** = ability to keep sustaining after the move.
-- A bigger shape means a stronger all-round profile.
-- A lopsided shape tells you the horse's natural weapon: early speed, travel, turn of foot or grind.
-- In **Phase PI mode**, the radar is tied directly to your PI calculation because each axis is built from the same phase PI contribution.
+- **100** is the race average/par line.
+- **Above 100** means the horse was stronger than the race average in that phase.
+- **Below 100** means the horse was weaker than the race average in that phase.
+- A bigger, rounder shape suggests a more complete horse.
+- A lopsided shape shows the horse's main weapon: early speed, travelling, turn of foot, or grind.
                 """
             )
 
