@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from matplotlib.colors import TwoSlopeNorm
 from matplotlib.lines import Line2D
+import matplotlib.patheffects as pe
 
 # ======================= Global NaN/Inf → None guard (JSON-safe, index-safe) =======================
 
@@ -297,24 +298,6 @@ def _safe_bal_norm(series, center=100.0, pad=0.5):
             vmax = center + 0.1
 
     return TwoSlopeNorm(vcenter=center, vmin=vmin, vmax=vmax)
-
-def render_profile_badge(label: str, color_hex: str):
-    st.markdown(
-        f"""
-        <div style="
-            display:inline-block;
-            background:{color_hex};
-            color:white;
-            padding:4px 10px;
-            border-radius:8px;
-            font-weight:600;
-            font-size:0.9rem;">
-            {label}
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
 
 def _view_is(*names: str) -> bool:
     try:
@@ -617,67 +600,14 @@ def render_rpss_section(rpss_info: dict | None):
 
     # Runner-level tsSPI detail table intentionally removed to keep the app lighter and faster.
 
-def render_dashboard(metrics: pd.DataFrame, split_step: int, distance_m: float, going: str, wind_tag: str):
-    st.markdown("## Dashboard")
-    st.caption("Quick race snapshot — strongest overall profiles and key sectional leaders.")
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Distance", f"{int(distance_m)} m")
-    c2.metric("Split Step", f"{int(split_step)} m")
-    c3.metric("Going", going)
-    c4.metric("Wind", wind_tag if wind_tag not in (None, "", "None") else "None")
-    _rpss = metrics.attrs.get("RPSS")
-    c5.metric("RPSS", f"{float(_rpss):.2f}" if _rpss is not None and np.isfinite(float(_rpss)) else "-")
-
-    pi_col = "PI_RS" if ("PI_RS" in metrics.columns and pd.to_numeric(metrics["PI_RS"], errors="coerce").notna().any()) else ("PI" if "PI" in metrics.columns else None)
-    gci_col = "GCI_RS" if ("GCI_RS" in metrics.columns and pd.to_numeric(metrics["GCI_RS"], errors="coerce").notna().any()) else ("GCI" if "GCI" in metrics.columns else None)
-    gr_col = metrics.attrs.get("GR_COL", "Grind_CG" if "Grind_CG" in metrics.columns else "Grind")
-
-    for c in [pi_col, gci_col, "Accel", "tsSPI", "TOF", gr_col, "Finish_Pos"]:
-        if c and c not in metrics.columns:
-            metrics[c] = np.nan
-
-    top_cols = [c for c in ["Horse", "Finish_Pos", pi_col, gci_col] if c]
-    if top_cols:
-        st.markdown("### Top overall profiles")
-        top_df = metrics[top_cols].copy()
-        if pi_col:
-            top_df[pi_col] = pd.to_numeric(top_df[pi_col], errors="coerce")
-            top_df = top_df.sort_values(pi_col, ascending=False)
-        st.dataframe(top_df.head(5), use_container_width=True, hide_index=True)
-
-    st.markdown("### Sectional leaders")
-    leaders = []
-    for label, col in [("Best Accel", "Accel"), ("Best TOF", "TOF"), ("Best Sustain", gr_col), ("Best Travel", "tsSPI"), ("Best SRI", "SRI")]:
-        if col in metrics.columns:
-            s = pd.to_numeric(metrics[col], errors="coerce")
-            if s.notna().any():
-                idx = s.idxmax()
-                leaders.append({"Category": label, "Horse": metrics.loc[idx, "Horse"], "Score": round(float(s.loc[idx]), 2)})
-    if leaders:
-        st.dataframe(pd.DataFrame(leaders), use_container_width=True, hide_index=True)
-
-    shape = metrics.attrs.get("RACE_PROFILE") or metrics.attrs.get("ShapeTag") or metrics.attrs.get("RSI_Cue") or "Not available"
-    rqs = metrics.attrs.get("RQS")
-    rps = metrics.attrs.get("RPS")
-    badge = metrics.attrs.get("RACE_PROFILE", "Unknown")
-    st.markdown("### Race read")
-    bullets = []
-    bullets.append(f"Profile: **{shape}**")
-    if rqs is not None:
-        bullets.append(f"RQS: **{float(rqs):.1f}/100**")
-    if rps is not None:
-        bullets.append(f"RPS: **{float(rps):.1f}/100**")
-    st.markdown("\n".join([f"- {b}" for b in bullets]))
-
 # ----------------------- Sidebar ---------------------------
 with st.sidebar:
     st.markdown(f"### Race Edge v{APP_VERSION}")
-    st.caption("Cleaner layout • same calculations")
+    st.caption("Focused sectional analysis")
 
     APP_VIEW = st.radio(
         "App View",
-        ["Dashboard", "Core Metrics", "Visuals", "Ability Radar", "Race Plane Analysis", "Advanced Models", "Exports & Notes", "Full Report"],
+        ["Core Metrics", "Pressure Retention", "Pace Curve", "Ability Radar", "Race Plane Analysis", "Advanced Models", "Form Study"],
         index=0,
     )
 
@@ -691,8 +621,9 @@ with st.sidebar:
     with st.expander("Advanced settings", expanded=False):
         USE_CG = st.toggle("Use Corrected Grind (CG)", value=True, help="Adjust Grind when the field finish collapses; preserves finisher credit.")
         DAMPEN_CG = st.toggle("Dampen Grind weight if collapsed", value=True, help="Shift a little weight Grind→Accel/tsSPI on collapse races.")
-        USE_RACE_SHAPE = st.toggle("Use Race Shape module (SED/FRA/SCI)", value=True,
-                                   help="Detect slow-early/sprint-home and apply False-Run Adjustment and consistency guardrails.")
+        # Race-shape calculations remain enabled internally for advanced models,
+        # but their controls and summary outputs are intentionally hidden.
+        USE_RACE_SHAPE = True
         USE_GOING_ADJUST = st.toggle(
             "Use Going Adjustment",
             value=True,
@@ -702,7 +633,7 @@ with st.sidebar:
             "Track Going",
             options=["Good", "Firm", "Soft", "Heavy"],
             index=0,
-            help="Only affects PI weights; GCI stays independent"
+            help="Only affects PI weights; the underlying sectional indices stay unchanged"
         ) if USE_GOING_ADJUST else "Good"
         WIND_AFFECTED = st.toggle("Wind affected race?", value=False, help="Purely informational (disclaimer only).")
         WIND_TAG = st.selectbox(
@@ -760,8 +691,6 @@ CREATE TABLE IF NOT EXISTS performances(
   grind_adj_pts   REAL,
   pi              REAL,
   pi_rs           REAL,    -- NEW: PI after race-shape adjustments (if any)
-  gci             REAL,
-  gci_rs          REAL,    -- NEW: GCI after race-shape adjustments (if any)
   hidden          REAL,
   ability         REAL,
   ability_tier    TEXT,
@@ -871,14 +800,6 @@ split_step = detect_step(work)
 st.markdown(f"**Detected split step:** {split_step} m")
 if alias_notes and SHOW_WARNINGS:
     st.info("Header aliases applied: " + "; ".join(alias_notes))
-
-if _view_is("Dashboard", "Exports & Notes", "Full Report"):
-    with st.expander("File preview", expanded=_view_is("Exports & Notes")):
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Rows", len(work))
-        c2.metric("Columns", len(work.columns))
-        c3.metric("Split Step", f"{split_step} m")
-        st.dataframe(work.head(12), use_container_width=True)
 
 # ----------------------- Integrity helpers (odds-aware) -------------------
 def expected_segments_from_df(df: pd.DataFrame) -> list[str]:
@@ -1086,28 +1007,34 @@ def pi_weights_distance_and_context(
     """
     Returns PI weights (sum=1). If return_meta=True, also returns a meta dict
     describing the going multipliers actually applied.
-    Going affects PI weighting ONLY (not indices or GCI).
+    Going affects PI weighting only; the underlying sectional indices remain unchanged.
     """
 
     dm = float(distance_m or 1200)
 
-    # ---- Base by distance (your current logic) ----
-    if dm <= 1000:
-        F200, ts, ACC, GR = 0.10, 0.20, 0.45, 0.25
-
-    elif dm <= 1200:
-        F200, ts, ACC, GR = 0.10, 0.25, 0.40, 0.25
-
-    elif dm <= 1400:
-        F200, ts, ACC, GR = 0.10, 0.30, 0.35, 0.25
-
-    elif dm <= 2200:
-        F200, ts, ACC, GR = 0.08, 0.35, 0.35, 0.22
-
-    else:  # 2400–3200
-        F200, ts, ACC, GR = 0.05, 0.40, 0.35, 0.20
-
-    base = {"F200_idx":F200, "tsSPI":ts, "Accel":ACC, "Grind":GR}
+    # ---- Continuous base weights by distance ----
+    # Refined to reward complete sprint performances and genuine staying strength.
+    # Values between anchors are linearly interpolated, avoiding abrupt distance bands.
+    anchors = [
+        (1000.0, {"F200_idx":0.12, "tsSPI":0.23, "Accel":0.30, "Grind":0.35}),
+        (1200.0, {"F200_idx":0.10, "tsSPI":0.25, "Accel":0.32, "Grind":0.33}),
+        (1400.0, {"F200_idx":0.10, "tsSPI":0.30, "Accel":0.35, "Grind":0.25}),
+        (1600.0, {"F200_idx":0.08, "tsSPI":0.34, "Accel":0.34, "Grind":0.24}),
+        (2000.0, {"F200_idx":0.07, "tsSPI":0.37, "Accel":0.31, "Grind":0.25}),
+        (2400.0, {"F200_idx":0.05, "tsSPI":0.40, "Accel":0.28, "Grind":0.27}),
+        (3000.0, {"F200_idx":0.03, "tsSPI":0.42, "Accel":0.23, "Grind":0.32}),
+    ]
+    if dm <= anchors[0][0]:
+        base = anchors[0][1].copy()
+    elif dm >= anchors[-1][0]:
+        base = anchors[-1][1].copy()
+    else:
+        base = anchors[-1][1].copy()
+        for (d0, w0), (d1, w1) in zip(anchors, anchors[1:]):
+            if d0 <= dm <= d1:
+                base = _interp_weights(dm, d0, w0, d1, w1)
+                break
+    F200, ts, ACC, GR = (base["F200_idx"], base["tsSPI"], base["Accel"], base["Grind"])
 
     # ---- Mild context nudge (your bias step) ----
     if acc_med is not None and grd_med is not None and math.isfinite(acc_med) and math.isfinite(grd_med):
@@ -1134,17 +1061,17 @@ def pi_weights_distance_and_context(
     # Heavy: stronger version of Soft
     if going == "Firm":
         # Firm: boost Accel ONLY
-        amp = 0.06 * field_scale
+        amp = 0.03 * field_scale
         mult = {"F200_idx": 1.0, "tsSPI": 1.0, "Accel": 1.0 + amp, "Grind": 1.0}
 
     elif going == "Soft":
         # Soft: boost Grind ONLY
-        amp = 0.06 * field_scale
+        amp = 0.03 * field_scale
         mult = {"F200_idx": 1.0, "tsSPI": 1.0, "Accel": 1.0, "Grind": 1.0 + amp}
 
     elif going == "Heavy":
         # Heavy: boost Grind ONLY (stronger)
-        amp = 0.10 * field_scale
+        amp = 0.05 * field_scale
         mult = {"F200_idx": 1.0, "tsSPI": 1.0, "Accel": 1.0, "Grind": 1.0 + amp}
 
     else:  # "Good" or unknown
@@ -1326,232 +1253,100 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         return 100.0 + 0.5*(g-100.0) if (dg < 97.0 and g > 100.0) else g
     w["Grind_CG"] = [ _fade_cap(g, dg) for g, dg in zip(w["Grind_CG"], w["DeltaG"]) ]
 
-    # ----- PI v3.2 -----
-    GR_COL = "Grind_CG" if use_cg else "Grind"
-    acc_med = pd.to_numeric(w["Accel"], errors="coerce").median(skipna=True)
-    grd_med = pd.to_numeric(w[GR_COL], errors="coerce").median(skipna=True)
+    # ----- PI v4.3: distance-aware four-core model -----
+    # PI is based only on F200, tsSPI, Accel and raw Grind.
+    # F200 remains proportional to the race distance. The remaining influence
+    # is divided in the ratio tsSPI : Accel : Grind = 1 : 1.2 : 1.
+    GR_COL = "Grind"
 
-    # Pull going context from the outer scope (set in sidebar)
-    global GOING_TYPE, USE_GOING_ADJUST
-    going_for_pi = GOING_TYPE if ('USE_GOING_ADJUST' in globals() and USE_GOING_ADJUST) else "Good"
+    race_distance = max(float(D), 200.0)
+    w_f200 = float(np.clip(200.0 / race_distance, 0.0, 1.0))
+    remaining = max(0.0, 1.0 - w_f200)
+    ratio_total = 3.2
 
-    PI_W, PI_META = pi_weights_distance_and_context(
-        D,
-        acc_med,
-        grd_med,
-        going=going_for_pi,
-        field_n=len(w),
-        return_meta=True
-    )
-    # ---- MASS (horse weight) awareness for PI ---------------------------------
-    # Detect/parse a mass column, default 60 kg. Accepts: kg, lb, st-lb ("9-4"), or strings.
-    def _parse_mass_to_kg(v):
-        if v is None or (isinstance(v, float) and not np.isfinite(v)): return np.nan
-        s = str(v).strip().lower()
-        if not s: return np.nan
-        # st-lb like "9-4" or "9st 4lb"
-        m = re.match(r"^\s*(\d+)\s*st[\s\-]*([0-9]{1,2})\s*(lb|lbs)?\s*$", s)
-        if m:
-            stn = float(m.group(1)); lb = float(m.group(2))
-            return (stn*14.0 + lb) * 0.45359237
-        # plain "9-4"
-        m = re.match(r"^\s*(\d+)\s*[\-\/]\s*([0-9]{1,2})\s*$", s)
-        if m:
-            stn = float(m.group(1)); lb = float(m.group(2))
-            return (stn*14.0 + lb) * 0.45359237
-        # numbers with unit
-        m = re.match(r"^\s*([0-9]*\.?[0-9]+)\s*(kg|kilogram|kilograms)\s*$", s)
-        if m:
-            return float(m.group(1))
-        m = re.match(r"^\s*([0-9]*\.?[0-9]+)\s*(lb|lbs|pound|pounds)\s*$", s)
-        if m:
-            return float(m.group(1)) * 0.45359237
-        # bare number → guess unit
-        try:
-            x = float(s)
-            # > 200 is almost surely lb; 30..120 plausible kg
-            if x > 200:      return x * 0.45359237
-            if 30 <= x <= 120: return x
-            # 100–200 could be lb; bias to lb if <= 90 kg equiv
-            if 100 <= x <= 200: return x * 0.45359237
-            return np.nan
-        except Exception:
-            return np.nan
-
-    def _pick_mass_column(df_cols):
-        # try common names (case-insensitive, strip spaces/underscores)
-        keys = { re.sub(r"[\s_]+","", c.lower()): c for c in df_cols }
-        for k in (
-            "horseweight","weight","wt","bodyweight","bw","mass",
-            "declaredweight","officialweight","carriedweight"
-        ):
-            if k in keys: return keys[k]
-        # fallbacks: any column containing "weight" (shortest name wins)
-        cands = [c for c in df_cols if "weight" in c.lower()]
-        return sorted(cands, key=len)[0] if cands else None
-
-    MASS_REF_KG = 60.0  # neutral reference
-    mass_col = _pick_mass_column(w.columns)
-    if mass_col:
-        mass_kg = w[mass_col].map(_parse_mass_to_kg)
-    else:
-        mass_kg = pd.Series(np.nan, index=w.index)
-
-    # Fill with median when available; else 60
-    if mass_kg.notna().any():
-        mass_kg = mass_kg.fillna(mass_kg.median(skipna=True))
-    mass_kg = mass_kg.fillna(MASS_REF_KG)
-
-    # Distance-sensitive per-kg penalty (in PI_pts space, pre-scaling)
-    # Calibrated so that ~1600m charges ~0.16 pts per kg around the reference.
-    def _perkg_pts(dm):
-        dm = float(dm)
-        # anchors: (1000m→0.10), (1200→0.12), (1400→0.14), (1600→0.16), (2000→0.20), (2400→0.24)
-        knots = [(1000,0.10),(1200,0.12),(1400,0.14),(1600,0.16),(2000,0.20),(2400,0.24)]
-        if dm <= knots[0][0]: return knots[0][1]
-        if dm >= knots[-1][0]: return knots[-1][1]
-        for (a,va),(b,vb) in zip(knots, knots[1:]):
-            if a <= dm <= b:
-                t = (dm-a)/(b-a)
-                return va + (vb - va)*t
-        return 0.16  # fallback near a mile
-
-    perkg = _perkg_pts(D)
-    # Persist a short note for UI/PDF (source + per-kg effect)
-    w.attrs["PI_MASS_NOTE"] = {
-        "mass_col": mass_col or "(none → 60 kg default)",
-        "ref_kg": MASS_REF_KG,
-        "perkg_pts": round(perkg, 3),
-        "distance_m": int(D),
+    PI_W = {
+        "F200_idx": w_f200,
+        "tsSPI": remaining * (1.0 / ratio_total),
+        "Accel": remaining * (1.2 / ratio_total),
+        "Grind": remaining * (1.0 / ratio_total),
     }
 
-    # Signed adjustment vs reference (positive mass = penalty)
-    mass_delta = (mass_kg - MASS_REF_KG)
-                               
+    # Keep metadata available to the dashboard, exports and reports.
+    w.attrs["GOING"] = GOING_TYPE if "GOING_TYPE" in globals() else "Good"
+    w.attrs["PI_GOING_META"] = {
+        "method": "distance_f200_ratio_1_1.2_1",
+        "distance_m": int(round(race_distance)),
+    }
+    w.attrs["PI_MASS_NOTE"] = {
+        "mass_col": "(not used in PI)",
+        "ref_kg": None,
+        "perkg_pts": 0.0,
+        "distance_m": int(round(race_distance)),
+    }
 
-    # Store for captions/DB/PDF
-    w.attrs["GOING"] = going_for_pi
-    w.attrs["PI_GOING_META"] = PI_META
-    if use_cg and dampen_cg and CollapseSeverity >= 3.0:
-        d = min(0.02 + 0.01*(CollapseSeverity-3.0), 0.08)
-        shift = min(d, PI_W["Grind"])
-        PI_W["Grind"] -= shift
-        PI_W["Accel"] += shift*0.5
-        PI_W["tsSPI"] += shift*0.5
-
-    # ---------- Mass-aware PI points (drop-in) ----------
-    # 1) Pull carried mass (kg) from the file, robustly
-
-    def _mass_kg_series(df: pd.DataFrame) -> tuple[pd.Series, str]:
-        """
-        Returns (mass_kg, source_name).
-        Accepts any of these columns if present (first match wins):
-          Carried_kg, Weight, Wt, Carried, WeightCarried
-        Parses:
-          • pure kg: 57.0, "57", "57kg"
-          • pounds: 126, "126lb"
-          • stones-lbs: "9-4", "9st4lb", "9 st 4"
-        """
-        candidates = ["Carried_kg", "Weight", "Wt", "Carried", "WeightCarried"]
-        src = next((c for c in candidates if c in df.columns), None)
-        if src is None:
-            return pd.Series(np.nan, index=df.index, dtype=float), "none"
-
-        def _to_kg(v):
-            if v is None:
-                return np.nan
-            s = str(v).strip().lower()
-            if s == "" or s == "nan":
-                return np.nan
-
-            # stones-lbs: "9-4", "9 st 4", "9st4lb"
-            m = re.match(r"^\s*(\d+)\s*(?:st|stone|)\s*[-\s]?\s*(\d+)\s*(?:lb|lbs|)\s*$", s)
-            if m:
-                st = float(m.group(1)); lb = float(m.group(2))
-                return (st * 14.0 + lb) * 0.45359237
-
-            # any number in the string
-            m = re.search(r"([-+]?\d+(?:\.\d+)?)", s)
-            if not m:
-                return np.nan
-            val = float(m.group(1))
-
-            # unit hint
-            if "lb" in s or "lbs" in s or val > 130:   # 130+ → almost surely pounds
-                return val * 0.45359237
-            # default kg
-            return val
-
-        mass_kg = pd.to_numeric(pd.Series(df[src]).map(_to_kg), errors="coerce")
-        return mass_kg, src
-
-    mass_kg, mass_src = _mass_kg_series(w)
-    w.attrs["MASS_SRC"] = mass_src
-
-    # Reference mass = median of available masses in this race
-    mass_ref = float(np.nanmedian(mass_kg)) if np.isfinite(np.nanmedian(mass_kg)) else np.nan
-    mass_delta = (mass_kg - mass_ref) if np.isfinite(mass_ref) else pd.Series(0.0, index=w.index, dtype=float)
-    # Positive mass_delta = carried HEAVIER than reference → penalty
-
-    # 2) Per-kg impact in PI points (tweakable)
-    PER_KG_PTS = 0.14  # subtract 0.14 PI_pts per extra kg carried vs race median
-
-    # 3) Base (sectional) PI points as you already do, then apply mass adjustment
     def _pi_pts_row(r):
-        acc = r.get("Accel"); mid = r.get("tsSPI"); f = r.get("F200_idx"); gr = r.get(GR_COL)
-        parts = []
-        if pd.notna(f):   parts.append(PI_W["F200_idx"] * (f   - 100.0))
-        if pd.notna(mid): parts.append(PI_W["tsSPI"]    * (mid - 100.0))
-        if pd.notna(acc): parts.append(PI_W["Accel"]    * (acc - 100.0))
-        if pd.notna(gr):  parts.append(PI_W["Grind"]    * (gr  - 100.0))
-
-        if not parts:
+        values = {
+            "F200_idx": pd.to_numeric(pd.Series([r.get("F200_idx")]), errors="coerce").iloc[0],
+            "tsSPI": pd.to_numeric(pd.Series([r.get("tsSPI")]), errors="coerce").iloc[0],
+            "Accel": pd.to_numeric(pd.Series([r.get("Accel")]), errors="coerce").iloc[0],
+            "Grind": pd.to_numeric(pd.Series([r.get("Grind")]), errors="coerce").iloc[0],
+        }
+        valid = {k: v for k, v in values.items() if np.isfinite(v)}
+        if not valid:
             return np.nan
-        base = sum(parts) / (sum(PI_W.values()) or 1.0)
 
-        # mass penalty in PI_pts (kg heavier than ref lowers PI_pts)
-        idx = r.name
-        md = float(mass_delta.loc[idx]) if idx in mass_delta.index else 0.0
-        return base - (PER_KG_PTS * md)
+        valid_weight = sum(PI_W[k] for k in valid) or 1.0
+        return sum(PI_W[k] * (v - 100.0) for k, v in valid.items()) / valid_weight
 
+    w["Sprint_Conversion_Penalty"] = 0.0
     w["PI_pts"] = w.apply(_pi_pts_row, axis=1)
 
-    # 4) Convert PI_pts → PI 0..10 (same centering/scaling you use)
+    w.attrs["PI_REFINED_META"] = {
+        "distance_m": int(round(race_distance)),
+        "weights": PI_W.copy(),
+        "method": "f200_distance_proportional_remaining_ratio_1_1.2_1",
+        "inputs": ["F200_idx", "tsSPI", "Accel", "Grind"],
+        "uses_race_time": False,
+        "uses_corrected_grind": False,
+        "uses_weight_adjustment": False,
+    }
+
+    # Race-relative 0-10 scale. The field median centres on 5, while the
+    # non-linear mapping preserves separation without forcing the leader to 10.
     pts = pd.to_numeric(w["PI_pts"], errors="coerce")
-    med = float(np.nanmedian(pts)) if np.isfinite(np.nanmedian(pts)) else 0.0
+    finite_pts = pts[np.isfinite(pts)]
+    med = float(np.nanmedian(finite_pts)) if len(finite_pts) else 0.0
     centered = pts - med
     sigma = mad_std(centered)
-    sigma = 0.75 if (not np.isfinite(sigma) or sigma < 0.75) else sigma
-    w["PI"] = (5.0 + 2.2 * (centered / sigma)).clip(0.0, 10.0).round(2)
+    sigma = 0.75 if (not np.isfinite(sigma) or sigma < 0.75) else float(sigma)
+
+    w["PI"] = (
+        5.0 + 2.75 * np.tanh((centered / sigma) / 1.35)
+    ).clip(0.0, 10.0).round(2)
 
     # ----- Phase PI decomposition -----
-    # Uses the exact same PI primitives, weights, field centre and scaling as PI.
-    # These are additive contributions to the final PI scale, not separate new ratings.
-    # Rebuild check: PI ≈ clip(PI_Base + F200_PIc + tsSPI_PIc + Accel_PIc + Grind_PIc + Mass_PIc, 0, 10)
+    # Diagnostic weighted contributions. Final PI is non-linear, so these
+    # components explain influence but are not expected to add exactly to PI.
     total_pi_w = sum(PI_W.values()) or 1.0
-    pi_scale = 2.2 / (sigma if (np.isfinite(sigma) and sigma > 0) else 1.0)
-    pi_intercept = 5.0 - (2.2 * med / (sigma if (np.isfinite(sigma) and sigma > 0) else 1.0))
+    pi_scale = 1.0
+    pi_intercept = 5.0
 
     def _phase_component(series, weight):
         vals = pd.to_numeric(series, errors="coerce")
-        raw = (weight * (vals - 100.0)) / total_pi_w
-        return pi_scale * raw
+        return (weight * (vals - 100.0)) / total_pi_w
 
-    w["PI_Base"] = round(float(pi_intercept), 4) if np.isfinite(pi_intercept) else np.nan
-    w["F200_PIc"] = _phase_component(w.get("F200_idx"), PI_W.get("F200_idx", 0.0)).round(3)
-    w["tsSPI_PIc"] = _phase_component(w.get("tsSPI"), PI_W.get("tsSPI", 0.0)).round(3)
-    w["Accel_PIc"] = _phase_component(w.get("Accel"), PI_W.get("Accel", 0.0)).round(3)
-    w["Grind_PIc"] = _phase_component(w.get(GR_COL), PI_W.get("Grind", 0.0)).round(3)
-    try:
-        w["Mass_PIc"] = (pi_scale * (-PER_KG_PTS * mass_delta)).round(3)
-    except Exception:
-        w["Mass_PIc"] = 0.0
+    w["PI_Base"] = 5.0
+    w["F200_PIc"] = _phase_component(w.get("F200_idx"), PI_W["F200_idx"]).round(3)
+    w["tsSPI_PIc"] = _phase_component(w.get("tsSPI"), PI_W["tsSPI"]).round(3)
+    w["Accel_PIc"] = _phase_component(w.get("Accel"), PI_W["Accel"]).round(3)
+    w["Grind_PIc"] = _phase_component(w.get("Grind"), PI_W["Grind"]).round(3)
+    w["Mass_PIc"] = 0.0
+    w["Conversion_PIc"] = 0.0
 
     phase_cols_calc = ["F200_PIc", "tsSPI_PIc", "Accel_PIc", "Grind_PIc"]
     w["PI_Phase_Total"] = (
-        pd.to_numeric(w["PI_Base"], errors="coerce")
+        5.0
         + w[phase_cols_calc].apply(pd.to_numeric, errors="coerce").fillna(0).sum(axis=1)
-        + pd.to_numeric(w.get("Mass_PIc", 0.0), errors="coerce").fillna(0)
     ).clip(0.0, 10.0).round(2)
 
     def _main_phase_from_row(r):
@@ -1561,90 +1356,19 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
             "Accel": r.get("Accel_PIc"),
             "Grind": r.get("Grind_PIc"),
         }
-        vals = {k: float(v) for k, v in vals.items() if pd.notna(v) and np.isfinite(float(v))}
-        if not vals:
-            return "-"
-        return max(vals, key=vals.get)
+        vals = {
+            k: float(v) for k, v in vals.items()
+            if pd.notna(v) and np.isfinite(float(v))
+        }
+        return max(vals, key=vals.get) if vals else "-"
 
     w["Main_PI_Phase"] = w.apply(_main_phase_from_row, axis=1)
     w.attrs["PI_PHASE_WEIGHTS"] = PI_W.copy()
-    w.attrs["PI_PHASE_SCALE"] = float(pi_scale) if np.isfinite(pi_scale) else np.nan
-    w.attrs["PI_PHASE_BASE"] = float(pi_intercept) if np.isfinite(pi_intercept) else np.nan
+    w.attrs["PI_PHASE_SCALE"] = float(pi_scale)
+    w.attrs["PI_PHASE_BASE"] = float(pi_intercept)
 # ---------- /Mass-aware PI points ----------
 
-    # ----- GCI (time + shape + efficiency) -----
-    winner_time = None
-    if "RaceTime_s" in w.columns and w["RaceTime_s"].notna().any():
-        try:
-            winner_time = float(w["RaceTime_s"].min())
-        except Exception:
-            winner_time = None
-
-    wT = 0.25
-    Wg = pi_weights_distance_and_context(
-        D,
-        pd.to_numeric(w["Accel"], errors="coerce").median(skipna=True),
-        pd.to_numeric(w[GR_COL], errors="coerce").median(skipna=True)
-    )  # (no going arg -> defaults to Good)
-
-    wPACE = Wg["Accel"] + Wg["Grind"]
-    wSS   = Wg["tsSPI"]
-    wEFF  = max(0.0, 1.0 - (wT + wPACE + wSS))
-
-    def _map_pct(x, lo=98.0, hi=104.0):
-        x = float(x) if pd.notna(x) else np.nan
-        return 0.0 if not np.isfinite(x) else clamp((x-lo)/(hi-lo), 0.0, 1.0)
-
-    gci_vals = []
-    for _, r in w.iterrows():
-        T = 0.0
-        if winner_time is not None and pd.notna(r.get("RaceTime_s")):
-            d = float(r["RaceTime_s"]) - winner_time
-            T = 1.0 if d <= 0.30 else (0.7 if d <= 0.60 else (0.4 if d <= 1.00 else 0.2))
-        LQ = 0.6*_map_pct(r.get("Accel")) + 0.4*_map_pct(r.get(GR_COL))
-        SS = _map_pct(r.get("tsSPI"))
-        acc, grd_eff = r.get("Accel"), r.get(GR_COL)
-        if pd.isna(acc) or pd.isna(grd_eff):
-            EFF = 0.0
-        else:
-            dev = (abs(acc-100.0) + abs(grd_eff-100.0))/2.0
-            EFF = clamp(1.0 - dev/8.0, 0.0, 1.0)
-        gci_vals.append(round(10.0 * (wT*T + wPACE*LQ + wSS*SS + wEFF*EFF), 3))
-    w["GCI"] = gci_vals
-
-    # ---- GCI refinement by Race Shape (GCI_RS) ----
-    # RSI sign: + = slow-early (late favoured), - = fast-early (early favoured)
-    RSI_val = float(w.attrs.get("RSI", 0.0))
-    SCI_val = float(w.attrs.get("SCI", 0.0))
-
-    # per-horse exposure along same axis (late-minus-mid already computed for RS_Component)
-    dLM = (pd.to_numeric(w["Accel"], errors="coerce") -
-           pd.to_numeric(w["tsSPI"], errors="coerce"))
-
-    # normalise exposure into [-1, +1] softly (bigger fields → slightly stronger signal)
-    field_n = max(1, len(w))
-    expo = np.tanh((dLM / 6.0)) * np.sign(RSI_val)
-
-    # gate by consensus; reduce if consensus is weak
-    consensus = 0.60 + 0.40 * max(0.0, min(1.0, SCI_val))
-    expo *= consensus
-
-    # soft-sigmoid attenuation: trim “with-shape”, boost “against-shape”
-    # cap adjustment to ±0.60 GCI points
-    with_shape  = np.clip(expo, 0.0, 1.0)
-    against     = np.clip(-expo, 0.0, 1.0)
-    adj = 0.35*against - 0.22*with_shape
-
-    # small distance seasoning (mile gets a touch more)
-    Dm = float(D_actual_m)
-    dist_gain = 1.00 + (0.06 if 1400 <= Dm <= 1800 else 0.00)
-    adj *= dist_gain
-
-    # SCI failsafe: damp everything if SCI is very low
-    if SCI_val < 0.40:
-        adj *= 0.5
-
-    w["GCI_RS"] = (pd.to_numeric(w["GCI"], errors="coerce") + adj).clip(0.0, 10.0).round(3)                           
+    # GCI removed: PI is now the sole overall performance rating.
         # ----- EARLY/LATE (blended, for display only) -----
     w["EARLY_idx"] = (0.65*pd.to_numeric(w["F200_idx"], errors="coerce") +
                       0.35*pd.to_numeric(w["tsSPI"],    errors="coerce"))
@@ -1794,6 +1518,166 @@ except Exception as e:
     st.exception(e)
     st.stop()
 
+# ======================= Pressure Retention Index (PRI) =======================
+def _pri_robust_z(series: pd.Series) -> pd.Series:
+    """Race-relative robust z-score with a standard-deviation fallback."""
+    s = pd.to_numeric(series, errors="coerce")
+    med = float(np.nanmedian(s)) if s.notna().any() else np.nan
+    mad = float(np.nanmedian(np.abs(s - med))) if np.isfinite(med) else np.nan
+    if np.isfinite(mad) and mad > 1e-9:
+        z = (s - med) / (1.4826 * mad)
+    else:
+        std = float(np.nanstd(s, ddof=0))
+        mean = float(np.nanmean(s)) if s.notna().any() else np.nan
+        z = (s - mean) / std if np.isfinite(std) and std > 1e-9 else pd.Series(0.0, index=s.index)
+    return pd.to_numeric(z, errors="coerce").clip(-3.5, 3.5)
+
+def _phase_speed_from_raw(row: pd.Series, distance_m: float, phase_low: float, phase_high: float):
+    """
+    Compute speed inside a phase expressed as distance remaining.
+    Segment times are apportioned by overlap, which supports 100m, 200m,
+    and odd opening segments without changing the source interpretation.
+    """
+    D = float(distance_m)
+    low = max(0.0, float(phase_low))
+    high = min(D, float(phase_high))
+    if high <= low:
+        return np.nan, 0.0
+
+    markers = []
+    for c in row.index:
+        if isinstance(c, str) and c.endswith("_Time") and c != "Finish_Time":
+            try:
+                markers.append(int(c.split("_")[0]))
+            except Exception:
+                pass
+    markers = sorted({m for m in markers if 0 < m < D}, reverse=True)
+
+    segments = []
+    prev = D
+    for marker in markers:
+        col = f"{marker}_Time"
+        if marker >= prev:
+            continue
+        segments.append((float(prev), float(marker), col))
+        prev = float(marker)
+    if "Finish_Time" in row.index and prev > 0:
+        segments.append((float(prev), 0.0, "Finish_Time"))
+
+    total_dist = 0.0
+    total_time = 0.0
+    for seg_high, seg_low, col in segments:
+        overlap = max(0.0, min(seg_high, high) - max(seg_low, low))
+        if overlap <= 0:
+            continue
+        t = pd.to_numeric(row.get(col), errors="coerce")
+        seg_dist = seg_high - seg_low
+        if pd.isna(t) or float(t) <= 0 or seg_dist <= 0:
+            continue
+        total_dist += overlap
+        total_time += float(t) * (overlap / seg_dist)
+
+    if total_dist <= 0 or total_time <= 0:
+        return np.nan, total_dist
+    return total_dist / total_time, total_dist
+
+def build_pri_table(raw_df: pd.DataFrame, metrics_df: pd.DataFrame, distance_m: float) -> pd.DataFrame:
+    """
+    Pressure phase: after the opening 200m until 400m from home.
+    Retention phase: final 400m.
+    PRI is independent of PI. Positive pressure only earns full credit when
+    the horse retains that effort through the final 400m.
+    """
+    D = float(distance_m)
+    out = pd.DataFrame(index=raw_df.index)
+    out["Horse"] = raw_df["Horse"].astype(str) if "Horse" in raw_df.columns else metrics_df["Horse"].astype(str)
+    if "Finish_Pos" in metrics_df.columns:
+        out["Finish_Pos"] = pd.to_numeric(metrics_df["Finish_Pos"], errors="coerce").to_numpy()
+    if "PI" in metrics_df.columns:
+        out["PI"] = pd.to_numeric(metrics_df["PI"], errors="coerce").to_numpy()
+
+    pressure_low = 400.0
+    pressure_high = max(pressure_low, D - 200.0)
+    middle_speeds, middle_coverage = [], []
+    late_speeds, late_coverage = [], []
+
+    for _, row in raw_df.iterrows():
+        ms, mc = _phase_speed_from_raw(row, D, pressure_low, pressure_high)
+        ls, lc = _phase_speed_from_raw(row, D, 0.0, min(400.0, D))
+        middle_speeds.append(ms); middle_coverage.append(mc)
+        late_speeds.append(ls); late_coverage.append(lc)
+
+    out["Pressure_Speed"] = pd.to_numeric(pd.Series(middle_speeds, index=out.index), errors="coerce")
+    out["Late_Speed"] = pd.to_numeric(pd.Series(late_speeds, index=out.index), errors="coerce")
+    out["Pressure_Coverage_m"] = middle_coverage
+    out["Late_Coverage_m"] = late_coverage
+
+    field_middle = float(np.nanmedian(out["Pressure_Speed"])) if out["Pressure_Speed"].notna().any() else np.nan
+    out["Pressure_Delta_pct"] = np.where(
+        np.isfinite(field_middle) & (field_middle > 0),
+        100.0 * (out["Pressure_Speed"] / field_middle - 1.0),
+        np.nan,
+    )
+    out["Retention_pct"] = np.where(
+        (out["Pressure_Speed"] > 0) & out["Late_Speed"].notna(),
+        100.0 * out["Late_Speed"] / out["Pressure_Speed"],
+        np.nan,
+    )
+
+    out["Pressure_z"] = _pri_robust_z(out["Pressure_Delta_pct"])
+    out["Retention_z"] = _pri_robust_z(out["Retention_pct"])
+
+    # Retained-pressure model:
+    # - Only above-field pressure creates positive pressure credit.
+    # - That credit is gated by how much speed the horse retained late.
+    # - 90% retention gives no retained-pressure credit; 100% gives full credit.
+    #   Values outside that band are clipped for stability.
+    out["Positive_Pressure_z"] = pd.to_numeric(out["Pressure_z"], errors="coerce").clip(lower=0.0)
+    out["Retention_Gate"] = (
+        (pd.to_numeric(out["Retention_pct"], errors="coerce") - 90.0) / 10.0
+    ).clip(lower=0.0, upper=1.0)
+    out["Retained_Pressure"] = out["Positive_Pressure_z"] * out["Retention_Gate"]
+
+    # Pressure gate prevents low-pressure closers from topping PRI purely on late retention.
+    # - Clearly negative pressure receives little or no access to a high PRI.
+    # - Neutral pressure receives partial access.
+    # - Strong positive pressure receives full access.
+    out["Pressure_Gate"] = (
+        (pd.to_numeric(out["Pressure_Delta_pct"], errors="coerce") + 0.25) / 1.0
+    ).clip(lower=0.0, upper=1.0)
+
+    out["PRI_Core"] = (
+        0.75 * out["Retained_Pressure"]
+        + 0.25 * out["Retention_z"] * out["Pressure_Gate"]
+    )
+    out["PRI"] = (5.0 + 2.5 * np.tanh(out["PRI_Core"] / 1.35)).clip(0.0, 10.0)
+
+    retention_median = float(np.nanmedian(out["Retention_pct"])) if out["Retention_pct"].notna().any() else np.nan
+    def _pri_profile(row):
+        p = row.get("Pressure_Delta_pct")
+        r = row.get("Retention_pct")
+        if not (pd.notna(p) and pd.notna(r) and np.isfinite(retention_median)):
+            return "Insufficient data"
+        high_p = float(p) >= 0.0
+        high_r = float(r) >= retention_median
+        if high_p and high_r:
+            return "Pressure resistant"
+        if high_p and not high_r:
+            return "Brave but faded"
+        if not high_p and high_r:
+            return "Pace-assisted closer"
+        return "Low-pressure performer"
+
+    out["Profile"] = out.apply(_pri_profile, axis=1)
+    out["PRI_Rank"] = out["PRI"].rank(method="min", ascending=False, na_option="bottom").astype("Int64")
+    out.attrs["pressure_phase"] = f"after first 200m to 400m remaining"
+    out.attrs["retention_phase"] = "final 400m"
+    out.attrs["field_middle_speed"] = field_middle
+    out.attrs["retention_median"] = retention_median
+    return out
+
+PRI_TABLE = build_pri_table(work.reset_index(drop=True), metrics.reset_index(drop=True), float(race_distance_input))
+
 # ----------------------- RPSS (race-level tsSPI benchmark strength) -----------------------
 RPSS_INFO = compute_rpss(metrics, float(race_distance_input), int(split_step), seg_markers)
 if RPSS_INFO:
@@ -1802,185 +1686,6 @@ if RPSS_INFO:
     metrics.attrs["RPSS_BEATERS_PCT"] = RPSS_INFO.get("beaters_pct")
     metrics.attrs["RPSS_STD_SPLIT"] = RPSS_INFO.get("benchmark_split_time")
     metrics.attrs["RPSS_RACE_AVG_SPLIT"] = RPSS_INFO.get("race_avg_split_time")
-
-# ----------------------- Race Quality Score (RQS v2) -----------------------
-def compute_rqs(df: pd.DataFrame, attrs: dict) -> float:
-    """
-    RQS v2 (0..100): single-race class/quality indicator, handicap-friendly.
-
-    Ingredients (no GCI in the core):
-      • Peak talent  (S1): p90(PI_RS or PI) scaled to 0..100
-      • Depth        (S2): share with PI_RS >= 6.8 (good/strong mark)
-      • Dispersion   (S3): how healthy the spread is (MAD target ≈ 1.0)
-      • Field trust  (mult): small lift for bigger fields, small trim for tiny fields
-      • False-run penalty: if FRA applied with real conviction (SCI high)
-    """
-    if df is None or len(df) == 0:
-        return 0.0
-
-    # Prefer RS-adjusted; fall back cleanly
-    pi = pd.to_numeric(df.get("PI_RS", df.get("PI")), errors="coerce")
-    pi = pi[pi.notna()]
-    if pi.empty:
-        return 0.0
-
-    # ---------- S1: Peak talent (p90 of PI) ----------
-    p90 = float(np.nanpercentile(pi.values, 90))
-    S1  = 10.0 * p90                    # 0..100
-
-    # ---------- S2: Depth above a strong bar ----------
-    # 6.8 is a “solid black-type” effort in your scale.
-    depth_prop = _pct_at_or_above(pi, 6.8)
-    S2 = 100.0 * depth_prop             # 0..100
-
-    # --- S3: Dispersion “health” (use RAW MAD, not mad_std) ---
-    center = float(np.nanmedian(pi))
-    mad_raw = float(np.nanmedian(np.abs(pi - center)))  # <-- raw MAD (no 1.4826)
-    if not np.isfinite(mad_raw): mad_raw = 1.2
-    # peak at 1.2; falls linearly to 0 at 0 or 2.4
-    S3 = 100.0 * max(0.0, 1.0 - abs(mad_raw - 1.2) / 1.2)
-
-    # ---------- field-size trust (multiplier 0.85..1.15) ----------
-    n = int(len(df.index))
-    # 6 → 0.85 ; 10 → ~1.02 ; 12 → 1.08 ; 14+ → 1.15 (capped)
-    trust = 0.85 + 0.30 * max(0.0, min(1.0, (n - 6) / 8.0))
-    trust = float(min(1.15, max(0.85, trust)))
-
-    # ---------- False-run penalty (only when FRA actually applied & SCI meaningful) ----------
-    fra_applied = int(attrs.get("FRA_APPLIED", 0) or 0)
-    sci         = float(attrs.get("SCI", 1.0))
-    penalty = 0.0
-    if fra_applied == 1 and sci >= 0.60:
-        # Up to 10 pts at SCI=1.0, scaled from 0 at 0.60
-        penalty = 10.0 * (sci - 0.60) / 0.40
-        penalty = float(min(10.0, max(0.0, penalty)))
-
-    # ---------- Blend (weights sum to 1.0 before multiplier) ----------
-    # Handicap-friendly: put most weight on peak & depth; dispersion still matters.
-    w1, w2, w3 = 0.55, 0.25, 0.20
-    base = w1*S1 + w2*S2 + w3*S3
-
-    rqs = base * trust - penalty
-    return float(np.clip(round(rqs, 1), 0.0, 100.0))
-
-# Compute once and store into attrs (used by header / PDF / DB)
-metrics.attrs["RQS"] = compute_rqs(metrics, metrics.attrs)
-
-def compute_rps(df: pd.DataFrame) -> float:
-    """
-    RPS (0..100): star-aware peak strength.
-    Blends p95(PI_RS) with the true peak based on dominance and field-size trust.
-    """
-    if df is None or len(df) == 0:
-        return 0.0
-
-    pi = pd.to_numeric(df.get("PI_RS", df.get("PI")), errors="coerce").dropna()
-    n = int(pi.size)
-    if n == 0:
-        return 0.0
-
-    p95 = float(np.nanpercentile(pi, 95)) if n >= 5 else float(np.nanmax(pi))
-    p90 = float(np.nanpercentile(pi, 90)) if n >= 4 else p95
-    pmax = float(np.nanmax(pi))
-    # second-best (for Gap2)
-    if n >= 2:
-        top2 = np.partition(pi.values, -2)[-2]
-    else:
-        top2 = p90
-
-    # Dominance signals (in PI points, not ×10)
-    gap_top = max(0.0, pmax - p90)       # how far top is beyond the elite band
-    gap_2   = max(0.0, pmax - float(top2))  # separation to 2nd
-
-    # Field-size trust: 0 at ≤6; 1 at ≥12 (same shape as you used elsewhere)
-    trust = max(0.0, min(1.0, (n - 6) / 6.0))
-
-    # Turn dominance into [0..1] via a smooth ramp that saturates ~3pts
-    # (≈ 3 PI points above the pack is huge)
-    def smooth_saturate(x, mid=1.8, span=1.2):
-        # 0 at x=0; ~0.5 at mid; →1 near mid+span (~3.0)
-        return max(0.0, min(1.0, (x / (mid + span))))
-
-    dom = max(smooth_saturate(gap_top), smooth_saturate(gap_2))
-
-    # Final blend weight toward the max:
-    # base 0.30 (slight pull to max), + up to +0.40 from dominance*trust
-    w_star = 0.30 + 0.40 * dom * trust
-    w_star = max(0.0, min(0.95, w_star))  # safety clamp
-
-    rps_pi = (1.0 - w_star) * p95 + w_star * pmax
-    return float(np.clip(round(10.0 * rps_pi, 1), 0.0, 100.0))
-
-# ----------------------- Race Peak Strength (RPS) + Race Profile -----------------------
-def compute_rps(df: pd.DataFrame) -> float:
-    """
-    RPS (0..100): star-aware peak strength.
-    Blends p95(PI_RS) with the true peak based on dominance and field-size trust.
-    """
-    if df is None or len(df) == 0:
-        return 0.0
-
-    pi = pd.to_numeric(df.get("PI"), errors="coerce").dropna()
-    n = int(pi.size)
-    if n == 0:
-        return 0.0
-
-    p95 = float(np.nanpercentile(pi, 95)) if n >= 5 else float(np.nanmax(pi))
-    p90 = float(np.nanpercentile(pi, 90)) if n >= 4 else p95
-    pmax = float(np.nanmax(pi))
-    # second-best (for Gap2)
-    if n >= 2:
-        top2 = np.partition(pi.values, -2)[-2]
-    else:
-        top2 = p90
-
-    # Dominance signals (in PI points, not ×10)
-    gap_top = max(0.0, pmax - p90)       # how far top is beyond the elite band
-    gap_2   = max(0.0, pmax - float(top2))  # separation to 2nd
-
-    # Field-size trust: 0 at ≤6; 1 at ≥12 (same shape as you used elsewhere)
-    trust = max(0.0, min(1.0, (n - 6) / 6.0))
-
-    # Turn dominance into [0..1] via a smooth ramp that saturates ~3pts
-    # (≈ 3 PI points above the pack is huge)
-    def smooth_saturate(x, mid=1.8, span=1.2):
-        # 0 at x=0; ~0.5 at mid; →1 near mid+span (~3.0)
-        return max(0.0, min(1.0, (x / (mid + span))))
-
-    dom = max(smooth_saturate(gap_top), smooth_saturate(gap_2))
-
-    # Final blend weight toward the max:
-    # base 0.30 (slight pull to max), + up to +0.40 from dominance*trust
-    w_star = 0.30 + 0.40 * dom * trust
-    w_star = max(0.0, min(0.95, w_star))  # safety clamp
-
-    rps_pi = (1.0 - w_star) * p95 + w_star * pmax
-    return float(np.clip(round(10.0 * rps_pi, 1), 0.0, 100.0))
-
-def classify_race_profile(rqs: float, rps: float) -> tuple[str, str]:
-    """
-    Return (label, color_hex) for the badge.
-    - 🔴 Top-Heavy  when RPS - RQS ≥ 18
-    - 🟢 Deep Field when RQS ≥ RPS - 10
-    - ⚪ Average Profile otherwise
-    """
-    if not (math.isfinite(rqs) and math.isfinite(rps)):
-        return ("Unknown", "#7f8c8d")
-    delta = rps - rqs
-    if delta >= 18.0:
-        return ("🔴 Top-Heavy", "#e74c3c")
-    elif rqs >= (rps - 10.0):
-        return ("🟢 Deep Field", "#2ecc71")
-    else:
-        return ("⚪ Average Profile", "#95a5a6")
-
-metrics.attrs["RPS"] = compute_rps(metrics)
-_profile_label, _profile_color = classify_race_profile(
-    float(metrics.attrs.get("RQS", np.nan)),
-    float(metrics.attrs.get("RPS", np.nan))
-)
-metrics.attrs["RACE_PROFILE"] = _profile_label
-metrics.attrs["RACE_PROFILE_COLOR"] = _profile_color
 
 # ======================= Data Integrity & Header (post compute) ==========================
 def _expected_segments(distance_m: float, step:int) -> list[str]:
@@ -2004,51 +1709,17 @@ def _integrity_scan(df: pd.DataFrame, distance_m: float, step: int):
 
 integrity_text, missing_cols, invalid_counts = _integrity_scan(work, race_distance_input, split_step)
 
-# ======================= Header with RQS + RPS + Badge =======================
+# ======================= Clean race header =======================
 _hdr = (
     f"## Race Distance: **{int(race_distance_input)}m**  |  "
-    f"Split step: **{split_step}m**  |  "
-    f"Shape: **{metrics.attrs.get('SHAPE_TAG','EVEN')}**  |  "
-    f"RSI: **{metrics.attrs.get('RSI',0.0):+.2f} / 10**  |  "
-    f"Finish: **{metrics.attrs.get('FINISH_FLAV','Balanced Finish')}**  |  "
-    f"SCI: **{metrics.attrs.get('SCI',0.0):.2f}**  |  "
-    f"FRA: **{'Yes' if metrics.attrs.get('FRA_APPLIED',0)==1 else 'No'}**"
+    f"Split step: **{split_step}m**"
 )
-rqs_v = metrics.attrs.get("RQS", None)
-rps_v = metrics.attrs.get("RPS", None)
-if rqs_v is not None:
-    _hdr += f"  |  **RQS:** {float(rqs_v):.1f}/100"
-if rps_v is not None:
-    _hdr += f"  |  **RPS:** {float(rps_v):.1f}/100"
 
 metrics.attrs["WIND_AFFECTED"] = bool(WIND_AFFECTED)
 metrics.attrs["WIND_TAG"] = str(WIND_TAG)
 
 st.markdown(_hdr)
 
-# Badge + short legend line
-render_profile_badge(
-    metrics.attrs.get("RACE_PROFILE","Unknown"),
-    metrics.attrs.get("RACE_PROFILE_COLOR","#7f8c8d")
-)
-st.caption("RQS = field depth/consistency • RPS = peak performance • Badge = depth vs dominance")
-# ----------------------- RQS Badge -----------------------
-rqs_val = float(metrics.attrs.get("RQS", 0.0))
-if rqs_val >= 80:
-    badge_color, badge_label = "#27AE60", "Elite Class"
-elif rqs_val >= 65:
-    badge_color, badge_label = "#F39C12", "Competitive Field"
-elif rqs_val >= 45:
-    badge_color, badge_label = "#E67E22", "Moderate Class"
-else:
-    badge_color, badge_label = "#C0392B", "Weak Field"
-
-st.markdown(
-    f"<div style='display:inline-block;padding:4px 10px;border-radius:6px;"
-    f"background-color:{badge_color};color:white;font-weight:bold;'>"
-    f"RQS {rqs_val:.1f} / 100 — {badge_label}</div>",
-    unsafe_allow_html=True
-)
 if SHOW_WARNINGS and (missing_cols or any(v>0 for v in invalid_counts.values())):
     bads = [f"{k} ({v} rows)" for k,v in invalid_counts.items() if v > 0]
     warn = []
@@ -2058,13 +1729,10 @@ if SHOW_WARNINGS and (missing_cols or any(v>0 for v in invalid_counts.values()))
 if split_step == 200:
     st.caption("First panel & F-window adapt to odd 200m distances (e.g., 1160→F160, 1450→F250, 1100→F100). Finish is the 200→0 split.")
 
-if _view_is("Dashboard", "Full Report"):
-    render_dashboard(metrics.copy(), split_step, float(race_distance_input), GOING_TYPE, WIND_TAG)
+if _view_is("Core Metrics"):
+    st.markdown("## Sectional Metrics (PI + Core Sectionals + SRI + TOF)")
 
-if _view_is("Core Metrics", "Full Report"):
-    st.markdown("## Sectional Metrics (PI v3.2 & GCI + CG + Race Shape + SRI + TOF)")
-
-if _view_is("Core Metrics", "Full Report"):
+if _view_is("Core Metrics"):
     GR_COL = metrics.attrs.get("GR_COL", "Grind")
 
     show_cols = [
@@ -2073,8 +1741,7 @@ if _view_is("Core Metrics", "Full Report"):
         "EARLY_idx","LATE_idx",
         "Peak_Speed","Peak_Location","SRI","SRI_Profile",
         "GrindAdjPts","DeltaG",
-        "PI","GCI","GCI_RS",
-        "RSI","RS_Component","RSI_Cue"
+        "PI","PI_pts","Sprint_Conversion_Penalty"
     ]
 
     # ---- make the column pick robust (no KeyError if some are missing) ----
@@ -2092,17 +1759,6 @@ if _view_is("Core Metrics", "Full Report"):
 
     st.dataframe(display_df, use_container_width=True)
 
-    # Now (optionally) backfill RSI/exposure cue columns from attrs if they were missing
-    if "RSI" in metrics.attrs and display_df["RSI"].isna().all():
-        display_df["RSI"] = float(metrics.attrs["RSI"])
-    if "RS_Component" in metrics.columns and display_df["RS_Component"].isna().all():
-        display_df["RS_Component"] = metrics["RS_Component"]
-    if "RSI_Cue" in metrics.columns and display_df["RSI_Cue"].isna().all():
-        display_df["RSI_Cue"] = metrics["RSI_Cue"]
-    # ----- Add RSI & exposure columns to the Sectional Metrics view -----
-    display_df["RSI"]          = metrics.attrs.get("RSI", np.nan)
-    display_df["RS_Component"] = metrics.get("RS_Component", np.nan)
-    display_df["RSI_Cue"]      = metrics.get("RSI_Cue", "")
     # Going note (PI only)
     pi_meta = metrics.attrs.get("PI_GOING_META", {})
     if pi_meta:
@@ -2113,42 +1769,10 @@ if _view_is("Core Metrics", "Full Report"):
         moved = [f"{k}×{mult[k]:.3f}" for k in ["Accel","F200_idx","tsSPI","Grind"] if abs(mult.get(k,1.0)-1.0) >= 0.005]
         if moved:
             st.caption(f"Going: {g} — PI weight multipliers: " + ", ".join(moved) + f" (field={n}).")
-            st.caption("RSI: + = slow-early (late favoured), − = fast-early (early favoured).  RS_Component per horse uses the same axis.  🔵 with shape · 🔴 against shape.")
 
     render_rpss_section(RPSS_INFO)
 
-    # ======================= Race Class Summary (pure stats) =======================
-    st.markdown("## Race Class Summary")
-
-    # Prefer GCI_RS, fall back to GCI
-    gci_col = "GCI_RS" if ("GCI_RS" in metrics.columns and pd.to_numeric(metrics["GCI_RS"], errors="coerce").notna().any()) else "GCI"
-    s = pd.to_numeric(metrics.get(gci_col, pd.Series(dtype=float)), errors="coerce").dropna()
-
-    if s.empty:
-        st.info("No valid GCI values found for this race.")
-    else:
-        mean_v   = float(s.mean())
-        med_v    = float(s.median())
-        # Robust spread stats (raw MAD, not 1.4826 scaled; and IQR)
-        mad_raw  = float(np.nanmedian(np.abs(s - med_v)))
-        try:
-            q75, q25 = np.nanpercentile(s, 75), np.nanpercentile(s, 25)
-            iqr_v    = float(q75 - q25)
-        except Exception:
-            iqr_v    = float("nan")
-
-        c1, c2, c3, c4 = st.columns([1,1,1,1])
-        with c1:
-            st.metric("Mean GCI", f"{mean_v:.2f}")
-        with c2:
-            st.metric("Median GCI", f"{med_v:.2f}")
-        with c3:
-            st.metric("Spread (MAD)", f"{mad_raw:.2f}")
-        with c4:
-            st.metric("IQR", f"{iqr_v:.2f}" if np.isfinite(iqr_v) else "—")
-
-        st.caption(f"Source: **{gci_col}** (pure stats; no class labels).")
-    # =================== /Race Class Summary ===================
+    # GCI-based Race Class Summary removed.
 
     # ======================= Ahead of the Handicap — One-Run Weight Intelligence =======================
     st.markdown("## Ahead of the Handicap — One-Run (Race-local)")
@@ -2340,7 +1964,7 @@ if _view_is("Core Metrics", "Full Report"):
         except Exception:
             _repel_labels_builtin(ax, x, y, names)
 
-if _view_is("Visuals", "Full Report"):
+if _view_is("Pace Curve"):
     # ======================= Pace Curve — enhanced detailed version =======================
     st.markdown("## Pace Curve")
 
@@ -2352,12 +1976,7 @@ if _view_is("Visuals", "Full Report"):
     with cpc3:
         show_phase_shading = st.toggle("Phase shading", value=True, key="pace_curve_phase_shading")
 
-    cpc4, cpc5 = st.columns([1,1])
-    with cpc4:
-        show_end_labels = st.toggle("Line-end labels", value=True, key="pace_curve_end_labels")
-    with cpc5:
-        make_png = st.toggle("Prepare PNG for download", value=False, key="pace_curve_png") if _view_is("Exports & Notes", "Full Report") else False
-    pace_png = None
+    show_end_labels = st.toggle("Line-end labels", value=True, key="pace_curve_end_labels")
 
     step = int(metrics.attrs.get("STEP", 100))
     D = float(race_distance_input)
@@ -2606,156 +2225,13 @@ if _view_is("Visuals", "Full Report"):
                 except Exception:
                     st.caption(f"View: {runner_set}. Ranking basis: {ranking_rule}.")
 
-                # optional png export
-                if make_png:
-                    buf = io.BytesIO()
-                    fig.savefig(buf, format="png", dpi=220, bbox_inches="tight", facecolor="white")
-                    pace_png = buf.getvalue()
-                    st.download_button("Download pace curve (PNG)", pace_png, file_name="pace_curve.png", mime="image/png")
                 plt.close(fig)
     # ======================= /Pace Curve (enhanced detailed version) =======================
 
 
 
 
-    # ======================= Visual 1: Sectional Shape Map =======================
-    st.markdown("## Sectional Shape Map — Accel (home drive) vs Grind (finish)")
-    shape_map_png = None
-    GR_COL = metrics.attrs.get("GR_COL","Grind")
-
-    need_cols={"Horse","Accel",GR_COL,"tsSPI","PI"}
-    if not need_cols.issubset(metrics.columns):
-        st.warning("Shape Map: required columns missing: " + ", ".join(sorted(need_cols - set(metrics.columns))))
-    else:
-        dfm = metrics.loc[:, ["Horse","Accel",GR_COL,"tsSPI","PI"]].copy()
-        for c in ["Accel",GR_COL,"tsSPI","PI"]:
-            dfm[c] = pd.to_numeric(dfm[c], errors="coerce")
-        dfm = dfm.dropna(subset=["Accel",GR_COL,"tsSPI"])
-        if dfm.empty:
-            st.info("Not enough data to draw the shape map.")
-        else:
-            dfm["AccelΔ"]=dfm["Accel"]-100.0
-            dfm["GrindΔ"]=dfm[GR_COL]-100.0
-            dfm["tsSPIΔ"]=dfm["tsSPI"]-100.0
-            names=dfm["Horse"].astype(str).to_list()
-            xv=dfm["AccelΔ"].to_numpy(); yv=dfm["GrindΔ"].to_numpy()
-            cv=dfm["tsSPIΔ"].to_numpy(); piv=dfm["PI"].fillna(0).to_numpy()
-
-            span=max(4.5,float(np.nanmax(np.abs(np.concatenate([xv,yv])))))
-            lim=np.ceil(span/1.5)*1.5
-
-            DOT_MIN, DOT_MAX = 40.0, 140.0
-            pmin,pmax=np.nanmin(piv),np.nanmax(piv)
-            sizes=np.full_like(xv,DOT_MIN) if not np.isfinite(pmin) or not np.isfinite(pmax) \
-                   else DOT_MIN+(piv-pmin)/(pmax-pmin+1e-9)*(DOT_MAX-DOT_MIN)
-
-            fig, ax = plt.subplots(figsize=(7.8,6.2))
-            # quadrant tint (stronger alpha)
-            TINT=0.12
-            ax.add_patch(Rectangle((0,0),lim,lim,facecolor="#4daf4a",alpha=TINT,zorder=0))
-            ax.add_patch(Rectangle((-lim,0),lim,lim,facecolor="#377eb8",alpha=TINT,zorder=0))
-            ax.add_patch(Rectangle((0,-lim),lim,lim,facecolor="#ff7f00",alpha=TINT,zorder=0))
-            ax.add_patch(Rectangle((-lim,-lim),lim,lim,facecolor="#984ea3",alpha=TINT,zorder=0))
-            ax.axvline(0,color="gray",lw=1.3,ls=(0,(3,3)),zorder=1)
-            ax.axhline(0,color="gray",lw=1.3,ls=(0,(3,3)),zorder=1)
-
-            vmin,vmax=np.nanmin(cv),np.nanmax(cv)
-            if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin==vmax:
-                vmin,vmax=-1.0,1.0
-            norm=TwoSlopeNorm(vcenter=0.0,vmin=vmin,vmax=vmax)
-
-            sc=ax.scatter(xv,yv,s=sizes,c=cv,cmap="coolwarm",norm=norm,
-                          edgecolor="black",linewidth=0.6,alpha=0.95)
-            label_points_neatly(ax,xv,yv,names)
-
-            ax.set_xlim(-lim,lim); ax.set_ylim(-lim,lim)
-            ax.set_xlabel("Acceleration vs field (points) →")
-            ax.set_ylabel(("Corrected " if USE_CG else "")+"Grind vs field (points) ↑")
-            ax.set_title("Quadrants: +X=Accel  · +Y="+("Corrected Grind" if USE_CG else "Grind")+" · Colour=tsSPIΔ")
-            s_ex=[DOT_MIN,0.5*(DOT_MIN+DOT_MAX),DOT_MAX]
-            h_ex=[Line2D([0],[0],marker='o',color='w',markerfacecolor='gray',
-                         markersize=np.sqrt(s/np.pi),markeredgecolor='black') for s in s_ex]
-            ax.legend(h_ex,["PI low","PI mid","PI high"],loc="upper left",frameon=False,fontsize=8)
-            cbar=fig.colorbar(sc,ax=ax,fraction=0.046,pad=0.04); cbar.set_label("tsSPI − 100")
-            ax.grid(True,linestyle=":",alpha=0.25)
-            st.pyplot(fig)
-            buf=io.BytesIO(); fig.savefig(buf,format="png",dpi=300,bbox_inches="tight")
-            shape_map_png=buf.getvalue()
-            if _view_is("Exports & Notes", "Full Report"):
-                st.download_button("Download shape map (PNG)",shape_map_png,file_name="shape_map.png",mime="image/png")
-            st.caption(("Y uses Corrected Grind (CG). " if USE_CG else "")+"Size=PI; X=Accel; Colour=tsSPIΔ.")
-
-
-    # ======================= TOF Map — Acceleration vs Travel =======================
-    st.markdown("## TOF Map — Turn of Foot vs Travel")
-    need_tof = {"Horse", "Accel", "tsSPI", "TOF"}
-    if not need_tof.issubset(metrics.columns):
-        st.info("TOF Map: Accel, tsSPI and TOF are not available for this file.")
-    else:
-        dft = metrics.loc[:, ["Horse", "Accel", "tsSPI", "TOF", "SRI", "PI"]].copy()
-        for c in ["Accel", "tsSPI", "TOF", "SRI", "PI"]:
-            dft[c] = pd.to_numeric(dft.get(c, np.nan), errors="coerce")
-        dft = dft.dropna(subset=["Accel", "tsSPI", "TOF"])
-        if dft.empty:
-            st.info("Not enough TOF data to draw the map.")
-        else:
-            fig, ax = plt.subplots(figsize=(7.8, 5.8))
-            names = dft["Horse"].astype(str).to_list()
-            x = (dft["tsSPI"] - 100.0).to_numpy()
-            y = (dft["Accel"] - 100.0).to_numpy()
-            tof_vals = dft["TOF"].to_numpy()
-            pi_vals = dft["PI"].fillna(dft["PI"].median()).to_numpy()
-            pmin, pmax = np.nanmin(pi_vals), np.nanmax(pi_vals)
-            sizes = np.full_like(x, 70.0) if not np.isfinite(pmin) or pmin == pmax else 45.0 + (pi_vals-pmin)/(pmax-pmin+1e-9)*115.0
-            sc = ax.scatter(x, y, c=tof_vals, s=sizes, alpha=0.92, edgecolor="black", linewidth=0.6, cmap="coolwarm")
-            label_points_neatly(ax, x, y, names)
-            ax.axhline(0, color="gray", lw=1.0, ls=(0,(3,3)))
-            ax.axvline(0, color="gray", lw=1.0, ls=(0,(3,3)))
-            ax.set_xlabel("tsSPI − 100 / travel strength")
-            ax.set_ylabel("Accel − 100 / acceleration strength")
-            ax.set_title("Top-left = sharp kick; top-right = complete accelerator")
-            ax.grid(True, linestyle=":", alpha=0.25)
-            cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-            cbar.set_label("TOF = Accel − tsSPI")
-            st.pyplot(fig)
-            st.caption("TOF isolates acceleration above/below the horse’s travel strength. Size=PI; colour=TOF.")
-
-    # ======================= SRI Map — Peak Speed vs Speed Retention =======================
-    st.markdown("## SRI Map — Peak Speed vs Speed Retention")
-    need_sri = {"Horse", "Peak_Speed", "SRI"}
-    if not need_sri.issubset(metrics.columns):
-        st.info("SRI Map: Peak Speed and SRI are not available for this file.")
-    else:
-        dfs = metrics.loc[:, ["Horse", "Peak_Speed", "Peak_Location", "SRI", "PI"]].copy()
-        dfs["Peak_Speed"] = pd.to_numeric(dfs["Peak_Speed"], errors="coerce")
-        dfs["SRI"] = pd.to_numeric(dfs["SRI"], errors="coerce")
-        dfs["PI"] = pd.to_numeric(dfs.get("PI", np.nan), errors="coerce")
-        dfs = dfs.dropna(subset=["Peak_Speed", "SRI"])
-        if dfs.empty:
-            st.info("Not enough SRI data to draw the map.")
-        else:
-            fig, ax = plt.subplots(figsize=(7.8, 5.8))
-            names = dfs["Horse"].astype(str).to_list()
-            x = dfs["Peak_Speed"].to_numpy()
-            y = dfs["SRI"].to_numpy()
-            pi_vals = dfs["PI"].fillna(dfs["PI"].median()).to_numpy()
-            pmin, pmax = np.nanmin(pi_vals), np.nanmax(pi_vals)
-            sizes = np.full_like(x, 70.0) if not np.isfinite(pmin) or pmin == pmax else 45.0 + (pi_vals-pmin)/(pmax-pmin+1e-9)*115.0
-            ax.scatter(x, y, s=sizes, alpha=0.92, edgecolor="black", linewidth=0.6)
-            label_points_neatly(ax, x, y, names)
-            ax.axhline(96, color="gray", lw=1.0, ls=(0,(3,3)))
-            ax.axhline(94, color="gray", lw=0.8, ls=":")
-            ax.axhline(92, color="gray", lw=0.8, ls=":")
-            ax.set_xlabel("Peak speed (m/s)")
-            ax.set_ylabel("SRI — speed retained after peak (%)")
-            ax.set_title("Top-right = high peak speed + high retention")
-            ax.grid(True, linestyle=":", alpha=0.25)
-            st.pyplot(fig)
-            st.caption("SRI = average speed from the horse’s peak sectional through the finish ÷ peak speed × 100. Size=PI.")
-
-
-# ======================= Ability Radar =======================
-if _view_is("Ability Radar", "Full Report"):
+if _view_is("Ability Radar"):
     st.markdown("## Ability Radar")
     st.caption(
         "Compare horses from the same race using the core Race Edge indexed values. "
@@ -2991,12 +2467,115 @@ if _view_is("Ability Radar", "Full Report"):
                     """
                 )
 
+# ======================= Pressure Retention module =======================
+if _view_is("Pressure Retention"):
+    st.markdown("## Pressure Retention Index (PRI)")
+    st.caption(
+        "PRI measures how much sustained pressure a horse absorbed after the opening 200m "
+        "and, crucially, how much of that pressure it retained through the final 400m. "
+        "Pressure credit is reduced when a horse fades. PRI remains separate from PI."
+    )
+
+    pri = PRI_TABLE.copy()
+    valid_pri = pri.dropna(subset=["Pressure_Delta_pct", "Retention_pct", "PRI"]).copy()
+
+    if valid_pri.empty:
+        st.info("PRI could not be calculated from the available sectional columns.")
+    else:
+        top = valid_pri.sort_values("PRI", ascending=False).iloc[0]
+        high_pressure = valid_pri.sort_values("Pressure_Delta_pct", ascending=False).iloc[0]
+        best_retention = valid_pri.sort_values("Retention_pct", ascending=False).iloc[0]
+
+        pc1, pc2, pc3 = st.columns(3)
+        pc1.metric("Top PRI", str(top["Horse"]), f'{float(top["PRI"]):.2f}')
+        pc2.metric("Most pressure absorbed", str(high_pressure["Horse"]), f'{float(high_pressure["Pressure_Delta_pct"]):+.2f}%')
+        pc3.metric("Best late retention", str(best_retention["Horse"]), f'{float(best_retention["Retention_pct"]):.1f}%')
+
+        st.markdown("### Pressure vs Retention map")
+        fig, ax = plt.subplots(figsize=(10.5, 6.6))
+        x = pd.to_numeric(valid_pri["Pressure_Delta_pct"], errors="coerce").to_numpy(dtype=float)
+        y = pd.to_numeric(valid_pri["Retention_pct"], errors="coerce").to_numpy(dtype=float)
+        c = pd.to_numeric(valid_pri["PRI"], errors="coerce").to_numpy(dtype=float)
+        sizes = 70 + 18 * np.clip(c, 0, 10)
+
+        sc = ax.scatter(x, y, c=c, s=sizes, cmap="viridis", vmin=0, vmax=10,
+                        edgecolors="white", linewidths=0.8, alpha=0.92, zorder=3)
+        retention_med = float(valid_pri.attrs.get("retention_median", np.nanmedian(y)))
+        ax.axvline(0.0, color="grey", lw=1.1, ls="--", alpha=0.75)
+        ax.axhline(retention_med, color="grey", lw=1.1, ls="--", alpha=0.75)
+
+        for _, r in valid_pri.iterrows():
+            ax.annotate(
+                str(r["Horse"]),
+                (float(r["Pressure_Delta_pct"]), float(r["Retention_pct"])),
+                xytext=(5, 5), textcoords="offset points",
+                fontsize=8, alpha=0.9
+            )
+
+        ax.set_xlabel("Pressure absorbed vs field median (%)")
+        ax.set_ylabel("Late retention: final-400 speed / pressure-phase speed (%)")
+        ax.set_title("Pressure Retention Map")
+        ax.grid(alpha=0.18)
+        cb = fig.colorbar(sc, ax=ax, pad=0.02)
+        cb.set_label("PRI (0–10)")
+        st.pyplot(fig, width="stretch")
+        plt.close(fig)
+
+        st.markdown("### PRI leaderboard")
+        pri_view_cols = [
+            "PRI_Rank", "Horse", "Finish_Pos", "PI",
+            "Pressure_Speed", "Late_Speed",
+            "Pressure_Delta_pct", "Retention_pct", "Retention_Gate",
+            "Pressure_Gate", "Retained_Pressure", "PRI", "Profile"
+        ]
+        pri_view = pri[[c for c in pri_view_cols if c in pri.columns]].copy()
+        pri_view = pri_view.sort_values(["PRI", "Pressure_Delta_pct"], ascending=[False, False], na_position="last")
+        rename = {
+            "PRI_Rank": "Rank",
+            "Pressure_Speed": "Pressure speed (m/s)",
+            "Late_Speed": "Late speed (m/s)",
+            "Pressure_Delta_pct": "Pressure vs field (%)",
+            "Retention_pct": "Retention (%)",
+            "Retention_Gate": "Retention gate",
+            "Pressure_Gate": "Pressure gate",
+            "Retained_Pressure": "Retained pressure",
+        }
+        pri_view = pri_view.rename(columns=rename)
+        for col in ["PI", "Pressure speed (m/s)", "Late speed (m/s)", "Pressure vs field (%)", "Retention (%)", "Retention gate", "Pressure gate", "Retained pressure", "PRI"]:
+            if col in pri_view.columns:
+                pri_view[col] = pd.to_numeric(pri_view[col], errors="coerce").round(2)
+        st.dataframe(pri_view, width="stretch", hide_index=True)
+
+        csv_data = pri_view.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download PRI CSV",
+            data=csv_data,
+            file_name=f"race_edge_PRI_{int(race_distance_input)}m.csv",
+            mime="text/csv",
+        )
+
+        with st.expander("How to read PRI"):
+            st.markdown(
+                """
+- **Pressure vs field (%)** measures the horse's speed through the pressure phase against the field median.
+- **Retention (%)** compares final-400 speed with the horse's own pressure-phase speed.
+- **Retention gate** controls how much positive pressure credit survives: 90% retention gives no pressure credit, while 100% gives full credit.
+- **Pressure gate** prevents a horse that sat well off the pace from earning a top PRI purely because it flew home. Negative pressure is heavily restricted; strong positive pressure receives full access.
+- **Retained pressure** is the horse's positive pressure score multiplied by that retention gate.
+- **Pressure resistant**: above-median pressure and above-median retention.
+- **Brave but faded**: absorbed above-median pressure but retained less late; its pressure credit is therefore reduced.
+- **Pace-assisted closer**: absorbed less pressure but retained strongly late.
+- **Low-pressure performer**: below median in both dimensions.
+- PRI combines **50% retained pressure and 50% race-relative retention** and remains separate from PI.
+                """
+            )
+
 # ======================= Race Plane Analysis — Experimental =======================
-if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
+if _view_is("Race Plane Analysis", "Class Plane Analysis"):
     st.markdown("## Race Plane Analysis")
     st.caption(
-        "Experimental module. The Race Plane Formula describes what this race rewarded from tsSPI and Accel, "
-        "then the residual ranks horses by how far above or below that race expectation they sustained."
+        "PPS identifies the strongest overall position in tsSPI–Accel–Grind space. "
+        "Class Residual remains a separate signal of above- or below-plane sustain."
     )
 
     req = {"Horse", "tsSPI", "Accel", "Grind"}
@@ -3148,92 +2727,207 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis", "Full Report"):
             if rank < 3:
                 st.warning("The plane is not fully stable because the points are close to collinear. Treat residuals cautiously.")
 
-            st.markdown("### Class Residual ranking")
-            out_cols = ["Horse", "Finish_Pos", "tsSPI", "Accel", plane_grind_col, "Expected_Grind", "Class_Residual", "CR_Profile"]
-            out_cols += [c for c in ["TOF", "SRI", "Peak_Location", "PI"] if c in plane_df.columns and c not in out_cols]
-            rank_df = plane_df.sort_values("Class_Residual", ascending=False).reset_index(drop=True)
+            # --- Plane Position Score (PPS): overall strength of the horse's location in
+            # tsSPI–Accel–Grind space. Residual remains a separate upside/underperformance signal.
+            def _pps_robust_z(series):
+                s = pd.to_numeric(series, errors="coerce").astype(float)
+                med = float(np.nanmedian(s)) if np.isfinite(s).any() else 0.0
+                mad = float(np.nanmedian(np.abs(s - med))) if np.isfinite(s).any() else 0.0
+                if np.isfinite(mad) and mad > 1e-12:
+                    out = (s - med) / (1.4826 * mad)
+                else:
+                    sd = float(np.nanstd(s, ddof=0)) if np.isfinite(s).any() else 0.0
+                    mu = float(np.nanmean(s)) if np.isfinite(s).any() else 0.0
+                    out = (s - mu) / sd if np.isfinite(sd) and sd > 1e-12 else pd.Series(0.0, index=s.index)
+                return pd.Series(out, index=s.index, dtype=float).clip(-3.5, 3.5)
+
+            plane_df["PPS_z_tsSPI"] = _pps_robust_z(plane_df["tsSPI"])
+            plane_df["PPS_z_Accel"] = _pps_robust_z(plane_df["Accel"])
+            plane_df["PPS_z_Grind"] = _pps_robust_z(plane_df[plane_grind_col])
+            # PPS weighting ratio: tsSPI : Accel : Grind = 1 : 1.2 : 1
+            # Normalised weights are 31.25%, 37.50%, 31.25%.
+            plane_df["PPS_Core"] = (
+                0.3125 * plane_df["PPS_z_tsSPI"]
+                + 0.3750 * plane_df["PPS_z_Accel"]
+                + 0.3125 * plane_df["PPS_z_Grind"]
+            )
+            plane_df["PPS"] = np.clip(
+                5.0 + 2.75 * np.tanh(plane_df["PPS_Core"] / 1.35),
+                0.0,
+                10.0,
+            )
+            plane_df["PPS"] = plane_df["PPS"].round(2)
+            plane_df["PPS_Rank"] = plane_df["PPS"].rank(method="min", ascending=False).astype(int)
+
+            st.markdown("### Performance Plane Rankings (PPS)")
+            st.caption(
+                "PPS ranks the strongest overall position in tsSPI–Accel–Grind space using a 1:1.2:1 ratio. "
+                "Class Residual remains separate: it indicates above- or below-plane performance, not overall plane quality."
+            )
+
+            top_pps_row = plane_df.sort_values(["PPS", "PI" if "PI" in plane_df.columns else "PPS"], ascending=False).iloc[0]
+            high_cr_row = plane_df.sort_values("Class_Residual", ascending=False).iloc[0]
+            low_cr_row = plane_df.sort_values("Class_Residual", ascending=True).iloc[0]
+            pps_cards = st.columns(3)
+            pps_cards[0].metric("Top Plane Position", str(top_pps_row["Horse"]), f"PPS {float(top_pps_row['PPS']):.2f}")
+            pps_cards[1].metric("Highest Positive Residual", str(high_cr_row["Horse"]), f"CR {float(high_cr_row['Class_Residual']):+.2f}")
+            pps_cards[2].metric("Lowest Residual", str(low_cr_row["Horse"]), f"CR {float(low_cr_row['Class_Residual']):+.2f}")
+
+            out_cols = [
+                "PPS_Rank", "Horse", "Finish_Pos", "PPS", "PI",
+                "tsSPI", "Accel", plane_grind_col,
+                "Expected_Grind", "Class_Residual", "CR_Profile",
+            ]
+            out_cols = [c for c in out_cols if c in plane_df.columns]
+            out_cols += [c for c in ["TOF", "SRI", "Peak_Location"] if c in plane_df.columns and c not in out_cols]
+            rank_df = plane_df.sort_values(["PPS", "Class_Residual"], ascending=[False, False]).reset_index(drop=True)
             st.dataframe(rank_df[out_cols], use_container_width=True, hide_index=True)
 
             csv = rank_df[out_cols].to_csv(index=False).encode("utf-8")
             st.download_button(
-                "Download Race Plane table (CSV)",
+                "Download Performance Plane table (CSV)",
                 data=csv,
-                file_name="race_plane_analysis.csv",
+                file_name="performance_plane_pps.csv",
                 mime="text/csv"
             )
 
-            st.markdown("### TOF vs Race Residual")
-            if "TOF" not in plane_df.columns:
-                st.info("TOF is not available, so the TOF vs CR map cannot be drawn.")
-            else:
-                d2 = plane_df.dropna(subset=["TOF", "Class_Residual"]).copy()
-                if d2.empty:
-                    st.info("Not enough TOF/CR data to draw the map.")
-                else:
-                    fig, ax = plt.subplots(figsize=(8.2, 5.8))
-                    xv = d2["TOF"].to_numpy(dtype=float)
-                    yv = d2["Class_Residual"].to_numpy(dtype=float)
-                    pi_vals = pd.to_numeric(d2.get("PI", pd.Series(np.nan, index=d2.index)), errors="coerce")
-                    if pi_vals.notna().any() and float(pi_vals.max()) != float(pi_vals.min()):
-                        sizes = 50.0 + (pi_vals.fillna(pi_vals.median()).to_numpy() - float(pi_vals.min())) / (float(pi_vals.max()) - float(pi_vals.min()) + 1e-9) * 120.0
-                    else:
-                        sizes = np.full(len(d2), 80.0)
-                    cv = yv
-                    vmax = float(np.nanmax(np.abs(cv))) if np.isfinite(cv).any() else 1.0
-                    vmax = max(vmax, 1.0)
-                    sc = ax.scatter(xv, yv, c=cv, s=sizes, cmap="coolwarm", vmin=-vmax, vmax=vmax,
-                                    alpha=0.92, edgecolor="black", linewidth=0.6)
-                    label_points_neatly(ax, xv, yv, d2["Horse"].astype(str).to_list())
-                    ax.axhline(0, color="gray", lw=1.0, ls=(0, (3, 3)))
-                    ax.axvline(0, color="gray", lw=1.0, ls=(0, (3, 3)))
-                    ax.set_xlabel("TOF = Accel − tsSPI")
-                    ax.set_ylabel("Class Residual")
-                    ax.set_title("Top-right = turn of foot + above-plane sustain")
-                    ax.grid(True, linestyle=":", alpha=0.25)
-                    cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-                    cbar.set_label("Class Residual")
-                    st.pyplot(fig)
-                    st.caption("High TOF + high CR = acceleration weapon that still sustained better than expected.")
-
             if show_3d_plane:
-                st.markdown("### 3D Race Plane")
+                st.markdown("### 3D Performance Plane")
                 try:
-                    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-                    fig = plt.figure(figsize=(8.8, 6.6))
-                    ax = fig.add_subplot(111, projection="3d")
+                    from mpl_toolkits.mplot3d import Axes3D, proj3d  # noqa: F401
 
+                    fig = plt.figure(figsize=(10.5, 7.8), facecolor="#0b1220")
+                    ax = fig.add_subplot(111, projection="3d")
+                    ax.set_facecolor("#0b1220")
+
+                    # The plane stays analytical; PPS controls marker size and label priority.
                     cr_vals = plane_df["Class_Residual"].to_numpy(dtype=float)
                     vmax = float(np.nanmax(np.abs(cr_vals))) if np.isfinite(cr_vals).any() else 1.0
                     vmax = max(vmax, 1.0)
-                    sc = ax.scatter(x, y, z, c=cr_vals, cmap="coolwarm", vmin=-vmax, vmax=vmax,
-                                    s=55, edgecolor="black", linewidth=0.5, depthshade=True)
+                    pps_vals = plane_df["PPS"].to_numpy(dtype=float)
+                    marker_sizes = 55.0 + 95.0 * np.clip((pps_vals - 3.0) / 5.0, 0.0, 1.0)
 
-                    for xi, yi, zi, name in zip(x, y, z, plane_df["Horse"].astype(str)):
-                        ax.text(xi, yi, zi, name, fontsize=7)
+                    sc = ax.scatter(
+                        x, y, z,
+                        c=cr_vals,
+                        cmap="coolwarm",
+                        vmin=-vmax,
+                        vmax=vmax,
+                        s=marker_sizes,
+                        edgecolor="white",
+                        linewidth=0.9,
+                        depthshade=True,
+                        alpha=0.96,
+                    )
 
-                    x_grid = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 15)
-                    y_grid = np.linspace(float(np.nanmin(y)), float(np.nanmax(y)), 15)
+                    x_grid = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 18)
+                    y_grid = np.linspace(float(np.nanmin(y)), float(np.nanmax(y)), 18)
                     Xg, Yg = np.meshgrid(x_grid, y_grid)
                     Zg = intercept + b_tsspi * Xg + c_accel * Yg
-                    ax.plot_surface(Xg, Yg, Zg, alpha=0.22, linewidth=0, antialiased=True)
+                    ax.plot_surface(
+                        Xg, Yg, Zg,
+                        color="#5f7896",
+                        alpha=0.20,
+                        linewidth=0,
+                        antialiased=True,
+                        shade=True,
+                    )
 
-                    ax.set_xlabel(x_label)
-                    ax.set_ylabel(y_label)
-                    ax.set_zlabel(z_label)
-                    ax.set_title("Race-specific race plane")
-                    cbar = fig.colorbar(sc, ax=ax, shrink=0.65, pad=0.08)
-                    cbar.set_label("Class Residual")
-                    st.pyplot(fig)
-                    st.caption("Points above the race plane sustained better than expected after their travel and acceleration effort.")
+                    # Premium dark-axis treatment.
+                    ax.set_xlabel("Sustained Speed" if centre_values else x_label, color="#e7eef7", labelpad=10)
+                    ax.set_ylabel("Acceleration" if centre_values else y_label, color="#e7eef7", labelpad=10)
+                    ax.set_zlabel("Finishing Strength" if centre_values else z_label, color="#e7eef7", labelpad=10)
+                    ax.set_title("Performance Plane", color="white", fontsize=16, pad=18, weight="bold")
+                    ax.view_init(elev=22, azim=-58)
+                    ax.tick_params(colors="#b8c5d4", labelsize=8)
+                    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+                        axis.pane.set_facecolor((0.05, 0.08, 0.13, 0.35))
+                        axis.pane.set_edgecolor((0.45, 0.55, 0.68, 0.28))
+                        axis._axinfo["grid"]["color"] = (0.55, 0.62, 0.72, 0.16)
+
+                    # Place labels directly in the 3D coordinate system so each
+                    # horse name remains visibly attached to its marker.
+                    horse_names = plane_df["Horse"].astype(str).tolist()
+
+                    # Small data-space offsets based on the axis spans.
+                    x_span = max(float(np.nanmax(x) - np.nanmin(x)), 1e-6)
+                    y_span = max(float(np.nanmax(y) - np.nanmin(y)), 1e-6)
+                    z_span = max(float(np.nanmax(z) - np.nanmin(z)), 1e-6)
+
+                    dx = 0.018 * x_span
+                    dy = 0.010 * y_span
+                    dz = 0.008 * z_span
+
+                    for xi, yi, zi, horse_name in zip(x, y, z, horse_names):
+                        # Default to the right of the marker; flip left only for
+                        # points near the right edge of the x-range.
+                        x_mid = float(np.nanmin(x) + 0.78 * x_span)
+                        if xi >= x_mid:
+                            label_x = xi - dx
+                            ha = "right"
+                        else:
+                            label_x = xi + dx
+                            ha = "left"
+
+                        label_y = yi + dy
+                        label_z = zi + dz
+
+                        txt = ax.text(
+                            label_x,
+                            label_y,
+                            label_z,
+                            horse_name,
+                            fontsize=7.2,
+                            fontweight="semibold",
+                            color="#f2f6fb",
+                            ha=ha,
+                            va="center",
+                            zorder=20,
+                            clip_on=False,
+                        )
+                        txt.set_path_effects([
+                            pe.Stroke(linewidth=2.2, foreground="#07101d", alpha=0.98),
+                            pe.Normal(),
+                        ])
+
+                    # PPS is communicated through marker size. Give the top three
+                    # positions a restrained outer ring rather than longer labels.
+                    top_three_idx = plane_df.nsmallest(3, "PPS_Rank").index.to_numpy(dtype=int)
+                    ax.scatter(
+                        x[top_three_idx],
+                        y[top_three_idx],
+                        z[top_three_idx],
+                        s=marker_sizes[top_three_idx] + 75.0,
+                        facecolors="none",
+                        edgecolors="#f4d77a",
+                        linewidths=1.25,
+                        depthshade=False,
+                        alpha=0.95,
+                    )
+
+                    cbar = fig.colorbar(sc, ax=ax, shrink=0.62, pad=0.09)
+                    cbar.set_label("Class Residual", color="#e7eef7")
+                    cbar.ax.tick_params(colors="#b8c5d4")
+                    for spine in cbar.ax.spines.values():
+                        spine.set_edgecolor("#6f8197")
+
+                    st.pyplot(fig, use_container_width=True)
+                    plt.close(fig)
+                    st.caption(
+                        "Marker size follows PPS (best overall position on the plane). "
+                        "Colour shows Class Residual separately: positive residual suggests more late sustain than the plane predicted."
+                    )
                 except Exception as e:
                     st.info(f"3D plane could not be rendered: {e}")
 
             with st.expander("How to read this module"):
                 st.markdown(
                     """
-- **Race Plane Formula:** the race-specific expected relationship between travel strength, acceleration strength and grind.
+- **PPS:** overall strength of the horse's position in tsSPI–Accel–Grind space. This is the module's main ranking.
+- **PPS Rank:** where the horse sits from strongest to weakest overall plane position.
+- **Race Plane Formula:** the race-specific expected relationship between sustained speed, acceleration and Grind.
 - **Expected Grind:** what the model predicts a horse should have produced from its tsSPI and Accel.
-- **Class Residual:** actual Grind minus expected Grind.
+- **Class Residual:** actual Grind minus expected Grind. It is a separate upside/underperformance signal, not the best-position ranking.
 - **Positive CR:** the horse sustained better than expected.
 - **Negative CR:** the horse did less late than its travel/acceleration profile suggested.
 
@@ -3243,280 +2937,10 @@ This is experimental. In small fields or unusual race shapes, use it as a guide 
                     """
                 )
 
-if _view_is("Advanced Models", "Full Report"):
-    # ======================= Winning DNA Matrix — distance-aware & report cards =======================
-    st.markdown("## Winning DNA Matrix")
 
-    WD = metrics.copy()
-    gr_col = metrics.attrs.get("GR_COL", "Grind")
-    D_m  = float(race_distance_input)
-    RSI  = float(metrics.attrs.get("RSI", 0.0))      # + = slow-early, - = fast-early
-    SCI  = float(metrics.attrs.get("SCI", 0.0))      # 0..1 (consensus/strength)
-
-    # ---- safety: make sure the columns exist ----
-    for c in ["Horse", "F200_idx", "tsSPI", "Accel", gr_col]:
-        if c not in WD.columns:
-            WD[c] = np.nan
-
-    # ---- helpers ----
-    def _clamp01(x): 
-        return float(max(0.0, min(1.0, x)))
-
-    def _lerp(a, b, t): 
-        return a + (b - a) * float(max(0.0, min(1.0, t)))
-
-    def _band_knots(metric: str):
-        """
-        Priors for (lo, hi) index bands that map to 0..1.
-        Distance knots: 1000,1100,1200,1400,1600,1800,2000+
-        """
-        if metric == "EZ":  # F200_idx
-            return [
-                (1000, (96.0, 106.0)), (1100, (96.5, 105.5)), (1200, (97.0, 105.0)),
-                (1400, (98.0, 104.0)), (1600, (98.5, 103.5)), (1800, (99.0, 103.0)),
-                (2000, (99.2, 102.8)),
-            ]
-        if metric == "MC":  # tsSPI
-            return [
-                (1000, (98.0, 102.0)), (1100, (98.0, 102.0)), (1200, (98.0, 102.0)),
-                (1400, (98.0, 102.2)), (1600, (97.8, 102.4)), (1800, (97.6, 102.6)),
-                (2000, (97.5, 102.7)),
-            ]
-        if metric == "LP":  # Accel
-            return [
-                (1000, (96.0, 104.0)), (1100, (96.5, 103.8)), (1200, (97.0, 103.5)),
-                (1400, (97.5, 103.0)), (1600, (98.0, 102.5)), (1800, (98.3, 102.3)),
-                (2000, (98.5, 102.0)),
-            ]
-        if metric == "LL":  # Grind (or Grind_CG)
-            return [
-                (1000, (98.5, 101.5)), (1100, (98.0, 102.0)), (1200, (98.0, 102.0)),
-                (1400, (97.5, 102.5)), (1600, (97.0, 103.0)), (1800, (96.5, 103.5)),
-                (2000, (96.0, 104.0)),
-            ]
-        return [(1200, (98.0, 102.0)), (2000, (98.0, 102.0))]
-
-    def _prior_band(distance_m: float, metric: str):
-        """Piecewise-linear interpolation over the metric's distance knots."""
-        knots = _band_knots(metric)
-        dm = float(distance_m)
-        if dm <= knots[0][0]: 
-            return knots[0][1]
-        if dm >= knots[-1][0]:
-            return knots[-1][1]
-        for (ad, (alo, ahi)), (bd, (blo, bhi)) in zip(knots, knots[1:]):
-            if ad <= dm <= bd:
-                t = (dm - ad) / (bd - ad)
-                return (_lerp(alo, blo, t), _lerp(ahi, bhi, t))
-        return knots[-1][1]
-
-    def _shape_shift(lo, hi, metric: str, rsi: float, sci: float):
-        """
-        Shift band centers by ±(0.2 * SCI) depending on RSI sign.
-        Fast-early (RSI<0): EZ/LP shift up; LL/MC shift down.
-        Slow-early (RSI>0): LL/MC shift up; EZ/LP shift down.
-        """
-        if not np.isfinite(sci) or sci <= 0: 
-            return lo, hi
-        shift = 0.2 * float(min(1.0, max(0.0, sci)))
-        center = 0.5*(lo+hi)
-        half   = 0.5*(hi-lo)
-        if rsi < -1e-9:   # fast-early
-            if metric in ("EZ","LP"): center += shift
-            if metric in ("LL","MC"): center -= shift
-        elif rsi >  1e-9: # slow-early
-            if metric in ("LL","MC"): center += shift
-            if metric in ("EZ","LP"): center -= shift
-        return (center - half, center + half)
-
-    def _blend_with_field(lo, hi, series: pd.Series):
-        """Blend priors (70%) with field 10th/90th (30%) if available."""
-        s = pd.to_numeric(series, errors="coerce")
-        if s.notna().any():
-            q10, q90 = np.nanpercentile(s.dropna(), [10, 90])
-            lo = 0.7*lo + 0.3*float(q10)
-            hi = 0.7*hi + 0.3*float(q90)
-        if hi <= lo: 
-            hi = lo + 1.0
-        return lo, hi
-
-    def _score01_from_band(x, lo, hi):
-        try:
-            xv = float(x)
-            if not np.isfinite(xv): return 0.0
-            return _clamp01((xv - lo) / (hi - lo))
-        except Exception:
-            return 0.0
-
-    # ---- compute distance/shape-aware 0..1 components ----
-    bands = {}
-    for metric_key, col in [("EZ","F200_idx"), ("MC","tsSPI"), ("LP","Accel"), ("LL",gr_col)]:
-        lo0, hi0 = _prior_band(D_m, metric_key)
-        lo1, hi1 = _shape_shift(lo0, hi0, metric_key, RSI, SCI)
-        lo, hi   = _blend_with_field(lo1, hi1, WD[col])
-        bands[metric_key] = (lo, hi)
-
-    WD["EZ01"] = WD["F200_idx"].map(lambda v: _score01_from_band(v, *bands["EZ"]))
-    WD["MC01"] = WD["tsSPI"].map(lambda v: _score01_from_band(v, *bands["MC"]))
-    WD["LP01"] = WD["Accel" ].map(lambda v: _score01_from_band(v, *bands["LP"]))
-    WD["LL01"] = WD[gr_col   ].map(lambda v: _score01_from_band(v, *bands["LL"]))
-
-    # ---- SOS (0..1) using your robust z-blend idea ----
-    def _sos01_series(df: pd.DataFrame) -> pd.Series:
-        ts = winsorize(pd.to_numeric(df["tsSPI"], errors="coerce"))
-        ac = winsorize(pd.to_numeric(df["Accel"], errors="coerce"))
-        gr = winsorize(pd.to_numeric(df[gr_col],  errors="coerce"))
-        def rz(s):
-            mu, sd = np.nanmedian(s), mad_std(s)
-            sd = sd if (np.isfinite(sd) and sd > 0) else 1.0
-            return (s - mu) / sd
-        raw = 0.45*rz(ts) + 0.35*rz(ac) + 0.20*rz(gr)
-        if raw.notna().any():
-            q5, q95 = np.nanpercentile(raw.dropna(), [5, 95])
-            denom = max(q95 - q5, 1.0)
-            return ((raw - q5) / denom).clip(0.0, 1.0)
-        return pd.Series(0.0, index=df.index)
-
-    WD["SOS01"] = _sos01_series(WD)
-
-    # ---- weights (distance + shape nudges) ----
-    def _wdna_base_weights(distance_m: float) -> dict:
-        knots = [
-            (1000, {"EZ":0.25,"MC":0.21,"LP":0.28,"LL":0.11}),
-            (1100, {"EZ":0.22,"MC":0.22,"LP":0.27,"LL":0.14}),
-            (1200, {"EZ":0.20,"MC":0.22,"LP":0.25,"LL":0.18}),
-            (1400, {"EZ":0.15,"MC":0.24,"LP":0.24,"LL":0.22}),
-            (1600, {"EZ":0.10,"MC":0.26,"LP":0.23,"LL":0.26}),
-            (1800, {"EZ":0.06,"MC":0.28,"LP":0.22,"LL":0.29}),
-            (2000, {"EZ":0.03,"MC":0.30,"LP":0.20,"LL":0.32}),
-        ]
-        dm = float(distance_m)
-        if dm <= knots[0][0]:  return knots[0][1]
-        if dm >= knots[-1][0]: return knots[-1][1]
-        for (ad, aw), (bd, bw) in zip(knots, knots[1:]):
-            if ad <= dm <= bd:
-                t = (dm - ad) / (bd - ad)
-                return {k: _lerp(aw[k], bw[k], t) for k in aw}
-        return knots[-1][1]
-
-    def _apply_shape_nudges(w: dict, rsi: float, sci: float) -> dict:
-        w = w.copy()
-        mag = 0.01 * max(0.0, min(1.0, sci))
-        if rsi < -1e-9:   # fast-early
-            take = mag/2.0
-            w["EZ"] += mag; w["LP"] += mag
-            w["LL"] = max(0.0, w["LL"] - take); w["MC"] = max(0.0, w["MC"] - take)
-        elif rsi >  1e-9: # slow-early
-            take = mag/2.0
-            w["LL"] += mag; w["MC"] += mag
-            w["EZ"] = max(0.0, w["EZ"] - take); w["LP"] = max(0.0, w["LP"] - take)
-        s = sum(w.values()) or 1.0
-        return {k: (v/s)*0.85 for k,v in w.items()}  # SOS fixed outside
-
-    def _wdna_weights(distance_m: float, rsi: float, sci: float) -> dict:
-        base = _wdna_base_weights(distance_m)
-        shaped = _apply_shape_nudges(base, rsi, sci)
-        shaped["SOS"] = 0.15
-        S = sum(shaped.values()) or 1.0
-        return {k: v / S for k, v in shaped.items()}
-
-    W = _wdna_weights(D_m, RSI, SCI)  # EZ/MC/LP/LL/SOS sum to 1.0
-
-    # ---- composite (0..1) -> re-centered 0..10 with median ≈ 5 ----
-    comp01 = (
-        W["EZ"]  * WD["EZ01"].fillna(0.0)  +
-        W["MC"]  * WD["MC01"].fillna(0.0)  +
-        W["LP"]  * WD["LP01"].fillna(0.0)  +
-        W["LL"]  * WD["LL01"].fillna(0.0)  +
-        W["SOS"] * WD["SOS01"].fillna(0.0)
-    )
-    med = float(np.nanmedian(comp01)) if comp01.notna().any() else 0.5
-    q10, q90 = (np.nanpercentile(comp01.dropna(), [10,90]) if comp01.notna().any() else (0.3,0.7))
-    den = max(q90 - q10, 1e-6)
-
-    WD["WinningDNA"] = (5.0 + 5.0 * ((comp01 - med) / den)).clip(0.0, 10.0).round(2)
-
-    # ---- tags, tiers, summaries ----
-    def _top_traits_row(r):
-        pairs = [("Early Zip", r.get("EZ01",0.0)), ("Mid Control", r.get("MC01",0.0)),
-                 ("Late Punch", r.get("LP01",0.0)), ("Lasting Lift", r.get("LL01",0.0))]
-        pairs = [(n, float(v if np.isfinite(v) else 0.0)) for n,v in pairs]
-        pairs.sort(key=lambda x: x[1], reverse=True)
-        keep = [n for n,v in pairs[:2] if v >= 0.55]
-        # specialist flags
-        ez, ll = float(r.get("EZ01",0.0)), float(r.get("LL01",0.0))
-        if ez >= 0.70 and ll <= 0.45: keep.append("Sprinter-leaning")
-        if ll >= 0.70 and ez <= 0.45: keep.append("Stayer-leaning")
-        return " · ".join(keep)
-
-    def _tier_badge(score):
-        if not np.isfinite(score): return ("", "")
-        if score >= 8.0: return ("🔥 Prime", "A")
-        if score >= 7.0: return ("🟢 Live", "B")
-        if score >= 6.0: return ("⚪ Comp", "C")
-        return ("⚪ Setup", "D")
-
-    def _summary_row(r):
-        name = str(r.get("Horse","")).strip()
-        sc   = float(r.get("WinningDNA",0.0))
-        traits = r.get("DNA_TopTraits","")
-        badge,_ = _tier_badge(sc)
-        parts = [f"{badge} DNA {sc:.2f}/10"]
-        if traits: parts.append(traits)
-        if SCI >= 0.6 and abs(RSI) >= 1.2:
-            with_shape = np.sign(RSI)*(float(r.get("LP01",0.0))-float(r.get("MC01",0.0))) >= 0
-            parts.append("with race shape" if with_shape else "against race shape")
-        return f"{name}: " + " — ".join(parts) + "."
-
-    WD["DNA_TopTraits"] = WD.apply(_top_traits_row, axis=1)
-    WD["DNA_Summary"]   = WD.apply(_summary_row,    axis=1)
-
-    # ---- Top-6 report cards ----
-    cards = WD.sort_values("WinningDNA", ascending=False).head(6).copy()
-    if len(cards) > 0:
-        st.markdown("**Top profiles (report cards)**")
-        cols = st.columns(3)
-        for i, (_, r) in enumerate(cards.iterrows()):
-            col = cols[i % 3]
-            nm  = str(r["Horse"])
-            sc  = float(r["WinningDNA"])
-            ez,mc,lp,ll,sos = [float(r[k]) for k in ["EZ01","MC01","LP01","LL01","SOS01"]]
-            badge, grade = _tier_badge(sc)
-            with col:
-                st.markdown(
-                    f"""
-    <div style="border:1px solid rgba(255,255,255,0.15); border-radius:10px; padding:10px; margin-bottom:10px;">
-      <div style="font-weight:700; font-size:1.05rem;">{nm}</div>
-      <div style="margin:4px 0;"><span style="font-weight:700;">{badge}</span> · Grade <b>{grade}</b> · DNA <b>{sc:.2f}</b>/10</div>
-      <div style="font-size:0.9rem; opacity:0.9;">{r['DNA_TopTraits']}</div>
-      <div style="margin-top:6px; font-size:0.85rem; opacity:0.8;">
-        EZ {ez:.2f} · MC {mc:.2f} · LP {lp:.2f} · LL {ll:.2f} · SOS {sos:.2f}
-      </div>
-    </div>
-    """,
-                    unsafe_allow_html=True
-                )
-
-    # ---- Full table ----
-    show_cols = ["Horse","WinningDNA","EZ01","MC01","LP01","LL01","SOS01","DNA_TopTraits"]
-    WD_view = WD.sort_values(["WinningDNA","Accel",gr_col], ascending=[False, False, False])[show_cols]
-    st.dataframe(WD_view, use_container_width=True)
-
-    # ---- Per-horse summaries ----
-    with st.expander("Race Pulse — per-horse summaries"):
-        for _, r in WD.sort_values("WinningDNA", ascending=False).iterrows():
-            st.write("• " + r["DNA_Summary"])
-
-    # ---- footnote: weights & band hints ----
-    w_note = ", ".join([f"{k} {W[k]:.2f}" for k in ["EZ","MC","LP","LL","SOS"]])
-    st.caption(
-        f"Weights — EZ fades with distance; LL grows; shape nudges via RSI×SCI. Final weights: {w_note}. "
-        f"Bands are distance-aware, shape-shifted, and blended 70/30 with field 10th/90th percentiles; "
-        f"DNA recentered so race median ≈ 5."
-    )
-    # ======================= /Winning DNA Matrix =======================
-    
-            # ======================= Hidden Horses (v2, shape-aware) =======================
+# ======================= Advanced Models =======================
+if _view_is("Advanced Models"):
+    # ======================= Hidden Horses =======================
     st.markdown("## Hidden Horses v2 (Shape-aware)")
 
     hh = metrics.copy()
@@ -3642,22 +3066,12 @@ if _view_is("Advanced Models", "Full Report"):
         if not np.isfinite(hs):
             return ""
 
-        # Baseline performance gates (robust to missing GCI_RS)
+        # PI-only baseline gate so weak raw performances are not crowned as hidden horses.
         pi_val = as_num(r.get("PI"))
-        gci_rs = as_num(r.get("GCI_RS")) if pd.notna(r.get("GCI_RS")) else as_num(r.get("GCI"))
 
-        # Mild gates so we don't crown complete outliers with zero baseline
         def baseline_ok_for(top: bool) -> bool:
-            if top:
-                return (
-                    (np.isfinite(pi_val)  and pi_val  >= 5.4) or
-                    (np.isfinite(gci_rs) and gci_rs >= 4.8)
-                )
-            else:
-                return (
-                    (np.isfinite(pi_val)  and pi_val  >= 4.8) or
-                    (np.isfinite(gci_rs) and gci_rs >= 4.2)
-                )
+            threshold = 5.4 if top else 4.8
+            return bool(np.isfinite(pi_val) and pi_val >= threshold)
 
         if hs >= 1.8 and baseline_ok_for(top=True):
             return "🔥 Top Hidden"
@@ -3668,10 +3082,10 @@ if _view_is("Advanced Models", "Full Report"):
 
     # --- Descriptive note ---
     def hh_note(r):
-        pi, gci_rs = as_num(r.get("PI")), as_num(r.get("GCI_RS"))
+        pi = as_num(r.get("PI"))
         bits=[]
-        if np.isfinite(pi) and np.isfinite(gci_rs):
-            bits.append(f"PI {pi:.2f}, GCI_RS {gci_rs:.2f}")
+        if np.isfinite(pi):
+            bits.append(f"PI {pi:.2f}")
         else:
             if as_num(r.get("SOS")) >= 1.2: bits.append("sectionals superior")
             asi2 = as_num(r.get("ASI2"))
@@ -3683,14 +3097,14 @@ if _view_is("Advanced Models", "Full Report"):
     hh["Note"] = hh.apply(hh_note, axis=1)
 
     # ---- Build ranked, presentation-friendly Hidden Horses table ----
-    cols_hh = ["Horse","Finish_Pos","PI","GCI","tsSPI","Accel",gr_col,
+    cols_hh = ["Horse","Finish_Pos","PI","tsSPI","Accel",gr_col,
                "SOS","ASI2","TFS","UEI","HiddenScore","Tier","Note"]
     for c in cols_hh:
         if c not in hh.columns:
             hh[c] = np.nan
 
     # numeric hygiene
-    num_cols = ["PI","GCI","tsSPI","Accel",gr_col,"SOS","ASI2","TFS","UEI","HiddenScore"]
+    num_cols = ["PI","tsSPI","Accel",gr_col,"SOS","ASI2","TFS","UEI","HiddenScore"]
     for c in num_cols:
         hh[c] = pd.to_numeric(hh[c], errors="coerce")
 
@@ -3706,7 +3120,7 @@ if _view_is("Advanced Models", "Full Report"):
     )
 
     # --- Build final table -------------------------------------------------
-    cols_hh = ["Horse","Finish_Pos","PI","GCI","tsSPI","Accel",gr_col,"SOS","ASI2","TFS","UEI","HiddenScore","Tier","Note"]
+    cols_hh = ["Horse","Finish_Pos","PI","tsSPI","Accel",gr_col,"SOS","ASI2","TFS","UEI","HiddenScore","Tier","Note"]
     for c in cols_hh:
         if c not in hh.columns:
             hh[c] = np.nan
@@ -3726,266 +3140,15 @@ if _view_is("Advanced Models", "Full Report"):
         s = pd.Series(np.ravel(df[col].values), index=df.index)
         df[col] = pd.to_numeric(s, errors="coerce").round(2)
 
-    for c in ["PI","GCI","ASI2","SOS","TFS","UEI","Accel",gr_col,"tsSPI","HiddenScore"]:
+    for c in ["PI","ASI2","SOS","TFS","UEI","Accel",gr_col,"tsSPI","HiddenScore"]:
         _cast_round(hh_view, c)
 
     st.dataframe(hh_view, use_container_width=True)
     st.caption("Hidden Horses v2 — sorted by Tier, then HiddenScore, then PI (Top first).")
 
-    # ======================= PWX + EFI — Robust final build =======================
-    st.markdown("## PWX + EFI — Burst vs. Efficiency (field-calibrated)")
-
-    import re, numpy as np, pandas as pd
-
-    def _nz(s): return pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan)
-    def _mad(x): x=np.asarray(x,float); m=np.nanmedian(x); return 1.4826*np.nanmedian(np.abs(x-m))
-    def _robust_z(s):
-        v=_nz(s); m=np.nanmedian(v); d=_mad(v); 
-        d = d if (np.isfinite(d) and d>1e-9) else 1.0
-        return (v-m)/d
-    def _pct_rank(s):
-        v=_nz(s).to_numpy(); order=np.argsort(v,kind="mergesort")
-        ranks=np.empty_like(order,float); ranks[order]=np.arange(1,len(v)+1)
-        pr=(ranks-0.5)/max(len(v),1); pr[~np.isfinite(v)]=0.5
-        return pd.Series(pr,index=s.index)
-    def _cal_0_10(raw):
-        pr=_pct_rank(raw); z=_robust_z(raw); sig=1/(1+np.exp(-0.85*z)); q=0.6*pr+0.4*sig
-        q_src=[0.01,0.05,0.25,0.5,0.75,0.9,0.985,0.995]; y_tgt=[0.6,1.6,3.6,5,6.6,8,9.5,9.9]
-        s=np.interp(q,q_src,y_tgt).clip(0,10)
-        n=len(raw); 
-        if n<10: s=(1-min(0.5,(10-n)/10))*s+min(0.5,(10-n)/10)*5
-        return pd.Series(s,index=raw.index)
-    def _norm(x): return re.sub(r"\s+"," ",str(x).strip().lower())
-
-    GR_COL = metrics.attrs.get("GR_COL","Grind")
-    need={"Horse","Accel",GR_COL,"tsSPI"}
-    if not need.issubset(metrics.columns):
-        st.warning("PWX/EFI: missing Accel/Grind/tsSPI")
-    else:
-        df=metrics.loc[:,["Horse","Accel",GR_COL,"tsSPI"]].copy()
-        df["HorseKey"]=df["Horse"].map(_norm)
-        df["TSI_tmp"]=np.nan; df["Onset_tmp"]=np.nan
-
-        # --- Safe optional VP merge ---
-        try:
-            if "VP" in globals() and isinstance(VP,pd.DataFrame) and len(VP):
-                vpj=VP.copy()
-                if "Horse" not in vpj.columns: vpj=vpj.reset_index().rename(columns={"index":"Horse"})
-                vpj["HorseKey"]=vpj["Horse"].map(_norm)
-                merge_cols=["HorseKey"]
-                if "TSI" in vpj.columns: merge_cols.append("TSI")
-                if "Onset_from_home_m" in vpj.columns: merge_cols.append("Onset_from_home_m")
-                vpj=vpj[merge_cols].drop_duplicates("HorseKey")
-                df=df.merge(vpj.rename(columns={"TSI":"TSI_tmp","Onset_from_home_m":"Onset_tmp"}),on="HorseKey",how="left")
-        except Exception: pass
-
-        for c in ["Accel",GR_COL,"tsSPI","TSI_tmp","Onset_tmp"]:
-            if c in df.columns: df[c]=_nz(df[c])
-
-        # --- compute ---
-        has_tsi = "TSI_tmp" in df.columns and df["TSI_tmp"].notna().any()
-        has_on  = "Onset_tmp" in df.columns and df["Onset_tmp"].notna().any()
-        z_acc=_robust_z(df["Accel"])
-        z_tsi=_robust_z(df["TSI_tmp"]) if has_tsi else _robust_z(df["tsSPI"])
-        z_on=-_robust_z(df["Onset_tmp"]) if has_on else pd.Series(0.0,index=df.index)
-        PWX_raw=0.70*z_acc+0.25*z_tsi+0.05*z_on
-
-        sm=1-(df["Accel"]-df[GR_COL]).abs()/((df["Accel"]+df[GR_COL]).replace(0,np.nan)/2)
-        z_tss=_robust_z(df["tsSPI"]); z_gr=_robust_z(df[GR_COL]); z_sm=_robust_z(sm)
-        EFI_raw=0.45*z_tss+0.35*z_gr+0.20*z_sm
-
-        df["PWX"]=_cal_0_10(PWX_raw); df["EFI"]=_cal_0_10(EFI_raw)
-        out=df[["Horse","PWX","EFI"]].sort_values(["PWX","EFI"],ascending=[False,False]).reset_index(drop=True)
-        st.dataframe(out,use_container_width=True)
-    # ======================= /PWX + EFI =======================
 
 
-
-if _view_is("Advanced Models", "Full Report"):
-    # ======================= R&V (CAR) — Context-Aware Reliability =======================
-    st.markdown("## R&V — Context-Aware Reliability (CAR)")
-
-    import numpy as np
-    import pandas as pd
-
-    df = metrics.copy()
-
-    # ---------- Small robust helpers ----------
-    def _nz(x, alt=0.0):
-        try:
-            v = float(x)
-            return v if np.isfinite(v) else alt
-        except Exception:
-            return alt
-
-    def _winsor(s: pd.Series, q: float = 0.02):
-        s = pd.to_numeric(s, errors="coerce")
-        lo, hi = s.quantile(q), s.quantile(1 - q)
-        return s.clip(lo, hi)
-
-    def _mad(x: np.ndarray):
-        x = np.asarray(x, dtype=float)
-        x = x[np.isfinite(x)]
-        if x.size == 0: return np.nan
-        med = np.median(x)
-        mad = np.median(np.abs(x - med))
-        return 1.4826 * mad
-
-    def _robust01(s: pd.Series):
-        """Percentile rank 0–1 using median/MAD for stability."""
-        s = pd.to_numeric(s, errors="coerce")
-        finite = s[np.isfinite(s)]
-        if finite.empty:
-            return pd.Series(0.5, index=s.index)
-        # rank to 0..1
-        r = finite.rank(method="average", pct=True)
-        out = pd.Series(np.nan, index=s.index)
-        out.loc[finite.index] = r
-        return out.fillna(0.5)
-
-    # ---------- If MV / RC not present, compute light versions from splits (exclude first) ----------
-    have_MV = "MV" in df.columns
-    have_RC = "RC" in df.columns
-
-    def _collect_time_cols(_work: pd.DataFrame):
-        # Any '*_Time' plus optional 'Finish_Time'
-        tcols = [c for c in _work.columns if c.endswith("_Time")]
-        # order columns by numeric end marker; keep Finish at the end
-        def _key(c):
-            if c == "Finish_Time": return (10**9)
-            try:
-                return int(c.split("_")[0])
-            except Exception:
-                return 10**8
-        tcols = sorted([c for c in tcols if c != "Finish_Time"], key=_key) + (["Finish_Time"] if "Finish_Time" in _work.columns else [])
-        return tcols
-
-    if not (have_MV and have_RC):
-        # Build per-horse segment speeds (m/s) from times.
-        step = int(metrics.attrs.get("STEP", 100))
-        tcols = _collect_time_cols(work)
-        # exclude the first split to avoid start noise
-        seg_cols = tcols[1:] if len(tcols) > 1 else tcols[:]
-        # guard
-        if len(seg_cols) >= 3:
-            # Compute speeds per segment length
-            seg_lens = []
-            for c in seg_cols:
-                if c == "Finish_Time":
-                    seg_lens.append(float(step))
-                else:
-                    # infer length from column gap; safe default = step
-                    seg_lens.append(float(step))
-            seg_lens = np.asarray(seg_lens, dtype=float)
-
-            # Make a small speed matrix (rows=horses, cols=segments)
-            # Join by horse where possible
-            w = work.copy()
-            if "Horse" in w.columns and "Horse" in df.columns:
-                w = w.set_index("Horse").reindex(df["Horse"]).reset_index()
-
-            spd = []
-            for _, r in w.iterrows():
-                times = pd.to_numeric(r[seg_cols], errors="coerce").to_numpy()
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    v = seg_lens / times
-                # ignore 0/neg/inf
-                v[~np.isfinite(v)] = np.nan
-                spd.append(v)
-            spd = np.asarray(spd, dtype=float)  # shape (N_horse, N_seg)
-
-            # Trim to segments that have at least some data
-            valid_mask = np.isfinite(spd).sum(axis=0) >= 2
-            spd = spd[:, valid_mask]
-            # After trim, require at least 3 segments
-            if spd.shape[1] >= 3:
-                # Fill nan per row with row-median to keep variability meaningful
-                row_med = np.nanmedian(spd, axis=1, keepdims=True)
-                spd_f = np.where(np.isfinite(spd), spd, row_med)
-
-                # MV_raw: variability across segments (lower = steadier).
-                # use coefficient of variation via MAD for robustness.
-                med = np.nanmedian(spd_f, axis=1)
-                mad = np.array([_mad(spd_f[i, :]) for i in range(spd_f.shape[0])])
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    mv_raw = mad / np.where(med > 0, med, np.nan)
-                mv_raw = pd.Series(mv_raw, index=df.index)
-
-                # RC_raw: rebound coefficient — late strength vs late trough.
-                # Find trough over the last ~half of race, compare to mean of final 2 segments.
-                H, S = spd_f.shape
-                late_start = max(1, S // 2)
-                trough = np.nanargmin(np.nanmedian(spd_f[:, late_start:], axis=0)) + late_start  # index in [late_start..S-1]
-                tail = np.nanmean(spd_f[:, max(S-2, 0):S], axis=1)
-                base = spd_f[:, trough]
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    rc_raw = tail / np.where(base > 0, base, np.nan)
-                rc_raw = pd.Series(rc_raw, index=df.index)
-
-                if not have_MV: df["MV"] = mv_raw
-                if not have_RC: df["RC"] = rc_raw
-
-    # ---------- Core normalisations ----------
-    mv = _winsor(df.get("MV", pd.Series(np.nan, index=df.index)), q=0.02)
-    rc = _winsor(df.get("RC", pd.Series(np.nan, index=df.index)), q=0.02)
-
-    # Lower MV is better -> invert after normalising; Higher RC is better.
-    mv01 = 1.0 - _robust01(mv)     # steadiness (0..1, higher = steadier)
-    rc01 = _robust01(rc)           # rebound (0..1, higher = more kick late)
-
-    # Class lens: use PI if available, else GCI
-    if "PI" in df.columns and pd.to_numeric(df["PI"], errors="coerce").notna().any():
-        cls = _winsor(pd.to_numeric(df["PI"], errors="coerce"), q=0.02)
-    else:
-        cls = _winsor(pd.to_numeric(df.get("GCI", np.nan), errors="coerce"), q=0.02)
-
-    cls01 = _robust01(cls)
-
-    # ---------- Class-aware blending (CAR) ----------
-    # More tolerance for variability when class is high
-    mv_term = np.power(mv01, 1.0 - 0.35*cls01)            # elite horses keep more of their steadiness score
-    rc_term = rc01 * (1.0 + 0.25*cls01)                   # elite kick counts a bit extra
-
-    CAR = 10.0 * (0.45*mv_term + 0.35*rc_term + 0.20*cls01)
-    CAR = np.clip(CAR, 0.0, 10.0)
-
-    # ---------- Risk tag ----------
-    def _risk_tag(car):
-        if not np.isfinite(car): return "None"
-        if car >= 8.0:  return "Reliable"
-        if car >= 6.0:  return "Mostly reliable"
-        if car >= 4.0:  return "Variable"
-        return "Fragile"
-
-    tags = [ _risk_tag(v) for v in CAR ]
-
-    # ---------- Output table ----------
-    out = pd.DataFrame({
-        "Horse": df["Horse"],
-        "R&V": np.round(CAR, 2),
-        "Risk Tag": tags,
-        "MV (↓ steadier)": np.round(pd.to_numeric(df.get("MV", np.nan), errors="coerce"), 3),
-        "RC (↑ better rebound)": np.round(pd.to_numeric(df.get("RC", np.nan), errors="coerce"), 3),
-    })
-
-    # Add PI for context if present
-    if "PI" in df.columns:
-        out["PI"] = np.round(pd.to_numeric(df["PI"], errors="coerce"), 2)
-    elif "GCI" in df.columns:
-        out["GCI"] = np.round(pd.to_numeric(df["GCI"], errors="coerce"), 2)
-
-    # Sort by most reliable first, then strongest class
-    sort_cols = ["R&V"]
-    if "PI" in out.columns: sort_cols += ["PI"]
-    elif "GCI" in out.columns: sort_cols += ["GCI"]
-    out = out.sort_values(sort_cols, ascending=[False] + [False]*(len(sort_cols)-1), kind="mergesort").reset_index(drop=True)
-
-    st.dataframe(out, use_container_width=True)
-    st.caption("CAR = class-aware reliability: blends Steadiness (MV), Rebound (RC) and Class (PI/GCI). "
-               "High CAR → repeatable pattern you can trust; low CAR → fragile/shape-dependent.")
-    # ======================= /R&V (CAR) =======================
-
-if _view_is("Advanced Models", "Full Report"):
+if _view_is("Advanced Models"):
     # ======================= xWin — Probability to Win (100-replay view) =======================
     st.markdown("## xWin — Probability to Win")
 
@@ -4228,19 +3391,485 @@ if _view_is("Advanced Models", "Full Report"):
             f"Interpretation: chance to win if this same race were replayed 100 times."
         )
 
+# ======================= Form Study module =======================
+if _view_is("Form Study"):
+    import html as _html
+    from xml.sax.saxutils import escape as _xml_escape
 
-if _view_is("Exports & Notes", "Full Report"):
-    st.markdown("## Notes & Debug")
-    with st.expander("Warnings / debug", expanded=False):
-        st.write({
-            "view": APP_VIEW,
-            "distance": race_distance_input,
-            "split_step": split_step,
-            "going": GOING_TYPE,
-            "wind": WIND_TAG,
-        })
-        if DEBUG:
+    st.markdown("# Race Edge Analytics")
+    st.caption("Performance-Based Race Analysis")
+    st.markdown("## Form Study Report")
+
+    # ---------- Race information ----------
+    st.markdown("### Race Information")
+    _fs_c1, _fs_c2, _fs_c3, _fs_c4 = st.columns(4)
+    with _fs_c1:
+        fs_date = st.text_input("Date", value=datetime.now().strftime("%Y-%m-%d"), key="fs_date")
+        fs_track = st.text_input("Track", value="", key="fs_track")
+    with _fs_c2:
+        fs_race_no = st.text_input("Race number", value="", key="fs_race_no")
+        fs_surface = st.selectbox("Surface", ["Turf", "Polytrack", "Dirt", "Other"], key="fs_surface")
+    with _fs_c3:
+        fs_going = st.text_input("Going", value=str(GOING_TYPE), key="fs_going")
+        fs_race_class = st.text_input("Race class", value="", key="fs_race_class")
+    with _fs_c4:
+        _fs_rpss_val = RPSS_INFO.get("rpss", np.nan) if isinstance(RPSS_INFO, dict) else np.nan
+        fs_rpss_text = st.text_input(
+            "RPSS",
+            value=(f"{float(_fs_rpss_val):.2f}" if np.isfinite(_fs_rpss_val) else ""),
+            key="fs_rpss",
+        )
+        fs_race_confidence = st.select_slider(
+            "Race confidence",
+            options=[1, 2, 3, 4, 5],
+            value=3,
+            format_func=lambda n: "★" * n + "☆" * (5 - n),
+            key="fs_race_confidence",
+        )
+
+    # ---------- Reusable PPS calculation (independent of Race Plane page rendering) ----------
+    def _fs_robust_z(series):
+        s = pd.to_numeric(series, errors="coerce").astype(float)
+        valid = s[np.isfinite(s)]
+        if valid.empty:
+            return pd.Series(0.0, index=s.index, dtype=float)
+        med = float(np.nanmedian(valid))
+        mad = float(np.nanmedian(np.abs(valid - med)))
+        if np.isfinite(mad) and mad > 1e-12:
+            z = (s - med) / (1.4826 * mad)
+        else:
+            sd = float(np.nanstd(valid, ddof=0))
+            mu = float(np.nanmean(valid))
+            z = (s - mu) / sd if np.isfinite(sd) and sd > 1e-12 else pd.Series(0.0, index=s.index)
+        return pd.Series(z, index=s.index, dtype=float).clip(-3.5, 3.5)
+
+    fs_grind_col = "Grind"
+    fs_required = ["Horse", "tsSPI", "Accel", fs_grind_col]
+    fs_missing = [c for c in fs_required if c not in metrics.columns]
+
+    if fs_missing:
+        st.warning("Form Study cannot calculate PPS because these columns are missing: " + ", ".join(fs_missing))
+    else:
+        fs_plane = metrics.copy()
+        for c in ["tsSPI", "Accel", fs_grind_col, "PI", "F200_idx", "Finish_Pos"]:
+            if c in fs_plane.columns:
+                fs_plane[c] = pd.to_numeric(fs_plane[c], errors="coerce")
+        fs_plane = fs_plane.dropna(subset=fs_required).copy()
+        fs_plane["Horse"] = fs_plane["Horse"].astype(str).str.strip()
+        fs_plane = fs_plane.drop_duplicates(subset=["Horse"], keep="first").reset_index(drop=True)
+
+        if len(fs_plane) < 3:
+            st.info("At least three valid runners are required for the Form Study module.")
+        else:
+            # PPS ratio: tsSPI : Accel : Grind = 1 : 1.2 : 1.
+            fs_plane["_z_tsSPI"] = _fs_robust_z(fs_plane["tsSPI"])
+            fs_plane["_z_Accel"] = _fs_robust_z(fs_plane["Accel"])
+            fs_plane["_z_Grind"] = _fs_robust_z(fs_plane[fs_grind_col])
+            fs_plane["PPS_Core"] = (
+                0.3125 * fs_plane["_z_tsSPI"]
+                + 0.3750 * fs_plane["_z_Accel"]
+                + 0.3125 * fs_plane["_z_Grind"]
+            )
+            fs_plane["PPS"] = np.clip(5.0 + 2.75 * np.tanh(fs_plane["PPS_Core"] / 1.35), 0.0, 10.0)
+            fs_plane["PPS_Rank"] = fs_plane["PPS"].rank(method="min", ascending=False).astype(int)
+
+            # Fit the same Performance Plane for residual context.
+            X = np.column_stack([
+                np.ones(len(fs_plane)),
+                fs_plane["tsSPI"].to_numpy(dtype=float) - 100.0,
+                fs_plane["Accel"].to_numpy(dtype=float) - 100.0,
+            ])
+            y = fs_plane[fs_grind_col].to_numpy(dtype=float) - 100.0
             try:
-                st.write(metrics.attrs)
+                coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+                expected = 100.0 + X @ coef
+                fs_plane["Expected_Grind"] = expected
+                fs_plane["Class_Residual"] = fs_plane[fs_grind_col] - expected
             except Exception:
-                pass
+                fs_plane["Expected_Grind"] = np.nan
+                fs_plane["Class_Residual"] = np.nan
+
+            fs_plane = fs_plane.sort_values(["PPS", "PI" if "PI" in fs_plane.columns else "PPS"], ascending=False)
+            fs_top4 = fs_plane.head(4).copy().reset_index(drop=True)
+
+            # ---------- Top 4 PPS ----------
+            st.markdown("### Top 4 Performance Plane Scores (PPS)")
+            st.caption("Automatically selected by PPS. PPS uses tsSPI : Accel : Grind in a 1 : 1.2 : 1 ratio.")
+            fs_top_cols = [
+                "PPS_Rank", "Horse", "Finish_Pos", "PPS", "PI", "F200_idx",
+                "tsSPI", "Accel", fs_grind_col, "Class_Residual",
+            ]
+            fs_top_cols = [c for c in fs_top_cols if c in fs_top4.columns]
+            fs_top_display = fs_top4[fs_top_cols].copy()
+            fs_top_display = fs_top_display.rename(columns={
+                "PPS_Rank": "PPS Rank", "Finish_Pos": "Finish", "F200_idx": "F200",
+                "Class_Residual": "Residual",
+            })
+            for c in ["PPS", "PI", "F200", "tsSPI", "Accel", "Grind", "Residual"]:
+                if c in fs_top_display.columns:
+                    fs_top_display[c] = pd.to_numeric(fs_top_display[c], errors="coerce").round(2)
+            st.dataframe(fs_top_display, width="stretch", hide_index=True)
+
+            # ---------- Analyst assessments ----------
+            st.markdown("### Analyst Assessment")
+            fs_follow_reasons = [
+                "Strong plane position", "Better than result", "Hidden run", "Pace against",
+                "Wants further", "Wants shorter", "Settled poorly", "Wide trip",
+                "Traffic problems", "Strong finish", "Forgive run", "Other",
+            ]
+            fs_surfaces = ["Any", "Turf", "Polytrack", "Dirt", "Other"]
+            fs_paces = ["Any", "Slow/tactical", "Even", "Strong", "Fast/collapse"]
+            fs_follow_rows = []
+
+            for i, row in fs_top4.iterrows():
+                horse = str(row["Horse"])
+                safe_key = re.sub(r"[^A-Za-z0-9]+", "_", horse).strip("_")[:40] or f"horse_{i}"
+                with st.expander(f"#{int(row['PPS_Rank'])} — {horse}", expanded=(i == 0)):
+                    a1, a2, a3 = st.columns([1, 1.4, 1])
+                    with a1:
+                        follow = st.checkbox("Follow horse", value=True, key=f"fs_follow_{safe_key}_{i}")
+                        reason = st.selectbox("Follow reason", fs_follow_reasons, key=f"fs_reason_{safe_key}_{i}")
+                        confidence = st.select_slider(
+                            "Confidence", options=[1, 2, 3, 4, 5], value=3,
+                            format_func=lambda n: "★" * n + "☆" * (5 - n),
+                            key=f"fs_conf_{safe_key}_{i}",
+                        )
+                    with a2:
+                        ideal_distance = st.text_input("Ideal distance", value=f"{int(race_distance_input)}m", key=f"fs_dist_{safe_key}_{i}")
+                        ideal_surface = st.selectbox("Ideal surface", fs_surfaces, key=f"fs_surf_{safe_key}_{i}")
+                        preferred_pace = st.selectbox("Preferred pace", fs_paces, key=f"fs_pace_{safe_key}_{i}")
+                    with a3:
+                        note = st.text_area("Analyst note", height=128, key=f"fs_note_{safe_key}_{i}")
+
+                    fs_follow_rows.append({
+                        "Follow": bool(follow), "Horse": horse,
+                        "PPS": float(row.get("PPS", np.nan)), "PI": float(row.get("PI", np.nan)),
+                        "Finish": row.get("Finish_Pos", np.nan), "F200": row.get("F200_idx", np.nan),
+                        "tsSPI": row.get("tsSPI", np.nan), "Accel": row.get("Accel", np.nan),
+                        "Grind": row.get(fs_grind_col, np.nan), "Residual": row.get("Class_Residual", np.nan),
+                        "Reason": reason, "Ideal distance": ideal_distance, "Ideal surface": ideal_surface,
+                        "Preferred pace": preferred_pace, "Confidence": int(confidence), "Note": note,
+                    })
+
+            # ---------- Handicap Review ----------
+            st.markdown("### Handicap Review")
+            st.caption("The full field is shown. Enter Current MR and MR Achieved; Race Edge calculates the difference.")
+
+            def _fs_beta_base(distance_m):
+                d = float(distance_m)
+                if d <= 1200: return 0.30
+                if d <= 1600: return 0.35
+                if d <= 2000: return 0.40
+                if d <= 2400: return 0.45
+                return 0.50
+
+            fs_weight_candidates = ["Horse Weight", "Horse_Weight", "Wt", "Weight", "Weight (kg)"]
+            fs_weight_col = next((c for c in fs_weight_candidates if c in metrics.columns), None)
+            fs_handicap = metrics[["Horse", "PI"]].copy()
+            fs_handicap["Weight (kg)"] = (
+                pd.to_numeric(metrics[fs_weight_col], errors="coerce").fillna(60.0)
+                if fs_weight_col else 60.0
+            )
+            fs_handicap["PI"] = pd.to_numeric(fs_handicap["PI"], errors="coerce")
+            fs_pi_med = float(np.nanmedian(fs_handicap["PI"])) if fs_handicap["PI"].notna().any() else np.nan
+            fs_beta = float(np.clip(_fs_beta_base(float(race_distance_input)), 0.22, 0.70))
+            fs_handicap["Ahead (kg)"] = (fs_handicap["PI"] - fs_pi_med) / fs_beta
+            fs_handicap["Ahead (MR)"] = fs_handicap["Ahead (kg)"] * 2.0
+            fs_handicap["Current MR"] = np.nan
+            fs_handicap["MR Achieved"] = np.nan
+            fs_handicap["Handicap Note"] = ""
+            fs_handicap = fs_handicap.sort_values("Ahead (kg)", ascending=False).reset_index(drop=True)
+            for c in ["Weight (kg)", "PI", "Ahead (kg)", "Ahead (MR)"]:
+                fs_handicap[c] = pd.to_numeric(fs_handicap[c], errors="coerce").round(2)
+
+            fs_edited = st.data_editor(
+                fs_handicap,
+                width="stretch",
+                hide_index=True,
+                disabled=["Horse", "Weight (kg)", "PI", "Ahead (kg)", "Ahead (MR)"],
+                column_config={
+                    "Current MR": st.column_config.NumberColumn("Current MR", step=1, format="%.0f"),
+                    "MR Achieved": st.column_config.NumberColumn("MR Achieved", step=1, format="%.0f"),
+                    "Handicap Note": st.column_config.TextColumn("Handicap Note", width="large"),
+                },
+                key="fs_handicap_editor",
+            )
+            fs_edited = fs_edited.copy()
+            fs_edited["Current MR"] = pd.to_numeric(fs_edited["Current MR"], errors="coerce")
+            fs_edited["MR Achieved"] = pd.to_numeric(fs_edited["MR Achieved"], errors="coerce")
+            fs_edited["MR Difference"] = fs_edited["MR Achieved"] - fs_edited["Current MR"]
+
+            fs_mr_view_cols = ["Horse", "Current MR", "MR Achieved", "MR Difference", "Handicap Note"]
+            st.dataframe(fs_edited[fs_mr_view_cols], width="stretch", hide_index=True)
+
+            # ---------- Race Edge Verdict ----------
+            st.markdown("### Race Edge Verdict")
+            fs_horses = [str(h) for h in metrics["Horse"].dropna().astype(str).tolist()]
+            fs_options = ["—"] + fs_horses
+            v1, v2, v3, v4 = st.columns(4)
+            with v1:
+                fs_main_follow = st.selectbox("Main horse to follow", fs_options, key="fs_main_follow")
+            with v2:
+                fs_improver = st.selectbox("Most likely improver", fs_options, key="fs_improver")
+            with v3:
+                fs_best_handicap = st.selectbox("Best handicapped horse", fs_options, key="fs_best_handicap")
+            with v4:
+                fs_forgive = st.selectbox("Horse to forgive", fs_options, key="fs_forgive")
+            fs_race_summary = st.text_area("Race summary", height=150, key="fs_race_summary")
+
+            # ---------- Final follow list ----------
+            st.markdown("### Final Follow List")
+            fs_follow_df = pd.DataFrame([r for r in fs_follow_rows if r["Follow"]])
+            if fs_follow_df.empty:
+                st.info("No horses selected for the final follow list.")
+            else:
+                # The handicap source can contain duplicate horse-name rows.
+                # Build one stable lookup row per horse before joining the MR fields.
+                fs_mr_lookup = (
+                    fs_edited[
+                        ["Horse", "Current MR", "MR Achieved", "MR Difference"]
+                    ]
+                    .copy()
+                    .dropna(subset=["Horse"])
+                    .drop_duplicates(subset=["Horse"], keep="last")
+                )
+
+                fs_follow_df = fs_follow_df.drop(
+                    columns=["Current MR", "MR Achieved", "MR Difference"],
+                    errors="ignore",
+                ).merge(
+                    fs_mr_lookup,
+                    on="Horse",
+                    how="left",
+                    validate="many_to_one",
+                )
+                fs_final_cols = [
+                    "Horse", "PPS", "PI", "Finish", "Current MR", "MR Achieved", "MR Difference",
+                    "Reason", "Ideal distance", "Ideal surface", "Preferred pace", "Confidence", "Note",
+                ]
+                fs_follow_display = fs_follow_df[fs_final_cols].copy()
+                for c in ["PPS", "PI", "Current MR", "MR Achieved", "MR Difference"]:
+                    fs_follow_display[c] = pd.to_numeric(fs_follow_display[c], errors="coerce").round(2)
+                st.dataframe(fs_follow_display, width="stretch", hide_index=True)
+
+            # ---------- Printable HTML ----------
+            def _fs_fmt(v, dp=2):
+                try:
+                    return "" if pd.isna(v) else f"{float(v):.{dp}f}"
+                except Exception:
+                    return _html.escape(str(v))
+
+            def _fs_html_table(df):
+                if df is None or df.empty:
+                    return "<p><em>None selected.</em></p>"
+                cols = list(df.columns)
+                head = "".join(f"<th>{_html.escape(str(c))}</th>" for c in cols)
+                rows = []
+                for _, rr in df.iterrows():
+                    cells = []
+                    for c in cols:
+                        v = rr[c]
+                        if isinstance(v, (float, np.floating)):
+                            txt = _fs_fmt(v)
+                        else:
+                            txt = "" if pd.isna(v) else _html.escape(str(v))
+                        cells.append(f"<td>{txt}</td>")
+                    rows.append("<tr>" + "".join(cells) + "</tr>")
+                return f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(rows)}</tbody></table>"
+
+            fs_report_title = f"{fs_date}_{fs_track or 'Track'}_Race{fs_race_no or 'NA'}_FormStudy"
+            fs_report_title = re.sub(r"[^A-Za-z0-9._-]+", "_", fs_report_title)
+
+            fs_print_html = f'''<!doctype html>
+<html><head><meta charset="utf-8"><title>{_html.escape(fs_report_title)}</title>
+<style>
+@page {{ size: A4; margin: 15mm 12mm 18mm; }}
+body {{ font-family: Arial, Helvetica, sans-serif; color:#111; font-size:10px; margin:0; }}
+h1 {{ font-size:21px; margin:0; letter-spacing:.5px; }}
+h2 {{ font-size:15px; margin:4px 0 12px; }}
+h3 {{ font-size:12px; border-bottom:1px solid #777; padding-bottom:3px; margin-top:14px; }}
+.meta {{ display:grid; grid-template-columns:repeat(4,1fr); gap:5px 12px; margin:8px 0 12px; }}
+table {{ width:100%; border-collapse:collapse; margin:5px 0 10px; font-size:8.4px; }}
+th,td {{ border:1px solid #999; padding:3px 4px; text-align:left; vertical-align:top; }}
+th {{ background:#eceff3; }}
+.verdict {{ display:grid; grid-template-columns:repeat(2,1fr); gap:6px 14px; }}
+.note {{ border:1px solid #999; min-height:46px; padding:6px; white-space:pre-wrap; }}
+.footer {{ position:fixed; left:0; right:0; bottom:-11mm; text-align:center; color:#666; font-size:8px; border-top:1px solid #aaa; padding-top:4px; }}
+.page-break {{ page-break-before:always; }}
+@media print {{ .print-button {{ display:none; }} }}
+</style></head><body>
+<button class="print-button" onclick="window.print()">Print report</button>
+<h1>RACE EDGE ANALYTICS</h1><h2>Performance-Based Race Analysis — Form Study Report</h2>
+<div class="meta">
+<div><b>Date:</b> {_html.escape(fs_date)}</div><div><b>Track:</b> {_html.escape(fs_track)}</div>
+<div><b>Race:</b> {_html.escape(fs_race_no)}</div><div><b>Distance:</b> {int(race_distance_input)}m</div>
+<div><b>Surface:</b> {_html.escape(fs_surface)}</div><div><b>Going:</b> {_html.escape(fs_going)}</div>
+<div><b>Class:</b> {_html.escape(fs_race_class)}</div><div><b>RPSS:</b> {_html.escape(fs_rpss_text)}</div>
+<div><b>Race confidence:</b> {'★' * int(fs_race_confidence)}{'☆' * (5-int(fs_race_confidence))}</div><div><b>Runners:</b> {len(metrics)}</div>
+</div>
+<h3>Top 4 Performance Plane Scores (PPS)</h3>{_fs_html_table(fs_top_display)}
+<h3>Analyst Follow Assessments</h3>{_fs_html_table(pd.DataFrame(fs_follow_rows))}
+<div class="page-break"></div>
+<h3>Handicap Review</h3>{_fs_html_table(fs_edited)}
+<h3>Race Edge Verdict</h3>
+<div class="verdict"><div><b>Main horse to follow:</b> {_html.escape(fs_main_follow)}</div><div><b>Most likely improver:</b> {_html.escape(fs_improver)}</div>
+<div><b>Best handicapped horse:</b> {_html.escape(fs_best_handicap)}</div><div><b>Horse to forgive:</b> {_html.escape(fs_forgive)}</div></div>
+<h3>Race Summary</h3><div class="note">{_html.escape(fs_race_summary)}</div>
+<h3>Final Follow List</h3>{_fs_html_table(fs_follow_display if not fs_follow_df.empty else pd.DataFrame())}
+<div class="footer">Property of Race Edge Analytics &nbsp; | &nbsp; Prepared by Kiran Singh &nbsp; | &nbsp; © Race Edge Analytics. All Rights Reserved.</div>
+</body></html>'''
+
+            # ---------- PDF export ----------
+            def _fs_build_pdf():
+                try:
+                    from reportlab.lib import colors
+                    from reportlab.lib.enums import TA_CENTER
+                    from reportlab.lib.pagesizes import A4, landscape
+                    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+                    from reportlab.lib.units import mm
+                    from reportlab.platypus import (
+                        SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, KeepTogether,
+                    )
+                except Exception as exc:
+                    raise RuntimeError("ReportLab is required for PDF export.") from exc
+
+                buf = io.BytesIO()
+                doc = SimpleDocTemplate(
+                    buf, pagesize=landscape(A4), rightMargin=10*mm, leftMargin=10*mm,
+                    topMargin=12*mm, bottomMargin=18*mm,
+                    title="Race Edge Analytics Form Study Report",
+                    author="Kiran Singh",
+                )
+                styles = getSampleStyleSheet()
+                title_style = ParagraphStyle("RETitle", parent=styles["Title"], fontSize=18, leading=21, spaceAfter=2)
+                sub_style = ParagraphStyle("RESub", parent=styles["Normal"], fontSize=9, leading=11, textColor=colors.HexColor("#555555"), spaceAfter=7)
+                h_style = ParagraphStyle("REH", parent=styles["Heading2"], fontSize=11, leading=13, spaceBefore=7, spaceAfter=4)
+                body_style = ParagraphStyle("REBody", parent=styles["BodyText"], fontSize=7.5, leading=9)
+                tiny_style = ParagraphStyle("RETiny", parent=styles["BodyText"], fontSize=6.2, leading=7.2)
+
+                def ptxt(v, style=tiny_style):
+                    if v is None or (isinstance(v, float) and not np.isfinite(v)):
+                        s = ""
+                    elif isinstance(v, (float, np.floating)):
+                        s = f"{float(v):.2f}"
+                    else:
+                        s = str(v)
+                    return Paragraph(_xml_escape(s).replace("\n", "<br/>"), style)
+
+                def make_table(df, widths=None, font=6.0):
+                    if df is None or df.empty:
+                        return Paragraph("None selected.", body_style)
+                    data = [[ptxt(c) for c in df.columns]]
+                    for _, rr in df.iterrows():
+                        data.append([ptxt(rr[c]) for c in df.columns])
+                    t = Table(data, colWidths=widths, repeatRows=1, hAlign="LEFT")
+                    t.setStyle(TableStyle([
+                        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#E8EDF3")),
+                        ("TEXTCOLOR", (0,0), (-1,0), colors.HexColor("#111111")),
+                        ("GRID", (0,0), (-1,-1), 0.35, colors.HexColor("#888888")),
+                        ("VALIGN", (0,0), (-1,-1), "TOP"),
+                        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+                        ("FONTSIZE", (0,0), (-1,-1), font),
+                        ("LEFTPADDING", (0,0), (-1,-1), 2.5),
+                        ("RIGHTPADDING", (0,0), (-1,-1), 2.5),
+                        ("TOPPADDING", (0,0), (-1,-1), 2.0),
+                        ("BOTTOMPADDING", (0,0), (-1,-1), 2.0),
+                    ]))
+                    return t
+
+                def footer(canvas, doc_obj):
+                    canvas.saveState()
+                    w, _h = landscape(A4)
+                    canvas.setStrokeColor(colors.HexColor("#999999"))
+                    canvas.setLineWidth(0.4)
+                    canvas.line(10*mm, 12*mm, w-10*mm, 12*mm)
+                    canvas.setFillColor(colors.HexColor("#666666"))
+                    canvas.setFont("Helvetica", 7)
+                    canvas.drawCentredString(
+                        w/2, 7.5*mm,
+                        "Property of Race Edge Analytics  |  Prepared by Kiran Singh  |  © Race Edge Analytics. All Rights Reserved."
+                    )
+                    canvas.setFont("Helvetica", 6.5)
+                    canvas.drawRightString(w-10*mm, 7.5*mm, f"Page {doc_obj.page}")
+                    canvas.restoreState()
+
+                story = [
+                    Paragraph("RACE EDGE ANALYTICS", title_style),
+                    Paragraph("Performance-Based Race Analysis — Form Study Report", sub_style),
+                ]
+                meta = pd.DataFrame([
+                    ["Date", fs_date, "Track", fs_track, "Race", fs_race_no, "Distance", f"{int(race_distance_input)}m"],
+                    ["Surface", fs_surface, "Going", fs_going, "Class", fs_race_class, "RPSS", fs_rpss_text],
+                    ["Race confidence", "★"*int(fs_race_confidence), "Runners", str(len(metrics)), "", "", "", ""],
+                ])
+                story += [make_table(meta, font=7.2), Spacer(1, 3*mm)]
+                story += [Paragraph("Top 4 Performance Plane Scores (PPS)", h_style), make_table(fs_top_display, font=6.4)]
+
+                analyst_df = pd.DataFrame(fs_follow_rows)
+                story += [Paragraph("Analyst Follow Assessments", h_style), make_table(analyst_df, font=5.6)]
+                story += [PageBreak(), Paragraph("Handicap Review", h_style), make_table(fs_edited, font=5.7)]
+
+                verdict_df = pd.DataFrame([
+                    ["Main horse to follow", fs_main_follow, "Most likely improver", fs_improver],
+                    ["Best handicapped horse", fs_best_handicap, "Horse to forgive", fs_forgive],
+                ])
+                story += [Paragraph("Race Edge Verdict", h_style), make_table(verdict_df, font=7.0)]
+                story += [Paragraph("Race Summary", h_style), Paragraph(_xml_escape(fs_race_summary).replace("\n", "<br/>"), body_style)]
+                story += [Paragraph("Final Follow List", h_style), make_table(fs_follow_display if not fs_follow_df.empty else pd.DataFrame(), font=5.7)]
+
+                doc.build(story, onFirstPage=footer, onLaterPages=footer)
+                buf.seek(0)
+                return buf.getvalue()
+
+            st.markdown("### Print & Export")
+            st.caption("Large report assets are prepared only when requested, keeping normal app reruns light.")
+
+            # HTML is already available as a string and is inexpensive to expose.
+            ex1, ex2, ex3 = st.columns(3)
+            with ex1:
+                st.download_button(
+                    "Download print-ready HTML",
+                    data=fs_print_html.encode("utf-8"),
+                    file_name=f"{fs_report_title}.html",
+                    mime="text/html",
+                    width="stretch",
+                )
+
+            # Build the ReportLab document only after the analyst explicitly asks
+            # for it. Previously this ran on every widget change and every rerun.
+            pdf_state_key = f"fs_pdf_bytes_{fs_report_title}"
+            with ex2:
+                if st.button("Prepare Form Study PDF", key="fs_prepare_pdf", width="stretch"):
+                    try:
+                        with st.spinner("Preparing PDF…"):
+                            st.session_state[pdf_state_key] = _fs_build_pdf()
+                    except Exception as exc:
+                        st.session_state.pop(pdf_state_key, None)
+                        st.error(f"PDF export unavailable: {exc}")
+
+                if pdf_state_key in st.session_state:
+                    st.download_button(
+                        "Download Form Study PDF",
+                        data=st.session_state[pdf_state_key],
+                        file_name=f"{fs_report_title}.pdf",
+                        mime="application/pdf",
+                        width="stretch",
+                    )
+
+            with ex3:
+                fs_export_df = fs_follow_display if not fs_follow_df.empty else fs_top_display
+                st.download_button(
+                    "Download Form Study CSV",
+                    data=fs_export_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"{fs_report_title}.csv",
+                    mime="text/csv",
+                    width="stretch",
+                )
+
+            # Streamlit executes the contents of a collapsed expander. Use a
+            # checkbox so the iframe is genuinely absent until requested.
+            fs_show_preview = st.checkbox("Show print preview", value=False, key="fs_show_print_preview")
+            if fs_show_preview:
+                st.components.v1.html(fs_print_html, height=900, scrolling=True)
+
+# ======================= /Form Study module =======================
