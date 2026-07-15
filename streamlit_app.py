@@ -3427,6 +3427,35 @@ if _view_is("Form Study"):
             key="fs_race_confidence",
         )
 
+    # ---------- Official result ----------
+    st.markdown("### Official Result")
+    _fs_result_options = ["—"] + [str(h) for h in metrics["Horse"].dropna().astype(str).tolist()]
+    _fs_finish_defaults = {}
+    if "Finish_Pos" in metrics.columns:
+        _fs_result_df = metrics[["Horse", "Finish_Pos"]].copy()
+        _fs_result_df["Finish_Pos"] = pd.to_numeric(_fs_result_df["Finish_Pos"], errors="coerce")
+        _fs_result_df = (
+            _fs_result_df.dropna(subset=["Horse", "Finish_Pos"])
+            .sort_values("Finish_Pos")
+            .drop_duplicates(subset=["Finish_Pos"], keep="first")
+        )
+        for _pos in (1, 2, 3):
+            _match = _fs_result_df.loc[_fs_result_df["Finish_Pos"] == _pos, "Horse"]
+            if not _match.empty:
+                _fs_finish_defaults[_pos] = str(_match.iloc[0])
+
+    def _fs_default_index(position):
+        horse = _fs_finish_defaults.get(position, "—")
+        return _fs_result_options.index(horse) if horse in _fs_result_options else 0
+
+    _fs_r1, _fs_r2, _fs_r3 = st.columns(3)
+    with _fs_r1:
+        fs_result_1st = st.selectbox("1st", _fs_result_options, index=_fs_default_index(1), key="fs_result_1st")
+    with _fs_r2:
+        fs_result_2nd = st.selectbox("2nd", _fs_result_options, index=_fs_default_index(2), key="fs_result_2nd")
+    with _fs_r3:
+        fs_result_3rd = st.selectbox("3rd", _fs_result_options, index=_fs_default_index(3), key="fs_result_3rd")
+
     # ---------- Reusable PPS calculation (independent of Race Plane page rendering) ----------
     def _fs_robust_z(series):
         s = pd.to_numeric(series, errors="coerce").astype(float)
@@ -3758,7 +3787,7 @@ if _view_is("Form Study"):
 .print-button{{margin-bottom:8px;padding:7px 12px;border:0;border-radius:5px;background:var(--navy);color:white}}.brand{{background:linear-gradient(120deg,var(--navy),var(--navy2));color:white;padding:18px 22px 16px;border-bottom:4px solid var(--gold)}}
 .brand h1{{margin:0;font-size:25px;letter-spacing:1.5px}}.brand p{{margin:4px 0 0;color:#dbe4ef}}.section{{margin:13px 0}}.section-title{{font-size:14px;color:var(--navy);text-transform:uppercase;border-bottom:2px solid var(--gold);padding-bottom:4px}}
 .race-grid{{display:grid;grid-template-columns:repeat(5,1fr);gap:7px;background:var(--soft);border:1px solid var(--line);padding:10px}}.race-item{{background:white;border-left:3px solid var(--gold);padding:6px 8px}}.race-item span{{display:block;color:var(--muted);font-size:8px;text-transform:uppercase}}.race-item b{{display:block;margin-top:2px;font-size:10.5px}}
-.verdict-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}}.verdict-card{{border:1px solid var(--line);padding:8px}}.verdict-card span{{color:var(--muted);font-size:8px;text-transform:uppercase}}.verdict-card b{{display:block;margin-top:4px;color:var(--navy);font-size:11px}}.summary{{margin-top:8px;border:1px solid var(--line);border-left:4px solid var(--gold);padding:9px;min-height:55px;white-space:pre-wrap}}
+.result-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}}.result-card{{border:1px solid var(--line);padding:9px 11px;border-top:3px solid var(--gold);background:white}}.result-card span{{display:block;color:var(--muted);font-size:8px;text-transform:uppercase}}.result-card b{{display:block;margin-top:4px;color:var(--navy);font-size:11px}}.verdict-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}}.verdict-card{{border:1px solid var(--line);padding:8px}}.verdict-card span{{color:var(--muted);font-size:8px;text-transform:uppercase}}.verdict-card b{{display:block;margin-top:4px;color:var(--navy);font-size:11px}}.summary{{margin-top:8px;border:1px solid var(--line);border-left:4px solid var(--gold);padding:9px;min-height:55px;white-space:pre-wrap}}
 .cards{{display:grid;grid-template-columns:1fr 1fr;gap:10px}}.horse-card{{border:1px solid #ccd5e0;border-top:4px solid var(--navy);padding:9px;break-inside:avoid}}.horse-title{{display:flex;justify-content:space-between;color:var(--navy);font-size:13px;font-weight:700;margin-bottom:7px}}.horse-title span:last-child{{color:var(--muted);font-size:9px}}.rank{{color:var(--gold)}}
 .metrics-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:5px 8px}}.metric-head{{display:flex;justify-content:space-between;font-size:8.5px}}.metric-head span{{color:var(--muted)}}.bar{{height:5px;background:#e3e7ed;margin-top:2px;border-radius:3px;overflow:hidden}}.bar span{{display:block;height:100%;background:linear-gradient(90deg,var(--navy2),var(--gold))}}.residual{{margin:7px 0;padding:5px 7px;background:var(--soft)}}.assessment{{display:grid;grid-template-columns:repeat(3,1fr);gap:4px 8px;font-size:8.6px}}.analyst-note{{margin-top:7px;border-top:1px solid var(--line);padding-top:6px;min-height:33px;white-space:pre-wrap}}
 table{{width:100%;border-collapse:collapse;margin:5px 0 10px;font-size:8.1px}}th{{background:var(--navy);color:white;padding:5px 4px;text-align:left}}td{{border-bottom:1px solid var(--line);padding:4px;vertical-align:top}}tr.alt td{{background:var(--soft)}}tr.positive td{{background:#e8f4ec}}tr.negative td{{background:#f8e9e9}}.empty{{color:var(--muted);font-style:italic;padding:7px}}.page-break{{page-break-before:always}}
@@ -3769,6 +3798,7 @@ table{{width:100%;border-collapse:collapse;margin:5px 0 10px;font-size:8.1px}}th
 <section class="section"><h2 class="section-title">Race Overview</h2><div class="race-grid">
 <div class="race-item"><span>Date</span><b>{_html.escape(fs_date)}</b></div><div class="race-item"><span>Track</span><b>{_html.escape(fs_track)}</b></div><div class="race-item"><span>Race</span><b>{_html.escape(fs_race_no)}</b></div><div class="race-item"><span>Distance</span><b>{int(race_distance_input)}m</b></div><div class="race-item"><span>Surface</span><b>{_html.escape(fs_surface)}</b></div>
 <div class="race-item"><span>Going</span><b>{_html.escape(fs_going)}</b></div><div class="race-item"><span>Class</span><b>{_html.escape(fs_race_class)}</b></div><div class="race-item"><span>RPSS</span><b>{_html.escape(fs_rpss_text)}</b></div><div class="race-item"><span>Race confidence</span><b>{int(fs_race_confidence)}/5</b></div><div class="race-item"><span>Runners</span><b>{len(metrics)}</b></div></div></section>
+<section class="section"><h2 class="section-title">Official Result</h2><div class="result-grid"><div class="result-card"><span>1st</span><b>{_html.escape(fs_result_1st)}</b></div><div class="result-card"><span>2nd</span><b>{_html.escape(fs_result_2nd)}</b></div><div class="result-card"><span>3rd</span><b>{_html.escape(fs_result_3rd)}</b></div></div></section>
 <section class="section"><h2 class="section-title">Race Edge Verdict</h2><div class="verdict-grid"><div class="verdict-card"><span>Main horse to follow</span><b>{_html.escape(fs_main_follow)}</b></div><div class="verdict-card"><span>Most likely improver</span><b>{_html.escape(fs_improver)}</b></div><div class="verdict-card"><span>Best handicapped horse</span><b>{_html.escape(fs_best_handicap)}</b></div><div class="verdict-card"><span>Horse to forgive</span><b>{_html.escape(fs_forgive)}</b></div></div><div class="summary"><b>Analyst summary</b><br>{_html.escape(fs_race_summary)}</div></section>
 <div class="page-break"></div><header class="brand"><h1>TOP 4 PPS HORSES</h1><p>Race Edge performance shortlist</p></header><section class="section"><div class="cards">{fs_cards_html}</div></section>
 <div class="page-break"></div><header class="brand"><h1>HANDICAP REVIEW</h1><p>Performance against the official assessment</p></header><section class="section">{_fs_html_table(fs_edited,'MR Difference')}</section><section class="section"><h2 class="section-title">Final Follow List</h2>{_fs_html_table(fs_follow_table,'MR Difference')}</section>
@@ -3860,7 +3890,23 @@ table{{width:100%;border-collapse:collapse;margin:5px 0 10px;font-size:8.1px}}th
                     row=[]
                     for label,value in meta[i:i+5]: row.append(Table([[Paragraph(label.upper(),muted_style)],[Paragraph(_xml_escape(str(value)),body_style)]],colWidths=[47*mm],style=[('BACKGROUND',(0,0),(-1,-1),colors.white),('LINEBEFORE',(0,0),(0,-1),2.2,GOLD),('BOX',(0,0),(-1,-1),.3,LINE),('LEFTPADDING',(0,0),(-1,-1),6),('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3)]))
                     meta_data.append(row)
-                meta_tbl=Table(meta_data,colWidths=[50*mm]*5); meta_tbl.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),2),('RIGHTPADDING',(0,0),(-1,-1),2),('TOPPADDING',(0,0),(-1,-1),2),('BOTTOMPADDING',(0,0),(-1,-1),2)])); story += [meta_tbl,Spacer(1,3*mm),heading('Race Edge Verdict')]
+                meta_tbl=Table(meta_data,colWidths=[50*mm]*5); meta_tbl.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),2),('RIGHTPADDING',(0,0),(-1,-1),2),('TOPPADDING',(0,0),(-1,-1),2),('BOTTOMPADDING',(0,0),(-1,-1),2)]))
+                result_tbl=Table(
+                    [[Paragraph('1ST',muted_style),Paragraph('2ND',muted_style),Paragraph('3RD',muted_style)],
+                     [ptxt(fs_result_1st,body_style),ptxt(fs_result_2nd,body_style),ptxt(fs_result_3rd,body_style)]],
+                    colWidths=[84*mm]*3
+                )
+                result_tbl.setStyle(TableStyle([
+                    ('BOX',(0,0),(-1,-1),.4,LINE),
+                    ('INNERGRID',(0,0),(-1,-1),.25,LINE),
+                    ('BACKGROUND',(0,0),(-1,0),SOFT),
+                    ('LINEABOVE',(0,0),(-1,0),2,GOLD),
+                    ('LEFTPADDING',(0,0),(-1,-1),6),
+                    ('RIGHTPADDING',(0,0),(-1,-1),6),
+                    ('TOPPADDING',(0,0),(-1,-1),5),
+                    ('BOTTOMPADDING',(0,0),(-1,-1),5),
+                ]))
+                story += [meta_tbl,Spacer(1,3*mm),heading('Official Result'),result_tbl,Spacer(1,3*mm),heading('Race Edge Verdict')]
                 verdict=Table([[Paragraph('MAIN HORSE TO FOLLOW',muted_style),Paragraph('MOST LIKELY IMPROVER',muted_style),Paragraph('BEST HANDICAPPED HORSE',muted_style),Paragraph('HORSE TO FORGIVE',muted_style)],[ptxt(fs_main_follow,body_style),ptxt(fs_improver,body_style),ptxt(fs_best_handicap,body_style),ptxt(fs_forgive,body_style)]],colWidths=[63*mm]*4); verdict.setStyle(TableStyle([('BOX',(0,0),(-1,-1),.4,LINE),('INNERGRID',(0,0),(-1,-1),.25,LINE),('BACKGROUND',(0,0),(-1,0),SOFT),('LEFTPADDING',(0,0),(-1,-1),5),('RIGHTPADDING',(0,0),(-1,-1),5),('TOPPADDING',(0,0),(-1,-1),5),('BOTTOMPADDING',(0,0),(-1,-1),5)]))
                 summary=Table([[Paragraph('<b>Analyst summary</b><br/>'+_xml_escape(fs_race_summary).replace('\n','<br/>'),body_style)]],colWidths=[252*mm]); summary.setStyle(TableStyle([('BOX',(0,0),(-1,-1),.4,LINE),('LINEBEFORE',(0,0),(0,-1),3,GOLD),('LEFTPADDING',(0,0),(-1,-1),7),('RIGHTPADDING',(0,0),(-1,-1),7),('TOPPADDING',(0,0),(-1,-1),6),('BOTTOMPADDING',(0,0),(-1,-1),6)])); story += [verdict,Spacer(1,3*mm),summary]
                 story += [PageBreak(),banner('TOP 4 PPS HORSES','Race Edge performance shortlist'),Spacer(1,4*mm)]
