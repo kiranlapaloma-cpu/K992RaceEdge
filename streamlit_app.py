@@ -3652,174 +3652,231 @@ if _view_is("Form Study"):
                     fs_follow_display[c] = pd.to_numeric(fs_follow_display[c], errors="coerce").round(2)
                 st.dataframe(fs_follow_display, width="stretch", hide_index=True)
 
-            # ---------- Printable HTML ----------
+            # ---------- Premium printable report ----------
             def _fs_fmt(v, dp=2):
                 try:
                     return "" if pd.isna(v) else f"{float(v):.{dp}f}"
                 except Exception:
                     return _html.escape(str(v))
 
-            def _fs_html_table(df):
+            def _fs_metric_pct(metric, value):
+                # Presentation-only visual scale; it does not expose methodology.
+                try:
+                    value = float(value)
+                except Exception:
+                    return 0.0
+                if not np.isfinite(value):
+                    return 0.0
+                if metric in ("PPS", "PI"):
+                    return float(np.clip(value * 10.0, 0.0, 100.0))
+                if metric in ("F200", "tsSPI", "Accel", "Grind"):
+                    return float(np.clip((value - 95.0) * 10.0, 0.0, 100.0))
+                return 0.0
+
+            def _fs_html_table(df, diff_col=None):
                 if df is None or df.empty:
-                    return "<p><em>None selected.</em></p>"
+                    return '<div class="empty">None selected.</div>'
                 cols = list(df.columns)
-                head = "".join(f"<th>{_html.escape(str(c))}</th>" for c in cols)
+                head = ''.join(f'<th>{_html.escape(str(c))}</th>' for c in cols)
                 rows = []
-                for _, rr in df.iterrows():
+                for ridx, (_, rr) in enumerate(df.iterrows()):
+                    cls = 'alt' if ridx % 2 else ''
+                    if diff_col and diff_col in rr.index:
+                        try:
+                            d = float(rr[diff_col])
+                            if np.isfinite(d):
+                                cls += ' positive' if d > 0 else (' negative' if d < 0 else '')
+                        except Exception:
+                            pass
                     cells = []
                     for c in cols:
                         v = rr[c]
-                        if isinstance(v, (float, np.floating)):
-                            txt = _fs_fmt(v)
-                        else:
-                            txt = "" if pd.isna(v) else _html.escape(str(v))
-                        cells.append(f"<td>{txt}</td>")
-                    rows.append("<tr>" + "".join(cells) + "</tr>")
-                return f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(rows)}</tbody></table>"
+                        txt = _fs_fmt(v) if isinstance(v, (float, np.floating)) else ('' if pd.isna(v) else _html.escape(str(v)))
+                        cells.append(f'<td>{txt}</td>')
+                    rows.append(f'<tr class="{cls.strip()}">' + ''.join(cells) + '</tr>')
+                return f'<table><thead><tr>{head}</tr></thead><tbody>{"".join(rows)}</tbody></table>'
+
+            def _fs_html_metric(name, value):
+                pct = _fs_metric_pct(name, value)
+                return (
+                    f'<div class="metric"><div class="metric-head"><span>{_html.escape(name)}</span>'
+                    f'<b>{_fs_fmt(value)}</b></div><div class="bar"><span style="width:{pct:.1f}%"></span></div></div>'
+                )
+
+            follow_lookup = {str(r['Horse']): r for r in fs_follow_rows}
+
+            def _fs_html_horse_card(row):
+                horse = str(row.get('Horse', ''))
+                info = follow_lookup.get(horse, {})
+                rank = int(row.get('PPS_Rank', 0)) if pd.notna(row.get('PPS_Rank', np.nan)) else ''
+                metric_html = ''.join([
+                    _fs_html_metric('PPS', row.get('PPS', np.nan)),
+                    _fs_html_metric('PI', row.get('PI', np.nan)),
+                    _fs_html_metric('F200', row.get('F200_idx', np.nan)),
+                    _fs_html_metric('tsSPI', row.get('tsSPI', np.nan)),
+                    _fs_html_metric('Accel', row.get('Accel', np.nan)),
+                    _fs_html_metric('Grind', row.get(fs_grind_col, np.nan)),
+                ])
+                return f'''<section class="horse-card">
+                <div class="horse-title"><div><span class="rank">#{rank}</span> {_html.escape(horse)}</div><span>Finish: {_html.escape(str(row.get('Finish_Pos','')))}</span></div>
+                <div class="metrics-grid">{metric_html}</div>
+                <div class="residual"><b>Residual:</b> {_fs_fmt(row.get('Class_Residual', np.nan))}</div>
+                <div class="assessment">
+                <div><b>Follow:</b> {'Yes' if info.get('Follow') else 'No'}</div><div><b>Reason:</b> {_html.escape(str(info.get('Reason','')))}</div>
+                <div><b>Ideal distance:</b> {_html.escape(str(info.get('Ideal distance','')))}</div><div><b>Ideal surface:</b> {_html.escape(str(info.get('Ideal surface','')))}</div>
+                <div><b>Preferred pace:</b> {_html.escape(str(info.get('Preferred pace','')))}</div><div><b>Confidence:</b> {int(info.get('Confidence',0) or 0)}/5</div>
+                </div><div class="analyst-note"><b>Analyst note</b><br>{_html.escape(str(info.get('Note',''))) or '&nbsp;'}</div></section>'''
+
+            fs_glossary = [
+                ('PI (Performance Index)', 'A proprietary performance rating designed to assess the overall quality of a horse performance.', [('8.0+','Outstanding performance'),('7.0-7.9','Very strong performance'),('6.0-6.9','Above-average performance'),('5.0-5.9','Competitive performance'),('Below 5.0','Below-average performance')]),
+                ('PPS', 'A proprietary measure of a horse overall performance characteristics.', [('8.0+','Elite performance profile'),('7.0-7.9','Strong performance profile'),('6.0-6.9','Above average'),('5.0-5.9','Competitive'),('Below 5.0','Below average')]),
+                ('Residual', 'Indicates how a horse finishing performance differed from its expected performance profile.', [('+5 or higher','Significantly exceeded expectations'),('+2 to +5','Above expectation'),('-2 to +2','Broadly as expected'),('-5 to -2','Below expectation'),('Below -5','Significantly below expectation')]),
+                ('tsSPI', 'A proprietary measure of sustained speed through the middle stages of a race.', [('102+','Exceptional'),('101-101.9','Strong'),('99-100.9','Average'),('Below 99','Below average')]),
+                ('Acceleration', 'Measures a horse ability to increase speed during the decisive stages of a race.', [('102+','Exceptional'),('101-101.9','Strong'),('99-100.9','Average'),('Below 99','Below average')]),
+                ('Grind', 'Measures a horse ability to sustain its performance through the closing stages of a race.', [('102+','Exceptional'),('101-101.9','Strong'),('99-100.9','Average'),('Below 99','Below average')]),
+                ('F200', 'Measures a horse gate speed during the opening stages of a race.', [('102+','Exceptional gate speed'),('101-101.9','Strong gate speed'),('99-100.9','Average gate speed'),('Below 99','Below-average gate speed')]),
+                ('RPSS', 'A proprietary race-level indicator used to assess how strongly the race was run.', [('100+','Strongly run race'),('98-99.9','Above-average race'),('96-97.9','Average race'),('Below 96','Slowly run or weaker race')]),
+                ('Ahead of the Handicap', 'Provides an indication of how a horse performance compares with its current official handicap assessment.', [('+5 MR or more','Significantly ahead of current mark'),('+2 to +4 MR','Well handicapped'),('-1 to +1 MR','Running to current mark'),('-2 MR or less','Below current rating')]),
+            ]
+
+            def _fs_html_glossary():
+                blocks = []
+                for name, desc, bands in fs_glossary:
+                    rows = ''.join(f'<tr><td>{_html.escape(a)}</td><td>{_html.escape(b)}</td></tr>' for a,b in bands)
+                    blocks.append(f'<div class="glossary-item"><h4>{_html.escape(name)}</h4><p>{_html.escape(desc)}</p><table class="guide">{rows}</table></div>')
+                return ''.join(blocks)
 
             fs_report_title = f"{fs_date}_{fs_track or 'Track'}_Race{fs_race_no or 'NA'}_FormStudy"
             fs_report_title = re.sub(r"[^A-Za-z0-9._-]+", "_", fs_report_title)
+            fs_cards_html = ''.join(_fs_html_horse_card(r) for _, r in fs_top4.iterrows())
+            fs_follow_table = fs_follow_display if not fs_follow_df.empty else pd.DataFrame()
 
-            fs_print_html = f'''<!doctype html>
-<html><head><meta charset="utf-8"><title>{_html.escape(fs_report_title)}</title>
+            fs_print_html = f'''<!doctype html><html><head><meta charset="utf-8"><title>{_html.escape(fs_report_title)}</title>
 <style>
-@page {{ size: A4; margin: 15mm 12mm 18mm; }}
-body {{ font-family: Arial, Helvetica, sans-serif; color:#111; font-size:10px; margin:0; }}
-h1 {{ font-size:21px; margin:0; letter-spacing:.5px; }}
-h2 {{ font-size:15px; margin:4px 0 12px; }}
-h3 {{ font-size:12px; border-bottom:1px solid #777; padding-bottom:3px; margin-top:14px; }}
-.meta {{ display:grid; grid-template-columns:repeat(4,1fr); gap:5px 12px; margin:8px 0 12px; }}
-table {{ width:100%; border-collapse:collapse; margin:5px 0 10px; font-size:8.4px; }}
-th,td {{ border:1px solid #999; padding:3px 4px; text-align:left; vertical-align:top; }}
-th {{ background:#eceff3; }}
-.verdict {{ display:grid; grid-template-columns:repeat(2,1fr); gap:6px 14px; }}
-.note {{ border:1px solid #999; min-height:46px; padding:6px; white-space:pre-wrap; }}
-.footer {{ position:fixed; left:0; right:0; bottom:-11mm; text-align:center; color:#666; font-size:8px; border-top:1px solid #aaa; padding-top:4px; }}
-.page-break {{ page-break-before:always; }}
-@media print {{ .print-button {{ display:none; }} }}
-</style></head><body>
-<button class="print-button" onclick="window.print()">Print report</button>
-<h1>RACE EDGE ANALYTICS</h1><h2>Performance-Based Race Analysis — Form Study Report</h2>
-<div class="meta">
-<div><b>Date:</b> {_html.escape(fs_date)}</div><div><b>Track:</b> {_html.escape(fs_track)}</div>
-<div><b>Race:</b> {_html.escape(fs_race_no)}</div><div><b>Distance:</b> {int(race_distance_input)}m</div>
-<div><b>Surface:</b> {_html.escape(fs_surface)}</div><div><b>Going:</b> {_html.escape(fs_going)}</div>
-<div><b>Class:</b> {_html.escape(fs_race_class)}</div><div><b>RPSS:</b> {_html.escape(fs_rpss_text)}</div>
-<div><b>Race confidence:</b> {'★' * int(fs_race_confidence)}{'☆' * (5-int(fs_race_confidence))}</div><div><b>Runners:</b> {len(metrics)}</div>
-</div>
-<h3>Top 4 Performance Plane Scores (PPS)</h3>{_fs_html_table(fs_top_display)}
-<h3>Analyst Follow Assessments</h3>{_fs_html_table(pd.DataFrame(fs_follow_rows))}
-<div class="page-break"></div>
-<h3>Handicap Review</h3>{_fs_html_table(fs_edited)}
-<h3>Race Edge Verdict</h3>
-<div class="verdict"><div><b>Main horse to follow:</b> {_html.escape(fs_main_follow)}</div><div><b>Most likely improver:</b> {_html.escape(fs_improver)}</div>
-<div><b>Best handicapped horse:</b> {_html.escape(fs_best_handicap)}</div><div><b>Horse to forgive:</b> {_html.escape(fs_forgive)}</div></div>
-<h3>Race Summary</h3><div class="note">{_html.escape(fs_race_summary)}</div>
-<h3>Final Follow List</h3>{_fs_html_table(fs_follow_display if not fs_follow_df.empty else pd.DataFrame())}
-<div class="footer">Property of Race Edge Analytics &nbsp; | &nbsp; Prepared by Kiran Singh &nbsp; | &nbsp; © Race Edge Analytics. All Rights Reserved.</div>
-</body></html>'''
+:root{{--navy:#0a1830;--navy2:#17365f;--gold:#c8a85a;--ink:#152238;--muted:#667386;--line:#d7dee8;--soft:#f4f6f9;}}
+@page{{size:A4 landscape;margin:13mm 12mm 17mm}}*{{box-sizing:border-box}}body{{margin:0;font-family:Arial,sans-serif;color:var(--ink);font-size:10px}}
+.print-button{{margin-bottom:8px;padding:7px 12px;border:0;border-radius:5px;background:var(--navy);color:white}}.brand{{background:linear-gradient(120deg,var(--navy),var(--navy2));color:white;padding:18px 22px 16px;border-bottom:4px solid var(--gold)}}
+.brand h1{{margin:0;font-size:25px;letter-spacing:1.5px}}.brand p{{margin:4px 0 0;color:#dbe4ef}}.section{{margin:13px 0}}.section-title{{font-size:14px;color:var(--navy);text-transform:uppercase;border-bottom:2px solid var(--gold);padding-bottom:4px}}
+.race-grid{{display:grid;grid-template-columns:repeat(5,1fr);gap:7px;background:var(--soft);border:1px solid var(--line);padding:10px}}.race-item{{background:white;border-left:3px solid var(--gold);padding:6px 8px}}.race-item span{{display:block;color:var(--muted);font-size:8px;text-transform:uppercase}}.race-item b{{display:block;margin-top:2px;font-size:10.5px}}
+.verdict-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}}.verdict-card{{border:1px solid var(--line);padding:8px}}.verdict-card span{{color:var(--muted);font-size:8px;text-transform:uppercase}}.verdict-card b{{display:block;margin-top:4px;color:var(--navy);font-size:11px}}.summary{{margin-top:8px;border:1px solid var(--line);border-left:4px solid var(--gold);padding:9px;min-height:55px;white-space:pre-wrap}}
+.cards{{display:grid;grid-template-columns:1fr 1fr;gap:10px}}.horse-card{{border:1px solid #ccd5e0;border-top:4px solid var(--navy);padding:9px;break-inside:avoid}}.horse-title{{display:flex;justify-content:space-between;color:var(--navy);font-size:13px;font-weight:700;margin-bottom:7px}}.horse-title span:last-child{{color:var(--muted);font-size:9px}}.rank{{color:var(--gold)}}
+.metrics-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:5px 8px}}.metric-head{{display:flex;justify-content:space-between;font-size:8.5px}}.metric-head span{{color:var(--muted)}}.bar{{height:5px;background:#e3e7ed;margin-top:2px;border-radius:3px;overflow:hidden}}.bar span{{display:block;height:100%;background:linear-gradient(90deg,var(--navy2),var(--gold))}}.residual{{margin:7px 0;padding:5px 7px;background:var(--soft)}}.assessment{{display:grid;grid-template-columns:repeat(3,1fr);gap:4px 8px;font-size:8.6px}}.analyst-note{{margin-top:7px;border-top:1px solid var(--line);padding-top:6px;min-height:33px;white-space:pre-wrap}}
+table{{width:100%;border-collapse:collapse;margin:5px 0 10px;font-size:8.1px}}th{{background:var(--navy);color:white;padding:5px 4px;text-align:left}}td{{border-bottom:1px solid var(--line);padding:4px;vertical-align:top}}tr.alt td{{background:var(--soft)}}tr.positive td{{background:#e8f4ec}}tr.negative td{{background:#f8e9e9}}.empty{{color:var(--muted);font-style:italic;padding:7px}}.page-break{{page-break-before:always}}
+.glossary-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px 10px}}.glossary-item{{border:1px solid var(--line);padding:7px;break-inside:avoid}}.glossary-item h4{{margin:0 0 3px;color:var(--navy);font-size:10px}}.glossary-item p{{margin:0 0 5px;font-size:8.3px;line-height:1.25}}.guide{{margin:0;font-size:7.6px}}.guide td:first-child{{width:34%;font-weight:bold;color:var(--navy)}}.notice{{margin-top:9px;padding:8px;background:var(--soft);border-left:4px solid var(--gold);font-size:8.2px}}
+.footer{{position:fixed;left:0;right:0;bottom:-11mm;text-align:center;color:#6b7280;font-size:7.5px;border-top:1px solid #b8c0cc;padding-top:4px}}@media print{{.print-button{{display:none}}}}
+</style></head><body><button class="print-button" onclick="window.print()">Print report</button>
+<header class="brand"><h1>RACE EDGE ANALYTICS</h1><p>Performance-Based Race Analysis | Form Study Report</p></header>
+<section class="section"><h2 class="section-title">Race Overview</h2><div class="race-grid">
+<div class="race-item"><span>Date</span><b>{_html.escape(fs_date)}</b></div><div class="race-item"><span>Track</span><b>{_html.escape(fs_track)}</b></div><div class="race-item"><span>Race</span><b>{_html.escape(fs_race_no)}</b></div><div class="race-item"><span>Distance</span><b>{int(race_distance_input)}m</b></div><div class="race-item"><span>Surface</span><b>{_html.escape(fs_surface)}</b></div>
+<div class="race-item"><span>Going</span><b>{_html.escape(fs_going)}</b></div><div class="race-item"><span>Class</span><b>{_html.escape(fs_race_class)}</b></div><div class="race-item"><span>RPSS</span><b>{_html.escape(fs_rpss_text)}</b></div><div class="race-item"><span>Race confidence</span><b>{int(fs_race_confidence)}/5</b></div><div class="race-item"><span>Runners</span><b>{len(metrics)}</b></div></div></section>
+<section class="section"><h2 class="section-title">Race Edge Verdict</h2><div class="verdict-grid"><div class="verdict-card"><span>Main horse to follow</span><b>{_html.escape(fs_main_follow)}</b></div><div class="verdict-card"><span>Most likely improver</span><b>{_html.escape(fs_improver)}</b></div><div class="verdict-card"><span>Best handicapped horse</span><b>{_html.escape(fs_best_handicap)}</b></div><div class="verdict-card"><span>Horse to forgive</span><b>{_html.escape(fs_forgive)}</b></div></div><div class="summary"><b>Analyst summary</b><br>{_html.escape(fs_race_summary)}</div></section>
+<div class="page-break"></div><header class="brand"><h1>TOP 4 PPS HORSES</h1><p>Race Edge performance shortlist</p></header><section class="section"><div class="cards">{fs_cards_html}</div></section>
+<div class="page-break"></div><header class="brand"><h1>HANDICAP REVIEW</h1><p>Performance against the official assessment</p></header><section class="section">{_fs_html_table(fs_edited,'MR Difference')}</section><section class="section"><h2 class="section-title">Final Follow List</h2>{_fs_html_table(fs_follow_table,'MR Difference')}</section>
+<div class="page-break"></div><header class="brand"><h1>METRIC GLOSSARY</h1><p>General interpretation guide | Version 1.0</p></header><section class="section glossary-grid">{_fs_html_glossary()}</section><div class="notice"><b>Proprietary notice.</b> The Race Edge metrics contained within this report are proprietary analytical measures developed by Race Edge Analytics. Descriptions are intentionally general and do not disclose the underlying methodologies or calculations. Reproduction, redistribution, or commercial use without prior written permission from Race Edge Analytics is prohibited.</div>
+<div class="footer">Property of Race Edge Analytics | Prepared by Kiran Singh | © Race Edge Analytics. All Rights Reserved.</div></body></html>'''
 
-            # ---------- PDF export ----------
+            # ---------- Premium PDF export ----------
             def _fs_build_pdf():
                 try:
                     from reportlab.lib import colors
-                    from reportlab.lib.enums import TA_CENTER
                     from reportlab.lib.pagesizes import A4, landscape
                     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
                     from reportlab.lib.units import mm
-                    from reportlab.platypus import (
-                        SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, KeepTogether,
-                    )
+                    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, KeepTogether, HRFlowable
                 except Exception as exc:
-                    raise RuntimeError("ReportLab is required for PDF export.") from exc
+                    raise RuntimeError('ReportLab is required for PDF export.') from exc
 
-                buf = io.BytesIO()
-                doc = SimpleDocTemplate(
-                    buf, pagesize=landscape(A4), rightMargin=10*mm, leftMargin=10*mm,
-                    topMargin=12*mm, bottomMargin=18*mm,
-                    title="Race Edge Analytics Form Study Report",
-                    author="Kiran Singh",
-                )
-                styles = getSampleStyleSheet()
-                title_style = ParagraphStyle("RETitle", parent=styles["Title"], fontSize=18, leading=21, spaceAfter=2)
-                sub_style = ParagraphStyle("RESub", parent=styles["Normal"], fontSize=9, leading=11, textColor=colors.HexColor("#555555"), spaceAfter=7)
-                h_style = ParagraphStyle("REH", parent=styles["Heading2"], fontSize=11, leading=13, spaceBefore=7, spaceAfter=4)
-                body_style = ParagraphStyle("REBody", parent=styles["BodyText"], fontSize=7.5, leading=9)
-                tiny_style = ParagraphStyle("RETiny", parent=styles["BodyText"], fontSize=6.2, leading=7.2)
+                NAVY=colors.HexColor('#0A1830'); NAVY2=colors.HexColor('#17365F'); GOLD=colors.HexColor('#C8A85A')
+                SOFT=colors.HexColor('#F3F5F8'); LINE=colors.HexColor('#D4DAE3'); INK=colors.HexColor('#172238'); MUTED=colors.HexColor('#667386')
+                POS=colors.HexColor('#E8F4EC'); NEG=colors.HexColor('#F8E9E9'); page_w,_=landscape(A4)
+                buf=io.BytesIO(); doc=SimpleDocTemplate(buf,pagesize=landscape(A4),rightMargin=11*mm,leftMargin=11*mm,topMargin=11*mm,bottomMargin=18*mm,title='Race Edge Analytics Form Study Report',author='Kiran Singh')
+                styles=getSampleStyleSheet()
+                brand_style=ParagraphStyle('REBrand',parent=styles['Title'],fontName='Helvetica-Bold',fontSize=20,leading=22,textColor=colors.white)
+                brand_sub=ParagraphStyle('REBrandSub',parent=styles['Normal'],fontSize=8.5,leading=10,textColor=colors.HexColor('#DCE4EF'))
+                section_style=ParagraphStyle('RESection',parent=styles['Heading2'],fontName='Helvetica-Bold',fontSize=12,leading=14,textColor=NAVY,spaceBefore=6,spaceAfter=4)
+                body_style=ParagraphStyle('REBody',parent=styles['BodyText'],fontSize=7.4,leading=9,textColor=INK)
+                small_style=ParagraphStyle('RESmall',parent=body_style,fontSize=6.3,leading=7.5)
+                tiny_style=ParagraphStyle('RETiny',parent=body_style,fontSize=5.5,leading=6.5)
+                white_small=ParagraphStyle('REWhiteSmall',parent=small_style,textColor=colors.white,fontName='Helvetica-Bold')
+                muted_style=ParagraphStyle('REMuted',parent=small_style,textColor=MUTED)
 
-                def ptxt(v, style=tiny_style):
-                    if v is None or (isinstance(v, float) and not np.isfinite(v)):
-                        s = ""
-                    elif isinstance(v, (float, np.floating)):
-                        s = f"{float(v):.2f}"
-                    else:
-                        s = str(v)
-                    return Paragraph(_xml_escape(s).replace("\n", "<br/>"), style)
+                def ptxt(v,style=tiny_style):
+                    if v is None or (isinstance(v,(float,np.floating)) and not np.isfinite(v)): s=''
+                    elif isinstance(v,(float,np.floating)): s=f'{float(v):.2f}'
+                    else: s=str(v)
+                    return Paragraph(_xml_escape(s).replace('\n','<br/>'),style)
 
-                def make_table(df, widths=None, font=6.0):
-                    if df is None or df.empty:
-                        return Paragraph("None selected.", body_style)
-                    data = [[ptxt(c) for c in df.columns]]
-                    for _, rr in df.iterrows():
+                def banner(title,subtitle):
+                    t=Table([[Paragraph(_xml_escape(title),brand_style)],[Paragraph(_xml_escape(subtitle),brand_sub)]],colWidths=[page_w-22*mm])
+                    t.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),NAVY),('LEFTPADDING',(0,0),(-1,-1),12),('RIGHTPADDING',(0,0),(-1,-1),12),('TOPPADDING',(0,0),(0,0),10),('BOTTOMPADDING',(0,0),(0,0),2),('TOPPADDING',(0,1),(0,1),0),('BOTTOMPADDING',(0,1),(0,1),9),('LINEBELOW',(0,-1),(-1,-1),3,GOLD)])); return t
+
+                def heading(title):
+                    return KeepTogether([Paragraph(_xml_escape(title.upper()),section_style),HRFlowable(width='100%',thickness=1.5,color=GOLD,spaceAfter=4)])
+
+                def make_table(df,font=5.8,highlight=False):
+                    if df is None or df.empty: return Paragraph('None selected.',muted_style)
+                    data=[[ptxt(c,white_small) for c in df.columns]]; diffs=[]
+                    for _,rr in df.iterrows():
                         data.append([ptxt(rr[c]) for c in df.columns])
-                    t = Table(data, colWidths=widths, repeatRows=1, hAlign="LEFT")
-                    t.setStyle(TableStyle([
-                        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#E8EDF3")),
-                        ("TEXTCOLOR", (0,0), (-1,0), colors.HexColor("#111111")),
-                        ("GRID", (0,0), (-1,-1), 0.35, colors.HexColor("#888888")),
-                        ("VALIGN", (0,0), (-1,-1), "TOP"),
-                        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-                        ("FONTSIZE", (0,0), (-1,-1), font),
-                        ("LEFTPADDING", (0,0), (-1,-1), 2.5),
-                        ("RIGHTPADDING", (0,0), (-1,-1), 2.5),
-                        ("TOPPADDING", (0,0), (-1,-1), 2.0),
-                        ("BOTTOMPADDING", (0,0), (-1,-1), 2.0),
-                    ]))
-                    return t
+                        try: diffs.append(float(rr['MR Difference']))
+                        except Exception: diffs.append(np.nan)
+                    t=Table(data,repeatRows=1,hAlign='LEFT')
+                    cmds=[('BACKGROUND',(0,0),(-1,0),NAVY),('TEXTCOLOR',(0,0),(-1,0),colors.white),('GRID',(0,0),(-1,-1),0.25,LINE),('VALIGN',(0,0),(-1,-1),'TOP'),('FONTSIZE',(0,0),(-1,-1),font),('LEFTPADDING',(0,0),(-1,-1),3),('RIGHTPADDING',(0,0),(-1,-1),3),('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3)]
+                    for r in range(1,len(data)): cmds.append(('BACKGROUND',(0,r),(-1,r),SOFT if r%2==0 else colors.white))
+                    if highlight:
+                        for r,d in enumerate(diffs,start=1):
+                            if np.isfinite(d): cmds.append(('BACKGROUND',(0,r),(-1,r),POS if d>0 else (NEG if d<0 else colors.white)))
+                    t.setStyle(TableStyle(cmds)); return t
 
-                def footer(canvas, doc_obj):
-                    canvas.saveState()
-                    w, _h = landscape(A4)
-                    canvas.setStrokeColor(colors.HexColor("#999999"))
-                    canvas.setLineWidth(0.4)
-                    canvas.line(10*mm, 12*mm, w-10*mm, 12*mm)
-                    canvas.setFillColor(colors.HexColor("#666666"))
-                    canvas.setFont("Helvetica", 7)
-                    canvas.drawCentredString(
-                        w/2, 7.5*mm,
-                        "Property of Race Edge Analytics  |  Prepared by Kiran Singh  |  © Race Edge Analytics. All Rights Reserved."
-                    )
-                    canvas.setFont("Helvetica", 6.5)
-                    canvas.drawRightString(w-10*mm, 7.5*mm, f"Page {doc_obj.page}")
-                    canvas.restoreState()
+                def metric_bar(name,value):
+                    pct=_fs_metric_pct(name,value); total=16; filled=int(round(total*pct/100))
+                    bar=Table([['']*total],colWidths=[2.35*mm]*total,rowHeights=[2.1*mm])
+                    cmds=[('BOX',(0,0),(-1,-1),0.2,LINE),('BACKGROUND',(0,0),(-1,-1),colors.HexColor('#E3E7ED'))]
+                    if filled>0: cmds.append(('BACKGROUND',(0,0),(filled-1,0),NAVY2))
+                    bar.setStyle(TableStyle(cmds)); label=Table([[Paragraph(_xml_escape(name),muted_style),ptxt(value,small_style)]],colWidths=[26*mm,12*mm]); label.setStyle(TableStyle([('ALIGN',(1,0),(1,0),'RIGHT'),('LEFTPADDING',(0,0),(-1,-1),0),('RIGHTPADDING',(0,0),(-1,-1),0),('TOPPADDING',(0,0),(-1,-1),0),('BOTTOMPADDING',(0,0),(-1,-1),1)])); return [label,bar]
 
-                story = [
-                    Paragraph("RACE EDGE ANALYTICS", title_style),
-                    Paragraph("Performance-Based Race Analysis — Form Study Report", sub_style),
-                ]
-                meta = pd.DataFrame([
-                    ["Date", fs_date, "Track", fs_track, "Race", fs_race_no, "Distance", f"{int(race_distance_input)}m"],
-                    ["Surface", fs_surface, "Going", fs_going, "Class", fs_race_class, "RPSS", fs_rpss_text],
-                    ["Race confidence", "★"*int(fs_race_confidence), "Runners", str(len(metrics)), "", "", "", ""],
-                ])
-                story += [make_table(meta, font=7.2), Spacer(1, 3*mm)]
-                story += [Paragraph("Top 4 Performance Plane Scores (PPS)", h_style), make_table(fs_top_display, font=6.4)]
+                def horse_card(row):
+                    horse=str(row.get('Horse','')); info=follow_lookup.get(horse,{})
+                    rank=int(row.get('PPS_Rank',0)) if pd.notna(row.get('PPS_Rank',np.nan)) else ''
+                    title=Table([[Paragraph(f'<font color="#C8A85A">#{rank}</font> {_xml_escape(horse)}',ParagraphStyle('HorseTitle',parent=body_style,fontName='Helvetica-Bold',fontSize=10.5,leading=12,textColor=NAVY)),Paragraph(f"Finish: {_xml_escape(str(row.get('Finish_Pos','')))}",muted_style)]],colWidths=[92*mm,28*mm]); title.setStyle(TableStyle([('ALIGN',(1,0),(1,0),'RIGHT'),('LEFTPADDING',(0,0),(-1,-1),0),('RIGHTPADDING',(0,0),(-1,-1),0)]))
+                    vals=[('PPS',row.get('PPS',np.nan)),('PI',row.get('PI',np.nan)),('F200',row.get('F200_idx',np.nan)),('tsSPI',row.get('tsSPI',np.nan)),('Accel',row.get('Accel',np.nan)),('Grind',row.get(fs_grind_col,np.nan))]
+                    cells=[metric_bar(a,b) for a,b in vals]; metrics_tbl=Table([[cells[0],cells[1],cells[2]],[cells[3],cells[4],cells[5]]],colWidths=[41*mm]*3); metrics_tbl.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),2),('RIGHTPADDING',(0,0),(-1,-1),2),('TOPPADDING',(0,0),(-1,-1),2),('BOTTOMPADDING',(0,0),(-1,-1),3)]))
+                    assess=pd.DataFrame([['Follow','Yes' if info.get('Follow') else 'No','Reason',info.get('Reason','')],['Ideal distance',info.get('Ideal distance',''),'Ideal surface',info.get('Ideal surface','')],['Preferred pace',info.get('Preferred pace',''),'Confidence',f"{int(info.get('Confidence',0) or 0)}/5"]])
+                    note=Table([[Paragraph('<b>Analyst note</b><br/>'+_xml_escape(str(info.get('Note',''))).replace('\n','<br/>'),small_style)]],colWidths=[122*mm]); note.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),SOFT),('BOX',(0,0),(-1,-1),0.3,LINE),('LEFTPADDING',(0,0),(-1,-1),5),('RIGHTPADDING',(0,0),(-1,-1),5),('TOPPADDING',(0,0),(-1,-1),4),('BOTTOMPADDING',(0,0),(-1,-1),5)]))
+                    residual=Table([[Paragraph(f"<b>Residual:</b> {_fs_fmt(row.get('Class_Residual',np.nan))}",small_style)]],colWidths=[122*mm]); residual.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),SOFT),('LEFTPADDING',(0,0),(-1,-1),4),('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3)]))
+                    card=Table([[title],[metrics_tbl],[residual],[make_table(assess,font=6.0)],[note]],colWidths=[128*mm]); card.setStyle(TableStyle([('BOX',(0,0),(-1,-1),0.6,LINE),('LINEABOVE',(0,0),(-1,0),3,NAVY),('LEFTPADDING',(0,0),(-1,-1),5),('RIGHTPADDING',(0,0),(-1,-1),5),('TOPPADDING',(0,0),(-1,-1),4),('BOTTOMPADDING',(0,0),(-1,-1),4),('VALIGN',(0,0),(-1,-1),'TOP')])); return card
 
-                analyst_df = pd.DataFrame(fs_follow_rows)
-                story += [Paragraph("Analyst Follow Assessments", h_style), make_table(analyst_df, font=5.6)]
-                story += [PageBreak(), Paragraph("Handicap Review", h_style), make_table(fs_edited, font=5.7)]
+                def glossary_card(item):
+                    name,desc,bands=item; guide=Table([[Paragraph(_xml_escape(a),small_style),Paragraph(_xml_escape(b),small_style)] for a,b in bands],colWidths=[27*mm,51*mm]); guide.setStyle(TableStyle([('GRID',(0,0),(-1,-1),0.25,LINE),('BACKGROUND',(0,0),(0,-1),SOFT),('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),3),('RIGHTPADDING',(0,0),(-1,-1),3),('TOPPADDING',(0,0),(-1,-1),2),('BOTTOMPADDING',(0,0),(-1,-1),2)]))
+                    block=Table([[Paragraph(_xml_escape(name),ParagraphStyle('Gloss',parent=body_style,fontName='Helvetica-Bold',fontSize=8.3,leading=9.5,textColor=NAVY))],[Paragraph(_xml_escape(desc),small_style)],[guide]],colWidths=[82*mm]); block.setStyle(TableStyle([('BOX',(0,0),(-1,-1),0.4,LINE),('LEFTPADDING',(0,0),(-1,-1),5),('RIGHTPADDING',(0,0),(-1,-1),5),('TOPPADDING',(0,0),(-1,-1),4),('BOTTOMPADDING',(0,0),(-1,-1),4),('VALIGN',(0,0),(-1,-1),'TOP')])); return block
 
-                verdict_df = pd.DataFrame([
-                    ["Main horse to follow", fs_main_follow, "Most likely improver", fs_improver],
-                    ["Best handicapped horse", fs_best_handicap, "Horse to forgive", fs_forgive],
-                ])
-                story += [Paragraph("Race Edge Verdict", h_style), make_table(verdict_df, font=7.0)]
-                story += [Paragraph("Race Summary", h_style), Paragraph(_xml_escape(fs_race_summary).replace("\n", "<br/>"), body_style)]
-                story += [Paragraph("Final Follow List", h_style), make_table(fs_follow_display if not fs_follow_df.empty else pd.DataFrame(), font=5.7)]
+                def footer(canvas,doc_obj):
+                    canvas.saveState(); canvas.setStrokeColor(colors.HexColor('#AEB7C4')); canvas.setLineWidth(.4); canvas.line(11*mm,12*mm,page_w-11*mm,12*mm); canvas.setFillColor(colors.HexColor('#687386')); canvas.setFont('Helvetica',6.6); canvas.drawCentredString(page_w/2,7.5*mm,'Property of Race Edge Analytics | Prepared by Kiran Singh | © Race Edge Analytics. All Rights Reserved.'); canvas.drawRightString(page_w-11*mm,7.5*mm,f'Page {doc_obj.page}'); canvas.restoreState()
 
-                doc.build(story, onFirstPage=footer, onLaterPages=footer)
-                buf.seek(0)
-                return buf.getvalue()
+                story=[banner('RACE EDGE ANALYTICS','Performance-Based Race Analysis | Form Study Report'),Spacer(1,4*mm),heading('Race Overview')]
+                meta=[('Date',fs_date),('Track',fs_track),('Race',fs_race_no),('Distance',f'{int(race_distance_input)}m'),('Surface',fs_surface),('Going',fs_going),('Class',fs_race_class),('RPSS',fs_rpss_text),('Race confidence',f'{int(fs_race_confidence)}/5'),('Runners',str(len(metrics)))]
+                meta_data=[]
+                for i in range(0,10,5):
+                    row=[]
+                    for label,value in meta[i:i+5]: row.append(Table([[Paragraph(label.upper(),muted_style)],[Paragraph(_xml_escape(str(value)),body_style)]],colWidths=[47*mm],style=[('BACKGROUND',(0,0),(-1,-1),colors.white),('LINEBEFORE',(0,0),(0,-1),2.2,GOLD),('BOX',(0,0),(-1,-1),.3,LINE),('LEFTPADDING',(0,0),(-1,-1),6),('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3)]))
+                    meta_data.append(row)
+                meta_tbl=Table(meta_data,colWidths=[50*mm]*5); meta_tbl.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),2),('RIGHTPADDING',(0,0),(-1,-1),2),('TOPPADDING',(0,0),(-1,-1),2),('BOTTOMPADDING',(0,0),(-1,-1),2)])); story += [meta_tbl,Spacer(1,3*mm),heading('Race Edge Verdict')]
+                verdict=Table([[Paragraph('MAIN HORSE TO FOLLOW',muted_style),Paragraph('MOST LIKELY IMPROVER',muted_style),Paragraph('BEST HANDICAPPED HORSE',muted_style),Paragraph('HORSE TO FORGIVE',muted_style)],[ptxt(fs_main_follow,body_style),ptxt(fs_improver,body_style),ptxt(fs_best_handicap,body_style),ptxt(fs_forgive,body_style)]],colWidths=[63*mm]*4); verdict.setStyle(TableStyle([('BOX',(0,0),(-1,-1),.4,LINE),('INNERGRID',(0,0),(-1,-1),.25,LINE),('BACKGROUND',(0,0),(-1,0),SOFT),('LEFTPADDING',(0,0),(-1,-1),5),('RIGHTPADDING',(0,0),(-1,-1),5),('TOPPADDING',(0,0),(-1,-1),5),('BOTTOMPADDING',(0,0),(-1,-1),5)]))
+                summary=Table([[Paragraph('<b>Analyst summary</b><br/>'+_xml_escape(fs_race_summary).replace('\n','<br/>'),body_style)]],colWidths=[252*mm]); summary.setStyle(TableStyle([('BOX',(0,0),(-1,-1),.4,LINE),('LINEBEFORE',(0,0),(0,-1),3,GOLD),('LEFTPADDING',(0,0),(-1,-1),7),('RIGHTPADDING',(0,0),(-1,-1),7),('TOPPADDING',(0,0),(-1,-1),6),('BOTTOMPADDING',(0,0),(-1,-1),6)])); story += [verdict,Spacer(1,3*mm),summary]
+                story += [PageBreak(),banner('TOP 4 PPS HORSES','Race Edge performance shortlist'),Spacer(1,4*mm)]
+                cards=[horse_card(r) for _,r in fs_top4.iterrows()]
+                while len(cards)<4: cards.append(Paragraph('',body_style))
+                grid=Table([[cards[0],cards[1]],[cards[2],cards[3]]],colWidths=[132*mm]*2); grid.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),3),('RIGHTPADDING',(0,0),(-1,-1),3),('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3)])); story.append(grid)
+                story += [PageBreak(),banner('HANDICAP REVIEW','Performance against the official assessment'),Spacer(1,4*mm),make_table(fs_edited,font=5.3,highlight=True),Spacer(1,4*mm),heading('Final Follow List'),make_table(fs_follow_table,font=5.5,highlight=True)]
+                story += [PageBreak(),banner('METRIC GLOSSARY','General interpretation guide | Version 1.0'),Spacer(1,4*mm)]
+                g=[glossary_card(x) for x in fs_glossary]; rows=[]
+                for i in range(0,len(g),3):
+                    row=g[i:i+3]
+                    while len(row)<3: row.append(Paragraph('',body_style))
+                    rows.append(row)
+                gtbl=Table(rows,colWidths=[86*mm]*3); gtbl.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),2),('RIGHTPADDING',(0,0),(-1,-1),2),('TOPPADDING',(0,0),(-1,-1),2),('BOTTOMPADDING',(0,0),(-1,-1),2)]))
+                notice=Table([[Paragraph('<b>Proprietary notice.</b> The Race Edge metrics contained within this report are proprietary analytical measures developed by Race Edge Analytics. Descriptions are intentionally general and do not disclose the underlying methodologies or calculations. Reproduction, redistribution, or commercial use without prior written permission from Race Edge Analytics is prohibited.',small_style)]],colWidths=[258*mm]); notice.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),SOFT),('LINEBEFORE',(0,0),(0,-1),3,GOLD),('BOX',(0,0),(-1,-1),.35,LINE),('LEFTPADDING',(0,0),(-1,-1),7),('RIGHTPADDING',(0,0),(-1,-1),7),('TOPPADDING',(0,0),(-1,-1),6),('BOTTOMPADDING',(0,0),(-1,-1),6)])); story += [gtbl,Spacer(1,3*mm),notice]
+                doc.build(story,onFirstPage=footer,onLaterPages=footer); buf.seek(0); return buf.getvalue()
 
             st.markdown("### Print & Export")
             st.caption("Large report assets are prepared only when requested, keeping normal app reruns light.")
