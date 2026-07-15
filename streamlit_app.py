@@ -3582,7 +3582,10 @@ if _view_is("Form Study"):
 
             # ---------- Handicap Review ----------
             st.markdown("### Handicap Review")
-            st.caption("The full field is shown. Enter Current MR and MR Achieved; Race Edge calculates the difference.")
+            st.caption(
+                "Enter the horse's Race MR and the MR achieved in this race. "
+                "Race Edge calculates the difference and generates an editable handicap note."
+            )
 
             def _fs_beta_base(distance_m):
                 d = float(distance_m)
@@ -3591,6 +3594,27 @@ if _view_is("Form Study"):
                 if d <= 2000: return 0.40
                 if d <= 2400: return 0.45
                 return 0.50
+
+            def _fs_auto_handicap_note(mr_difference):
+                try:
+                    value = float(mr_difference)
+                except (TypeError, ValueError):
+                    return ""
+                if not np.isfinite(value):
+                    return ""
+                if value >= 8:
+                    return "Significantly ahead of its race mark"
+                if value >= 5:
+                    return "Clearly ahead of its race mark"
+                if value >= 2:
+                    return "Ran above its race mark"
+                if value >= -1:
+                    return "Ran broadly to its race mark"
+                if value >= -4:
+                    return "Ran below its race mark"
+                if value >= -7:
+                    return "Clearly below its race mark"
+                return "Significantly below its race mark"
 
             fs_weight_candidates = ["Horse Weight", "Horse_Weight", "Wt", "Weight", "Weight (kg)"]
             fs_weight_col = next((c for c in fs_weight_candidates if c in metrics.columns), None)
@@ -3602,34 +3626,63 @@ if _view_is("Form Study"):
             fs_handicap["PI"] = pd.to_numeric(fs_handicap["PI"], errors="coerce")
             fs_pi_med = float(np.nanmedian(fs_handicap["PI"])) if fs_handicap["PI"].notna().any() else np.nan
             fs_beta = float(np.clip(_fs_beta_base(float(race_distance_input)), 0.22, 0.70))
-            fs_handicap["Ahead (kg)"] = (fs_handicap["PI"] - fs_pi_med) / fs_beta
-            fs_handicap["Ahead (MR)"] = fs_handicap["Ahead (kg)"] * 2.0
-            fs_handicap["Current MR"] = np.nan
+
+            # Ahead (kg) remains an internal calculation only.
+            fs_handicap["_Ahead_kg"] = (fs_handicap["PI"] - fs_pi_med) / fs_beta
+            fs_handicap["Ahead (MR)"] = fs_handicap["_Ahead_kg"] * 2.0
+            fs_handicap["Race MR"] = np.nan
             fs_handicap["MR Achieved"] = np.nan
-            fs_handicap["Handicap Note"] = ""
-            fs_handicap = fs_handicap.sort_values("Ahead (kg)", ascending=False).reset_index(drop=True)
-            for c in ["Weight (kg)", "PI", "Ahead (kg)", "Ahead (MR)"]:
+            fs_handicap = fs_handicap.sort_values("_Ahead_kg", ascending=False).reset_index(drop=True)
+
+            for c in ["Weight (kg)", "PI", "Ahead (MR)"]:
                 fs_handicap[c] = pd.to_numeric(fs_handicap[c], errors="coerce").round(2)
 
-            fs_edited = st.data_editor(
-                fs_handicap,
+            # First editor: capture the two analyst-entered ratings.
+            fs_rating_input = st.data_editor(
+                fs_handicap[["Horse", "PI", "Weight (kg)", "Ahead (MR)", "Race MR", "MR Achieved"]],
                 width="stretch",
                 hide_index=True,
-                disabled=["Horse", "Weight (kg)", "PI", "Ahead (kg)", "Ahead (MR)"],
+                disabled=["Horse", "Weight (kg)", "PI", "Ahead (MR)"],
                 column_config={
-                    "Current MR": st.column_config.NumberColumn("Current MR", step=1, format="%.0f"),
+                    "Race MR": st.column_config.NumberColumn("Race MR", step=1, format="%.0f"),
                     "MR Achieved": st.column_config.NumberColumn("MR Achieved", step=1, format="%.0f"),
-                    "Handicap Note": st.column_config.TextColumn("Handicap Note", width="large"),
                 },
-                key="fs_handicap_editor",
+                key="fs_handicap_rating_editor",
             )
-            fs_edited = fs_edited.copy()
-            fs_edited["Current MR"] = pd.to_numeric(fs_edited["Current MR"], errors="coerce")
-            fs_edited["MR Achieved"] = pd.to_numeric(fs_edited["MR Achieved"], errors="coerce")
-            fs_edited["MR Difference"] = fs_edited["MR Achieved"] - fs_edited["Current MR"]
 
-            fs_mr_view_cols = ["Horse", "Current MR", "MR Achieved", "MR Difference", "Handicap Note"]
-            st.dataframe(fs_edited[fs_mr_view_cols], width="stretch", hide_index=True)
+            fs_edited = fs_rating_input.copy()
+            fs_edited["Race MR"] = pd.to_numeric(fs_edited["Race MR"], errors="coerce")
+            fs_edited["MR Achieved"] = pd.to_numeric(fs_edited["MR Achieved"], errors="coerce")
+            fs_edited["MR Difference"] = fs_edited["MR Achieved"] - fs_edited["Race MR"]
+            fs_edited["Handicap Note"] = fs_edited["MR Difference"].apply(_fs_auto_handicap_note)
+
+            # Second editor: show the completed review and allow note overrides only.
+            fs_edited = st.data_editor(
+                fs_edited[
+                    [
+                        "Horse", "PI", "Weight (kg)", "Ahead (MR)",
+                        "Race MR", "MR Achieved", "Handicap Note", "MR Difference",
+                    ]
+                ],
+                width="stretch",
+                hide_index=True,
+                disabled=[
+                    "Horse", "PI", "Weight (kg)", "Ahead (MR)",
+                    "Race MR", "MR Achieved", "MR Difference",
+                ],
+                column_config={
+                    "Handicap Note": st.column_config.TextColumn(
+                        "Handicap Note",
+                        width="large",
+                        help="Automatically generated from MR Difference; edit where race circumstances require.",
+                    ),
+                    "MR Difference": st.column_config.NumberColumn(
+                        "MR Difference",
+                        format="%.0f",
+                    ),
+                },
+                key="fs_handicap_note_editor",
+            )
 
             # ---------- Race Edge Verdict ----------
             st.markdown("### Race Edge Verdict")
@@ -3656,7 +3709,7 @@ if _view_is("Form Study"):
                 # Build one stable lookup row per horse before joining the MR fields.
                 fs_mr_lookup = (
                     fs_edited[
-                        ["Horse", "Current MR", "MR Achieved", "MR Difference"]
+                        ["Horse", "Race MR", "MR Achieved", "MR Difference"]
                     ]
                     .copy()
                     .dropna(subset=["Horse"])
@@ -3664,7 +3717,7 @@ if _view_is("Form Study"):
                 )
 
                 fs_follow_df = fs_follow_df.drop(
-                    columns=["Current MR", "MR Achieved", "MR Difference"],
+                    columns=["Race MR", "MR Achieved", "MR Difference"],
                     errors="ignore",
                 ).merge(
                     fs_mr_lookup,
@@ -3673,11 +3726,11 @@ if _view_is("Form Study"):
                     validate="many_to_one",
                 )
                 fs_final_cols = [
-                    "Horse", "PPS", "PI", "Finish", "Current MR", "MR Achieved", "MR Difference",
+                    "Horse", "PPS", "PI", "Finish", "Race MR", "MR Achieved", "MR Difference",
                     "Reason", "Ideal distance", "Ideal surface", "Preferred pace", "Confidence", "Note",
                 ]
                 fs_follow_display = fs_follow_df[fs_final_cols].copy()
-                for c in ["PPS", "PI", "Current MR", "MR Achieved", "MR Difference"]:
+                for c in ["PPS", "PI", "Race MR", "MR Achieved", "MR Difference"]:
                     fs_follow_display[c] = pd.to_numeric(fs_follow_display[c], errors="coerce").round(2)
                 st.dataframe(fs_follow_display, width="stretch", hide_index=True)
 
