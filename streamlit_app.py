@@ -3541,11 +3541,6 @@ if _view_is("Form Study"):
 
             # ---------- Analyst assessments ----------
             st.markdown("### Analyst Assessment")
-            fs_follow_reasons = [
-                "Strong plane position", "Better than result", "Hidden run", "Pace against",
-                "Wants further", "Wants shorter", "Settled poorly", "Wide trip",
-                "Traffic problems", "Strong finish", "Forgive run", "Other",
-            ]
             fs_surfaces = ["Any", "Turf", "Polytrack", "Dirt", "Other"]
             fs_paces = ["Any", "Slow/tactical", "Even", "Strong", "Fast/collapse"]
             fs_follow_rows = []
@@ -3554,10 +3549,9 @@ if _view_is("Form Study"):
                 horse = str(row["Horse"])
                 safe_key = re.sub(r"[^A-Za-z0-9]+", "_", horse).strip("_")[:40] or f"horse_{i}"
                 with st.expander(f"#{int(row['PPS_Rank'])} — {horse}", expanded=(i == 0)):
-                    a1, a2, a3 = st.columns([1, 1.4, 1])
+                    a1, a2, a3 = st.columns([1, 1.4, 1.4])
                     with a1:
                         follow = st.checkbox("Follow horse", value=True, key=f"fs_follow_{safe_key}_{i}")
-                        reason = st.selectbox("Follow reason", fs_follow_reasons, key=f"fs_reason_{safe_key}_{i}")
                         confidence = st.select_slider(
                             "Confidence", options=[1, 2, 3, 4, 5], value=3,
                             format_func=lambda n: "★" * n + "☆" * (5 - n),
@@ -3568,7 +3562,7 @@ if _view_is("Form Study"):
                         ideal_surface = st.selectbox("Ideal surface", fs_surfaces, key=f"fs_surf_{safe_key}_{i}")
                         preferred_pace = st.selectbox("Preferred pace", fs_paces, key=f"fs_pace_{safe_key}_{i}")
                     with a3:
-                        note = st.text_area("Analyst note", height=128, key=f"fs_note_{safe_key}_{i}")
+                        note = st.text_area("Analyst assessment", height=150, key=f"fs_note_{safe_key}_{i}")
 
                     fs_follow_rows.append({
                         "Follow": bool(follow), "Horse": horse,
@@ -3576,7 +3570,7 @@ if _view_is("Form Study"):
                         "Finish": row.get("Finish_Pos", np.nan), "F200": row.get("F200_idx", np.nan),
                         "tsSPI": row.get("tsSPI", np.nan), "Accel": row.get("Accel", np.nan),
                         "Grind": row.get(fs_grind_col, np.nan), "Residual": row.get("Class_Residual", np.nan),
-                        "Reason": reason, "Ideal distance": ideal_distance, "Ideal surface": ideal_surface,
+                        "Ideal distance": ideal_distance, "Ideal surface": ideal_surface,
                         "Preferred pace": preferred_pace, "Confidence": int(confidence), "Note": note,
                     })
 
@@ -3690,9 +3684,9 @@ if _view_is("Form Study"):
             fs_options = ["—"] + fs_horses
             v1, v2, v3, v4 = st.columns(4)
             with v1:
-                fs_main_follow = st.selectbox("Main horse to follow", fs_options, key="fs_main_follow")
+                fs_main_follow = st.selectbox("Horse to follow", fs_options, key="fs_main_follow")
             with v2:
-                fs_improver = st.selectbox("Most likely improver", fs_options, key="fs_improver")
+                fs_improver = st.selectbox("Improver", fs_options, key="fs_improver")
             with v3:
                 fs_best_handicap = st.selectbox("Best handicapped horse", fs_options, key="fs_best_handicap")
             with v4:
@@ -3727,7 +3721,7 @@ if _view_is("Form Study"):
                 )
                 fs_final_cols = [
                     "Horse", "PPS", "PI", "Finish", "Race MR", "MR Achieved", "MR Difference",
-                    "Reason", "Ideal distance", "Ideal surface", "Preferred pace", "Confidence", "Note",
+                    "Ideal distance", "Ideal surface", "Preferred pace", "Confidence", "Note",
                 ]
                 fs_follow_display = fs_follow_df[fs_final_cols].copy()
                 for c in ["PPS", "PI", "Race MR", "MR Achieved", "MR Difference"]:
@@ -3735,6 +3729,14 @@ if _view_is("Form Study"):
                 st.dataframe(fs_follow_display, width="stretch", hide_index=True)
 
             # ---------- Premium printable report ----------
+            def _fs_stars(value):
+                try:
+                    n = int(value)
+                except Exception:
+                    n = 0
+                n = max(0, min(5, n))
+                return "★" * n + "☆" * (5 - n)
+
             def _fs_fmt(v, dp=2):
                 try:
                     return "" if pd.isna(v) else f"{float(v):.{dp}f}"
@@ -3804,21 +3806,23 @@ if _view_is("Form Study"):
                 <div class="metrics-grid">{metric_html}</div>
                 <div class="residual"><b>Residual:</b> {_fs_fmt(row.get('Class_Residual', np.nan))}</div>
                 <div class="assessment">
-                <div><b>Follow:</b> {'Yes' if info.get('Follow') else 'No'}</div><div><b>Reason:</b> {_html.escape(str(info.get('Reason','')))}</div>
-                <div><b>Ideal distance:</b> {_html.escape(str(info.get('Ideal distance','')))}</div><div><b>Ideal surface:</b> {_html.escape(str(info.get('Ideal surface','')))}</div>
-                <div><b>Preferred pace:</b> {_html.escape(str(info.get('Preferred pace','')))}</div><div><b>Confidence:</b> {int(info.get('Confidence',0) or 0)}/5</div>
-                </div><div class="analyst-note"><b>Analyst note</b><br>{_html.escape(str(info.get('Note',''))) or '&nbsp;'}</div></section>'''
+                <div><b>Follow:</b> {'Yes' if info.get('Follow') else 'No'}</div>
+                <div><b>Ideal distance:</b> {_html.escape(str(info.get('Ideal distance','')))}</div>
+                <div><b>Ideal surface:</b> {_html.escape(str(info.get('Ideal surface','')))}</div>
+                <div><b>Preferred pace:</b> {_html.escape(str(info.get('Preferred pace','')))}</div>
+                <div><b>Confidence:</b> <span class="stars">{_fs_stars(info.get('Confidence',0))}</span></div>
+                </div><div class="analyst-note"><b>Analyst Assessment</b><br>{_html.escape(str(info.get('Note',''))) or '&nbsp;'}</div></section>'''
 
             fs_glossary = [
-                ('PI (Performance Index)', 'A proprietary performance rating designed to assess the overall quality of a horse performance.', [('8.0+','Outstanding performance'),('7.0-7.9','Very strong performance'),('6.0-6.9','Above-average performance'),('5.0-5.9','Competitive performance'),('Below 5.0','Below-average performance')]),
-                ('PPS', 'A proprietary measure of a horse overall performance characteristics.', [('8.0+','Elite performance profile'),('7.0-7.9','Strong performance profile'),('6.0-6.9','Above average'),('5.0-5.9','Competitive'),('Below 5.0','Below average')]),
-                ('Residual', 'Indicates how a horse finishing performance differed from its expected performance profile.', [('+5 or higher','Significantly exceeded expectations'),('+2 to +5','Above expectation'),('-2 to +2','Broadly as expected'),('-5 to -2','Below expectation'),('Below -5','Significantly below expectation')]),
-                ('tsSPI', 'A proprietary measure of sustained speed through the middle stages of a race.', [('102+','Exceptional'),('101-101.9','Strong'),('99-100.9','Average'),('Below 99','Below average')]),
-                ('Acceleration', 'Measures a horse ability to increase speed during the decisive stages of a race.', [('102+','Exceptional'),('101-101.9','Strong'),('99-100.9','Average'),('Below 99','Below average')]),
-                ('Grind', 'Measures a horse ability to sustain its performance through the closing stages of a race.', [('102+','Exceptional'),('101-101.9','Strong'),('99-100.9','Average'),('Below 99','Below average')]),
-                ('F200', 'Measures a horse gate speed during the opening stages of a race.', [('102+','Exceptional gate speed'),('101-101.9','Strong gate speed'),('99-100.9','Average gate speed'),('Below 99','Below-average gate speed')]),
-                ('RPSS', 'A proprietary race-level indicator used to assess how strongly the race was run.', [('100+','Strongly run race'),('98-99.9','Above-average race'),('96-97.9','Average race'),('Below 96','Slowly run or weaker race')]),
-                ('Ahead of the Handicap', 'Provides an indication of how a horse performance compares with its current official handicap assessment.', [('+5 MR or more','Significantly ahead of current mark'),('+2 to +4 MR','Well handicapped'),('-1 to +1 MR','Running to current mark'),('-2 MR or less','Below current rating')]),
+                ('PI (Performance Index)', 'Measures how complete a horse performance was within the unique environment of that race. PI combines gate speed, sustained speed, acceleration and finishing strength into one race-relative score. It is intended for comparison within the same race rather than as an absolute class rating.', [('7.0+','Outstanding within the race'),('6.0-6.9','Strong performance'),('5.0-5.9','Around the race standard'),('4.0-4.9','Below the race standard'),('Below 4.0','Well below the race standard')]),
+                ('PPS (Performance Plane Score)', 'Measures the overall strength and balance of a horse sectional profile using sustained speed, acceleration and finishing strength.', [('8.0+','Elite plane position'),('7.0-7.9','Strong plane position'),('6.0-6.9','Above the race standard'),('5.0-5.9','Competitive plane position'),('Below 5.0','Below the race standard')]),
+                ('Residual', 'Shows whether a horse closing performance was better or worse than expected from its position in the Performance Plane.', [('+5 or higher','Significantly exceeded expectation'),('+2 to +5','Above expectation'),('-2 to +2','Broadly as expected'),('-5 to -2','Below expectation'),('Below -5','Significantly below expectation')]),
+                ('F200', 'Measures gate speed and early efficiency during the opening 200 metres.', [('102+','Exceptional gate speed'),('101-101.9','Strong gate speed'),('99-100.9','Around the race standard'),('Below 99','Below the race standard')]),
+                ('tsSPI', 'Measures sustained cruising speed through the middle stages of the race.', [('102+','Exceptional sustained speed'),('101-101.9','Strong'),('99-100.9','Around the race standard'),('Below 99','Below the race standard')]),
+                ('Accel', 'Measures how effectively a horse increased speed from the 600m point to the 200m point.', [('102+','Exceptional acceleration'),('101-101.9','Strong'),('99-100.9','Around the race standard'),('Below 99','Below the race standard')]),
+                ('Grind', 'Measures the ability to sustain speed from the 200m point to the finish.', [('102+','Exceptional closing strength'),('101-101.9','Strong'),('99-100.9','Around the race standard'),('Below 99','Below the race standard')]),
+                ('RPSS', 'Race Pace Strength Score indicates how strongly the race was run as a whole.', [('Above 100','Strongly run race'),('Around 100','Genuinely run race'),('Below 100','Slower or more tactical race')]),
+                ('Ahead of the Handicap (MR)', 'Estimates how far ahead or behind a horse performed relative to its Race MR within this race.', [('+5 MR or more','Significantly ahead of its mark'),('+2 to +4 MR','Ahead of its mark'),('-1 to +1 MR','Broadly ran to its mark'),('-2 MR or less','Below its race mark')]),
             ]
 
             def _fs_html_glossary():
@@ -3842,20 +3846,28 @@ if _view_is("Form Study"):
 .race-grid{{display:grid;grid-template-columns:repeat(5,1fr);gap:7px;background:var(--soft);border:1px solid var(--line);padding:10px}}.race-item{{background:white;border-left:3px solid var(--gold);padding:6px 8px}}.race-item span{{display:block;color:var(--muted);font-size:8px;text-transform:uppercase}}.race-item b{{display:block;margin-top:2px;font-size:10.5px}}
 .result-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}}.result-card{{border:1px solid var(--line);padding:9px 11px;border-top:3px solid var(--gold);background:white}}.result-card span{{display:block;color:var(--muted);font-size:8px;text-transform:uppercase}}.result-card b{{display:block;margin-top:4px;color:var(--navy);font-size:11px}}.verdict-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}}.verdict-card{{border:1px solid var(--line);padding:8px}}.verdict-card span{{color:var(--muted);font-size:8px;text-transform:uppercase}}.verdict-card b{{display:block;margin-top:4px;color:var(--navy);font-size:11px}}.summary{{margin-top:8px;border:1px solid var(--line);border-left:4px solid var(--gold);padding:9px;min-height:55px;white-space:pre-wrap}}
 .cards{{display:grid;grid-template-columns:1fr 1fr;gap:10px}}.horse-card{{border:1px solid #ccd5e0;border-top:4px solid var(--navy);padding:9px;break-inside:avoid}}.horse-title{{display:flex;justify-content:space-between;color:var(--navy);font-size:13px;font-weight:700;margin-bottom:7px}}.horse-title span:last-child{{color:var(--muted);font-size:9px}}.rank{{color:var(--gold)}}
-.metrics-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:5px 8px}}.metric-head{{display:flex;justify-content:space-between;font-size:8.5px}}.metric-head span{{color:var(--muted)}}.bar{{height:5px;background:#e3e7ed;margin-top:2px;border-radius:3px;overflow:hidden}}.bar span{{display:block;height:100%;background:linear-gradient(90deg,var(--navy2),var(--gold))}}.residual{{margin:7px 0;padding:5px 7px;background:var(--soft)}}.assessment{{display:grid;grid-template-columns:repeat(3,1fr);gap:4px 8px;font-size:8.6px}}.analyst-note{{margin-top:7px;border-top:1px solid var(--line);padding-top:6px;min-height:33px;white-space:pre-wrap}}
+.metrics-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:5px 8px}}.metric-head{{display:flex;justify-content:space-between;font-size:8.5px}}.metric-head span{{color:var(--muted)}}.bar{{height:5px;background:#e3e7ed;margin-top:2px;border-radius:3px;overflow:hidden}}.bar span{{display:block;height:100%;background:linear-gradient(90deg,var(--navy2),var(--gold))}}.residual{{margin:7px 0;padding:5px 7px;background:var(--soft)}}.assessment{{display:grid;grid-template-columns:repeat(5,1fr);gap:5px 8px;font-size:8.6px}}.stars{{color:var(--gold);letter-spacing:.5px;font-size:10px}}.analyst-note{{margin-top:7px;border-top:1px solid var(--line);padding-top:6px;min-height:33px;white-space:pre-wrap}}
 table{{width:100%;border-collapse:collapse;margin:5px 0 10px;font-size:8.1px}}th{{background:var(--navy);color:white;padding:5px 4px;text-align:left}}td{{border-bottom:1px solid var(--line);padding:4px;vertical-align:top}}tr.alt td{{background:var(--soft)}}tr.positive td{{background:#e8f4ec}}tr.negative td{{background:#f8e9e9}}.empty{{color:var(--muted);font-style:italic;padding:7px}}.page-break{{page-break-before:always}}
-.glossary-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px 10px}}.glossary-item{{border:1px solid var(--line);padding:7px;break-inside:avoid}}.glossary-item h4{{margin:0 0 3px;color:var(--navy);font-size:10px}}.glossary-item p{{margin:0 0 5px;font-size:8.3px;line-height:1.25}}.guide{{margin:0;font-size:7.6px}}.guide td:first-child{{width:34%;font-weight:bold;color:var(--navy)}}.notice{{margin-top:9px;padding:8px;background:var(--soft);border-left:4px solid var(--gold);font-size:8.2px}}
+.guide-cover{{min-height:170mm;padding-bottom:8px}}.guide-kicker{{display:inline-block;margin:12px 0 5px;padding:4px 9px;background:var(--gold);color:var(--navy);font-weight:700;text-transform:uppercase;letter-spacing:.8px}}.guide-intro{{font-size:11px;line-height:1.45;max-width:920px;margin:4px 0 12px}}.glossary-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px 10px}}.glossary-item{{border:1px solid var(--line);border-left:4px solid var(--gold);padding:8px;background:white;break-inside:avoid;box-shadow:0 1px 0 rgba(10,24,48,.04)}}.glossary-item h4{{margin:0 0 3px;color:var(--navy);font-size:10px}}.glossary-item p{{margin:0 0 5px;font-size:8.3px;line-height:1.25}}.guide{{margin:0;font-size:7.6px}}.guide td:first-child{{width:34%;font-weight:bold;color:var(--navy)}}.philosophy{{margin-top:10px;padding:12px 14px;background:var(--navy);color:white;border-left:5px solid var(--gold);font-size:9px;line-height:1.45}}.philosophy b{{color:var(--gold);font-size:11px}}.notice{{margin-top:8px;padding:8px;background:var(--soft);border-left:4px solid var(--gold);font-size:8.2px}}
 .footer{{position:fixed;left:0;right:0;bottom:-11mm;text-align:center;color:#6b7280;font-size:7.5px;border-top:1px solid #b8c0cc;padding-top:4px}}@media print{{.print-button{{display:none}}}}
 </style></head><body><button class="print-button" onclick="window.print()">Print report</button>
-<header class="brand"><h1>RACE EDGE ANALYTICS</h1><p>Performance-Based Race Analysis | Form Study Report</p></header>
+<section class="guide-cover">
+<header class="brand"><h1>RACE EDGE ANALYTICS</h1><p>FORM STUDY REPORT | Performance-Based Race Analysis</p></header>
+<div class="guide-kicker">Race Edge Guide</div>
+<p class="guide-intro">Understanding the core metrics used throughout this report. Race Edge evaluates each performance within the unique pace, tactics and conditions of the race that was actually run.</p>
+<section class="section glossary-grid">{_fs_html_glossary()}</section>
+<div class="philosophy"><b>EVERY RACE IS ITS OWN ECOSYSTEM.</b><br>Race Edge measures how completely each horse executed within the environment of that race. PI is race-relative, not an absolute class rating. A PI of 10 represents the theoretical benchmark of a flawless performance within the Race Edge model and is expected to be exceptionally rare.</div>
+<div class="notice"><b>Prepared by Kiran Singh.</b> The Race Edge metrics in this report are proprietary analytical measures. Descriptions are intentionally general and do not disclose underlying calculations.</div>
+</section>
+<div class="page-break"></div>
+<header class="brand"><h1>RACE ANALYSIS</h1><p>Race Overview | Official Result | Race Edge Verdict</p></header>
 <section class="section"><h2 class="section-title">Race Overview</h2><div class="race-grid">
 <div class="race-item"><span>Date</span><b>{_html.escape(fs_date)}</b></div><div class="race-item"><span>Track</span><b>{_html.escape(fs_track)}</b></div><div class="race-item"><span>Race</span><b>{_html.escape(fs_race_no)}</b></div><div class="race-item"><span>Distance</span><b>{int(race_distance_input)}m</b></div><div class="race-item"><span>Surface</span><b>{_html.escape(fs_surface)}</b></div>
-<div class="race-item"><span>Going</span><b>{_html.escape(fs_going)}</b></div><div class="race-item"><span>Class</span><b>{_html.escape(fs_race_class)}</b></div><div class="race-item"><span>RPSS</span><b>{_html.escape(fs_rpss_text)}</b></div><div class="race-item"><span>Race confidence</span><b>{int(fs_race_confidence)}/5</b></div><div class="race-item"><span>Runners</span><b>{len(metrics)}</b></div></div></section>
+<div class="race-item"><span>Going</span><b>{_html.escape(fs_going)}</b></div><div class="race-item"><span>Class</span><b>{_html.escape(fs_race_class)}</b></div><div class="race-item"><span>RPSS</span><b>{_html.escape(fs_rpss_text)}</b></div><div class="race-item"><span>Race confidence</span><b class="stars">{_fs_stars(fs_race_confidence)}</b></div><div class="race-item"><span>Runners</span><b>{len(metrics)}</b></div></div></section>
 <section class="section"><h2 class="section-title">Official Result</h2><div class="result-grid"><div class="result-card"><span>1st</span><b>{_html.escape(fs_result_1st)}</b></div><div class="result-card"><span>2nd</span><b>{_html.escape(fs_result_2nd)}</b></div><div class="result-card"><span>3rd</span><b>{_html.escape(fs_result_3rd)}</b></div></div></section>
-<section class="section"><h2 class="section-title">Race Edge Verdict</h2><div class="verdict-grid"><div class="verdict-card"><span>Main horse to follow</span><b>{_html.escape(fs_main_follow)}</b></div><div class="verdict-card"><span>Most likely improver</span><b>{_html.escape(fs_improver)}</b></div><div class="verdict-card"><span>Best handicapped horse</span><b>{_html.escape(fs_best_handicap)}</b></div><div class="verdict-card"><span>Horse to forgive</span><b>{_html.escape(fs_forgive)}</b></div></div><div class="summary"><b>Analyst summary</b><br>{_html.escape(fs_race_summary)}</div></section>
+<section class="section"><h2 class="section-title">Race Edge Verdict</h2><div class="verdict-grid"><div class="verdict-card"><span>Horse to follow</span><b>{_html.escape(fs_main_follow)}</b></div><div class="verdict-card"><span>Improver</span><b>{_html.escape(fs_improver)}</b></div><div class="verdict-card"><span>Best handicapped horse</span><b>{_html.escape(fs_best_handicap)}</b></div><div class="verdict-card"><span>Horse to forgive</span><b>{_html.escape(fs_forgive)}</b></div></div><div class="summary"><b>Analyst summary</b><br>{_html.escape(fs_race_summary)}</div></section>
 <div class="page-break"></div><header class="brand"><h1>TOP 4 PPS HORSES</h1><p>Race Edge performance shortlist</p></header><section class="section"><div class="cards">{fs_cards_html}</div></section>
 <div class="page-break"></div><header class="brand"><h1>HANDICAP REVIEW</h1><p>Performance against the official assessment</p></header><section class="section">{_fs_html_table(fs_edited,'MR Difference')}</section><section class="section"><h2 class="section-title">Final Follow List</h2>{_fs_html_table(fs_follow_table,'MR Difference')}</section>
-<div class="page-break"></div><header class="brand"><h1>METRIC GLOSSARY</h1><p>General interpretation guide | Version 1.0</p></header><section class="section glossary-grid">{_fs_html_glossary()}</section><div class="notice"><b>Proprietary notice.</b> The Race Edge metrics contained within this report are proprietary analytical measures developed by Race Edge Analytics. Descriptions are intentionally general and do not disclose the underlying methodologies or calculations. Reproduction, redistribution, or commercial use without prior written permission from Race Edge Analytics is prohibited.</div>
 <div class="footer">Property of Race Edge Analytics | Prepared by Kiran Singh | © Race Edge Analytics. All Rights Reserved.</div></body></html>'''
 
             # ---------- Premium PDF export ----------
@@ -3865,11 +3877,15 @@ table{{width:100%;border-collapse:collapse;margin:5px 0 10px;font-size:8.1px}}th
                     from reportlab.lib.pagesizes import A4, landscape
                     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
                     from reportlab.lib.units import mm
+                    from reportlab.pdfbase import pdfmetrics
+                    from reportlab.pdfbase.ttfonts import TTFont
                     from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, KeepTogether, HRFlowable
                 except Exception as exc:
                     raise RuntimeError('ReportLab is required for PDF export.') from exc
 
                 NAVY=colors.HexColor('#0A1830'); NAVY2=colors.HexColor('#17365F'); GOLD=colors.HexColor('#C8A85A')
+                pdfmetrics.registerFont(TTFont('RaceEdgeSans', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'))
+                pdfmetrics.registerFont(TTFont('RaceEdgeSansBold', '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'))
                 SOFT=colors.HexColor('#F3F5F8'); LINE=colors.HexColor('#D4DAE3'); INK=colors.HexColor('#172238'); MUTED=colors.HexColor('#667386')
                 POS=colors.HexColor('#E8F4EC'); NEG=colors.HexColor('#F8E9E9'); page_w,_=landscape(A4)
                 buf=io.BytesIO(); doc=SimpleDocTemplate(buf,pagesize=landscape(A4),rightMargin=11*mm,leftMargin=11*mm,topMargin=11*mm,bottomMargin=18*mm,title='Race Edge Analytics Form Study Report',author='Kiran Singh')
@@ -3882,6 +3898,7 @@ table{{width:100%;border-collapse:collapse;margin:5px 0 10px;font-size:8.1px}}th
                 tiny_style=ParagraphStyle('RETiny',parent=body_style,fontSize=5.5,leading=6.5)
                 white_small=ParagraphStyle('REWhiteSmall',parent=small_style,textColor=colors.white,fontName='Helvetica-Bold')
                 muted_style=ParagraphStyle('REMuted',parent=small_style,textColor=MUTED)
+                star_style=ParagraphStyle('REStars',parent=body_style,fontName='RaceEdgeSansBold',fontSize=8.5,leading=10,textColor=GOLD)
 
                 def ptxt(v,style=tiny_style):
                     if v is None or (isinstance(v,(float,np.floating)) and not np.isfinite(v)): s=''
@@ -3924,10 +3941,16 @@ table{{width:100%;border-collapse:collapse;margin:5px 0 10px;font-size:8.1px}}th
                     title=Table([[Paragraph(f'<font color="#C8A85A">#{rank}</font> {_xml_escape(horse)}',ParagraphStyle('HorseTitle',parent=body_style,fontName='Helvetica-Bold',fontSize=10.5,leading=12,textColor=NAVY)),Paragraph(f"Finish: {_xml_escape(str(row.get('Finish_Pos','')))}",muted_style)]],colWidths=[92*mm,28*mm]); title.setStyle(TableStyle([('ALIGN',(1,0),(1,0),'RIGHT'),('LEFTPADDING',(0,0),(-1,-1),0),('RIGHTPADDING',(0,0),(-1,-1),0)]))
                     vals=[('PPS',row.get('PPS',np.nan)),('PI',row.get('PI',np.nan)),('F200',row.get('F200_idx',np.nan)),('tsSPI',row.get('tsSPI',np.nan)),('Accel',row.get('Accel',np.nan)),('Grind',row.get(fs_grind_col,np.nan))]
                     cells=[metric_bar(a,b) for a,b in vals]; metrics_tbl=Table([[cells[0],cells[1],cells[2]],[cells[3],cells[4],cells[5]]],colWidths=[41*mm]*3); metrics_tbl.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),2),('RIGHTPADDING',(0,0),(-1,-1),2),('TOPPADDING',(0,0),(-1,-1),2),('BOTTOMPADDING',(0,0),(-1,-1),3)]))
-                    assess=pd.DataFrame([['Follow','Yes' if info.get('Follow') else 'No','Reason',info.get('Reason','')],['Ideal distance',info.get('Ideal distance',''),'Ideal surface',info.get('Ideal surface','')],['Preferred pace',info.get('Preferred pace',''),'Confidence',f"{int(info.get('Confidence',0) or 0)}/5"]])
-                    note=Table([[Paragraph('<b>Analyst note</b><br/>'+_xml_escape(str(info.get('Note',''))).replace('\n','<br/>'),small_style)]],colWidths=[122*mm]); note.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),SOFT),('BOX',(0,0),(-1,-1),0.3,LINE),('LEFTPADDING',(0,0),(-1,-1),5),('RIGHTPADDING',(0,0),(-1,-1),5),('TOPPADDING',(0,0),(-1,-1),4),('BOTTOMPADDING',(0,0),(-1,-1),5)]))
+                    assess_data=[
+                        [Paragraph('<b>Follow</b>',small_style),Paragraph('Yes' if info.get('Follow') else 'No',small_style),Paragraph('<b>Ideal distance</b>',small_style),ptxt(info.get('Ideal distance',''),small_style)],
+                        [Paragraph('<b>Ideal surface</b>',small_style),ptxt(info.get('Ideal surface',''),small_style),Paragraph('<b>Preferred pace</b>',small_style),ptxt(info.get('Preferred pace',''),small_style)],
+                        [Paragraph('<b>Confidence</b>',small_style),Paragraph(_fs_stars(info.get('Confidence',0)),star_style),Paragraph('',small_style),Paragraph('',small_style)],
+                    ]
+                    assess=Table(assess_data,colWidths=[24*mm,37*mm,24*mm,37*mm])
+                    assess.setStyle(TableStyle([('GRID',(0,0),(-1,-1),0.25,LINE),('BACKGROUND',(0,0),(-1,-1),colors.white),('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),3),('RIGHTPADDING',(0,0),(-1,-1),3),('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3)]))
+                    note=Table([[Paragraph('<b>Analyst Assessment</b><br/>'+_xml_escape(str(info.get('Note',''))).replace('\n','<br/>'),small_style)]],colWidths=[122*mm]); note.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),SOFT),('BOX',(0,0),(-1,-1),0.3,LINE),('LEFTPADDING',(0,0),(-1,-1),5),('RIGHTPADDING',(0,0),(-1,-1),5),('TOPPADDING',(0,0),(-1,-1),4),('BOTTOMPADDING',(0,0),(-1,-1),5)]))
                     residual=Table([[Paragraph(f"<b>Residual:</b> {_fs_fmt(row.get('Class_Residual',np.nan))}",small_style)]],colWidths=[122*mm]); residual.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),SOFT),('LEFTPADDING',(0,0),(-1,-1),4),('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3)]))
-                    card=Table([[title],[metrics_tbl],[residual],[make_table(assess,font=6.0)],[note]],colWidths=[128*mm]); card.setStyle(TableStyle([('BOX',(0,0),(-1,-1),0.6,LINE),('LINEABOVE',(0,0),(-1,0),3,NAVY),('LEFTPADDING',(0,0),(-1,-1),5),('RIGHTPADDING',(0,0),(-1,-1),5),('TOPPADDING',(0,0),(-1,-1),4),('BOTTOMPADDING',(0,0),(-1,-1),4),('VALIGN',(0,0),(-1,-1),'TOP')])); return card
+                    card=Table([[title],[metrics_tbl],[residual],[assess],[note]],colWidths=[128*mm]); card.setStyle(TableStyle([('BOX',(0,0),(-1,-1),0.6,LINE),('LINEABOVE',(0,0),(-1,0),3,NAVY),('LEFTPADDING',(0,0),(-1,-1),5),('RIGHTPADDING',(0,0),(-1,-1),5),('TOPPADDING',(0,0),(-1,-1),4),('BOTTOMPADDING',(0,0),(-1,-1),4),('VALIGN',(0,0),(-1,-1),'TOP')])); return card
 
                 def glossary_card(item):
                     name,desc,bands=item; guide=Table([[Paragraph(_xml_escape(a),small_style),Paragraph(_xml_escape(b),small_style)] for a,b in bands],colWidths=[27*mm,51*mm]); guide.setStyle(TableStyle([('GRID',(0,0),(-1,-1),0.25,LINE),('BACKGROUND',(0,0),(0,-1),SOFT),('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),3),('RIGHTPADDING',(0,0),(-1,-1),3),('TOPPADDING',(0,0),(-1,-1),2),('BOTTOMPADDING',(0,0),(-1,-1),2)]))
@@ -3936,12 +3959,25 @@ table{{width:100%;border-collapse:collapse;margin:5px 0 10px;font-size:8.1px}}th
                 def footer(canvas,doc_obj):
                     canvas.saveState(); canvas.setStrokeColor(colors.HexColor('#AEB7C4')); canvas.setLineWidth(.4); canvas.line(11*mm,12*mm,page_w-11*mm,12*mm); canvas.setFillColor(colors.HexColor('#687386')); canvas.setFont('Helvetica',6.6); canvas.drawCentredString(page_w/2,7.5*mm,'Property of Race Edge Analytics | Prepared by Kiran Singh | © Race Edge Analytics. All Rights Reserved.'); canvas.drawRightString(page_w-11*mm,7.5*mm,f'Page {doc_obj.page}'); canvas.restoreState()
 
-                story=[banner('RACE EDGE ANALYTICS','Performance-Based Race Analysis | Form Study Report'),Spacer(1,4*mm),heading('Race Overview')]
-                meta=[('Date',fs_date),('Track',fs_track),('Race',fs_race_no),('Distance',f'{int(race_distance_input)}m'),('Surface',fs_surface),('Going',fs_going),('Class',fs_race_class),('RPSS',fs_rpss_text),('Race confidence',f'{int(fs_race_confidence)}/5'),('Runners',str(len(metrics)))]
+                cover_intro=Paragraph('Understanding the core metrics used throughout this report. Race Edge evaluates each performance within the unique pace, tactics and conditions of the race that was actually run.',ParagraphStyle('CoverIntro',parent=body_style,fontSize=8.5,leading=11,textColor=INK,spaceAfter=5))
+                guide_cards=[glossary_card(x) for x in fs_glossary]
+                guide_rows=[]
+                for i in range(0,len(guide_cards),3):
+                    row=guide_cards[i:i+3]
+                    while len(row)<3: row.append(Paragraph('',body_style))
+                    guide_rows.append(row)
+                guide_tbl=Table(guide_rows,colWidths=[86*mm]*3)
+                guide_tbl.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),2),('RIGHTPADDING',(0,0),(-1,-1),2),('TOPPADDING',(0,0),(-1,-1),2),('BOTTOMPADDING',(0,0),(-1,-1),2)]))
+                philosophy=Table([[Paragraph('<font color="#C8A85A"><b>EVERY RACE IS ITS OWN ECOSYSTEM.</b></font><br/>Race Edge measures how completely each horse executed within the environment of that race. PI is race-relative, not an absolute class rating. A PI of 10 represents the theoretical benchmark of a flawless performance within the Race Edge model and is expected to be exceptionally rare.',ParagraphStyle('Philosophy',parent=body_style,fontSize=7.3,leading=9.5,textColor=colors.white))]],colWidths=[258*mm])
+                philosophy.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),NAVY),('LINEBEFORE',(0,0),(0,-1),4,GOLD),('LEFTPADDING',(0,0),(-1,-1),9),('RIGHTPADDING',(0,0),(-1,-1),9),('TOPPADDING',(0,0),(-1,-1),7),('BOTTOMPADDING',(0,0),(-1,-1),7)]))
+                story=[banner('RACE EDGE ANALYTICS','FORM STUDY REPORT | Performance-Based Race Analysis'),Spacer(1,4*mm),heading('Race Edge Guide'),cover_intro,guide_tbl,Spacer(1,3*mm),philosophy,PageBreak(),banner('RACE ANALYSIS','Race Overview | Official Result | Race Edge Verdict'),Spacer(1,4*mm),heading('Race Overview')]
+                meta=[('Date',fs_date),('Track',fs_track),('Race',fs_race_no),('Distance',f'{int(race_distance_input)}m'),('Surface',fs_surface),('Going',fs_going),('Class',fs_race_class),('RPSS',fs_rpss_text),('Race confidence',_fs_stars(fs_race_confidence)),('Runners',str(len(metrics)))]
                 meta_data=[]
                 for i in range(0,10,5):
                     row=[]
-                    for label,value in meta[i:i+5]: row.append(Table([[Paragraph(label.upper(),muted_style)],[Paragraph(_xml_escape(str(value)),body_style)]],colWidths=[47*mm],style=[('BACKGROUND',(0,0),(-1,-1),colors.white),('LINEBEFORE',(0,0),(0,-1),2.2,GOLD),('BOX',(0,0),(-1,-1),.3,LINE),('LEFTPADDING',(0,0),(-1,-1),6),('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3)]))
+                    for label,value in meta[i:i+5]:
+                        value_style = star_style if label == 'Race confidence' else body_style
+                        row.append(Table([[Paragraph(label.upper(),muted_style)],[Paragraph(_xml_escape(str(value)),value_style)]],colWidths=[47*mm],style=[('BACKGROUND',(0,0),(-1,-1),colors.white),('LINEBEFORE',(0,0),(0,-1),2.2,GOLD),('BOX',(0,0),(-1,-1),.3,LINE),('LEFTPADDING',(0,0),(-1,-1),6),('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3)]))
                     meta_data.append(row)
                 meta_tbl=Table(meta_data,colWidths=[50*mm]*5); meta_tbl.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),2),('RIGHTPADDING',(0,0),(-1,-1),2),('TOPPADDING',(0,0),(-1,-1),2),('BOTTOMPADDING',(0,0),(-1,-1),2)]))
                 result_tbl=Table(
@@ -3960,21 +3996,13 @@ table{{width:100%;border-collapse:collapse;margin:5px 0 10px;font-size:8.1px}}th
                     ('BOTTOMPADDING',(0,0),(-1,-1),5),
                 ]))
                 story += [meta_tbl,Spacer(1,3*mm),heading('Official Result'),result_tbl,Spacer(1,3*mm),heading('Race Edge Verdict')]
-                verdict=Table([[Paragraph('MAIN HORSE TO FOLLOW',muted_style),Paragraph('MOST LIKELY IMPROVER',muted_style),Paragraph('BEST HANDICAPPED HORSE',muted_style),Paragraph('HORSE TO FORGIVE',muted_style)],[ptxt(fs_main_follow,body_style),ptxt(fs_improver,body_style),ptxt(fs_best_handicap,body_style),ptxt(fs_forgive,body_style)]],colWidths=[63*mm]*4); verdict.setStyle(TableStyle([('BOX',(0,0),(-1,-1),.4,LINE),('INNERGRID',(0,0),(-1,-1),.25,LINE),('BACKGROUND',(0,0),(-1,0),SOFT),('LEFTPADDING',(0,0),(-1,-1),5),('RIGHTPADDING',(0,0),(-1,-1),5),('TOPPADDING',(0,0),(-1,-1),5),('BOTTOMPADDING',(0,0),(-1,-1),5)]))
+                verdict=Table([[Paragraph('HORSE TO FOLLOW',muted_style),Paragraph('IMPROVER',muted_style),Paragraph('BEST HANDICAPPED HORSE',muted_style),Paragraph('HORSE TO FORGIVE',muted_style)],[ptxt(fs_main_follow,body_style),ptxt(fs_improver,body_style),ptxt(fs_best_handicap,body_style),ptxt(fs_forgive,body_style)]],colWidths=[63*mm]*4); verdict.setStyle(TableStyle([('BOX',(0,0),(-1,-1),.4,LINE),('INNERGRID',(0,0),(-1,-1),.25,LINE),('BACKGROUND',(0,0),(-1,0),SOFT),('LEFTPADDING',(0,0),(-1,-1),5),('RIGHTPADDING',(0,0),(-1,-1),5),('TOPPADDING',(0,0),(-1,-1),5),('BOTTOMPADDING',(0,0),(-1,-1),5)]))
                 summary=Table([[Paragraph('<b>Analyst summary</b><br/>'+_xml_escape(fs_race_summary).replace('\n','<br/>'),body_style)]],colWidths=[252*mm]); summary.setStyle(TableStyle([('BOX',(0,0),(-1,-1),.4,LINE),('LINEBEFORE',(0,0),(0,-1),3,GOLD),('LEFTPADDING',(0,0),(-1,-1),7),('RIGHTPADDING',(0,0),(-1,-1),7),('TOPPADDING',(0,0),(-1,-1),6),('BOTTOMPADDING',(0,0),(-1,-1),6)])); story += [verdict,Spacer(1,3*mm),summary]
                 story += [PageBreak(),banner('TOP 4 PPS HORSES','Race Edge performance shortlist'),Spacer(1,4*mm)]
                 cards=[horse_card(r) for _,r in fs_top4.iterrows()]
                 while len(cards)<4: cards.append(Paragraph('',body_style))
                 grid=Table([[cards[0],cards[1]],[cards[2],cards[3]]],colWidths=[132*mm]*2); grid.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),3),('RIGHTPADDING',(0,0),(-1,-1),3),('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3)])); story.append(grid)
                 story += [PageBreak(),banner('HANDICAP REVIEW','Performance against the official assessment'),Spacer(1,4*mm),make_table(fs_edited,font=5.3,highlight=True),Spacer(1,4*mm),heading('Final Follow List'),make_table(fs_follow_table,font=5.5,highlight=True)]
-                story += [PageBreak(),banner('METRIC GLOSSARY','General interpretation guide | Version 1.0'),Spacer(1,4*mm)]
-                g=[glossary_card(x) for x in fs_glossary]; rows=[]
-                for i in range(0,len(g),3):
-                    row=g[i:i+3]
-                    while len(row)<3: row.append(Paragraph('',body_style))
-                    rows.append(row)
-                gtbl=Table(rows,colWidths=[86*mm]*3); gtbl.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),2),('RIGHTPADDING',(0,0),(-1,-1),2),('TOPPADDING',(0,0),(-1,-1),2),('BOTTOMPADDING',(0,0),(-1,-1),2)]))
-                notice=Table([[Paragraph('<b>Proprietary notice.</b> The Race Edge metrics contained within this report are proprietary analytical measures developed by Race Edge Analytics. Descriptions are intentionally general and do not disclose the underlying methodologies or calculations. Reproduction, redistribution, or commercial use without prior written permission from Race Edge Analytics is prohibited.',small_style)]],colWidths=[258*mm]); notice.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),SOFT),('LINEBEFORE',(0,0),(0,-1),3,GOLD),('BOX',(0,0),(-1,-1),.35,LINE),('LEFTPADDING',(0,0),(-1,-1),7),('RIGHTPADDING',(0,0),(-1,-1),7),('TOPPADDING',(0,0),(-1,-1),6),('BOTTOMPADDING',(0,0),(-1,-1),6)])); story += [gtbl,Spacer(1,3*mm),notice]
                 doc.build(story,onFirstPage=footer,onLaterPages=footer); buf.seek(0); return buf.getvalue()
 
             st.markdown("### Print & Export")
