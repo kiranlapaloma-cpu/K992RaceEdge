@@ -3877,15 +3877,11 @@ table{{width:100%;border-collapse:collapse;margin:5px 0 10px;font-size:8.1px}}th
                     from reportlab.lib.pagesizes import A4, landscape
                     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
                     from reportlab.lib.units import mm
-                    from reportlab.pdfbase import pdfmetrics
-                    from reportlab.pdfbase.ttfonts import TTFont
                     from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, KeepTogether, HRFlowable
                 except Exception as exc:
                     raise RuntimeError('ReportLab is required for PDF export.') from exc
 
                 NAVY=colors.HexColor('#0A1830'); NAVY2=colors.HexColor('#17365F'); GOLD=colors.HexColor('#C8A85A')
-                pdfmetrics.registerFont(TTFont('RaceEdgeSans', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'))
-                pdfmetrics.registerFont(TTFont('RaceEdgeSansBold', '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'))
                 SOFT=colors.HexColor('#F3F5F8'); LINE=colors.HexColor('#D4DAE3'); INK=colors.HexColor('#172238'); MUTED=colors.HexColor('#667386')
                 POS=colors.HexColor('#E8F4EC'); NEG=colors.HexColor('#F8E9E9'); page_w,_=landscape(A4)
                 buf=io.BytesIO(); doc=SimpleDocTemplate(buf,pagesize=landscape(A4),rightMargin=11*mm,leftMargin=11*mm,topMargin=11*mm,bottomMargin=18*mm,title='Race Edge Analytics Form Study Report',author='Kiran Singh')
@@ -3898,7 +3894,33 @@ table{{width:100%;border-collapse:collapse;margin:5px 0 10px;font-size:8.1px}}th
                 tiny_style=ParagraphStyle('RETiny',parent=body_style,fontSize=5.5,leading=6.5)
                 white_small=ParagraphStyle('REWhiteSmall',parent=small_style,textColor=colors.white,fontName='Helvetica-Bold')
                 muted_style=ParagraphStyle('REMuted',parent=small_style,textColor=MUTED)
-                star_style=ParagraphStyle('REStars',parent=body_style,fontName='RaceEdgeSansBold',fontSize=8.5,leading=10,textColor=GOLD)
+                star_style=ParagraphStyle('REStars',parent=body_style,fontName='ZapfDingbats',fontSize=8.5,leading=10,textColor=GOLD)
+
+                def pdf_star_rating(value):
+                    try:
+                        n = int(value)
+                    except Exception:
+                        n = 0
+                    n = max(0, min(5, n))
+                    cells = []
+                    for i in range(5):
+                        cell_style = ParagraphStyle(
+                            f'REStarCell{i}',
+                            parent=star_style,
+                            textColor=GOLD if i < n else LINE,
+                            alignment=1,
+                        )
+                        # In ReportLab's built-in ZapfDingbats font, 'H' renders as a star.
+                        cells.append(Paragraph('H', cell_style))
+                    rating = Table([cells], colWidths=[4.2*mm]*5, rowHeights=[5*mm])
+                    rating.setStyle(TableStyle([
+                        ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
+                        ('LEFTPADDING',(0,0),(-1,-1),0),
+                        ('RIGHTPADDING',(0,0),(-1,-1),0),
+                        ('TOPPADDING',(0,0),(-1,-1),0),
+                        ('BOTTOMPADDING',(0,0),(-1,-1),0),
+                    ]))
+                    return rating
 
                 def ptxt(v,style=tiny_style):
                     if v is None or (isinstance(v,(float,np.floating)) and not np.isfinite(v)): s=''
@@ -3944,7 +3966,7 @@ table{{width:100%;border-collapse:collapse;margin:5px 0 10px;font-size:8.1px}}th
                     assess_data=[
                         [Paragraph('<b>Follow</b>',small_style),Paragraph('Yes' if info.get('Follow') else 'No',small_style),Paragraph('<b>Ideal distance</b>',small_style),ptxt(info.get('Ideal distance',''),small_style)],
                         [Paragraph('<b>Ideal surface</b>',small_style),ptxt(info.get('Ideal surface',''),small_style),Paragraph('<b>Preferred pace</b>',small_style),ptxt(info.get('Preferred pace',''),small_style)],
-                        [Paragraph('<b>Confidence</b>',small_style),Paragraph(_fs_stars(info.get('Confidence',0)),star_style),Paragraph('',small_style),Paragraph('',small_style)],
+                        [Paragraph('<b>Confidence</b>',small_style),pdf_star_rating(info.get('Confidence',0)),Paragraph('',small_style),Paragraph('',small_style)],
                     ]
                     assess=Table(assess_data,colWidths=[24*mm,37*mm,24*mm,37*mm])
                     assess.setStyle(TableStyle([('GRID',(0,0),(-1,-1),0.25,LINE),('BACKGROUND',(0,0),(-1,-1),colors.white),('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),3),('RIGHTPADDING',(0,0),(-1,-1),3),('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3)]))
@@ -3971,13 +3993,13 @@ table{{width:100%;border-collapse:collapse;margin:5px 0 10px;font-size:8.1px}}th
                 philosophy=Table([[Paragraph('<font color="#C8A85A"><b>EVERY RACE IS ITS OWN ECOSYSTEM.</b></font><br/>Race Edge measures how completely each horse executed within the environment of that race. PI is race-relative, not an absolute class rating. A PI of 10 represents the theoretical benchmark of a flawless performance within the Race Edge model and is expected to be exceptionally rare.',ParagraphStyle('Philosophy',parent=body_style,fontSize=7.3,leading=9.5,textColor=colors.white))]],colWidths=[258*mm])
                 philosophy.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),NAVY),('LINEBEFORE',(0,0),(0,-1),4,GOLD),('LEFTPADDING',(0,0),(-1,-1),9),('RIGHTPADDING',(0,0),(-1,-1),9),('TOPPADDING',(0,0),(-1,-1),7),('BOTTOMPADDING',(0,0),(-1,-1),7)]))
                 story=[banner('RACE EDGE ANALYTICS','FORM STUDY REPORT | Performance-Based Race Analysis'),Spacer(1,4*mm),heading('Race Edge Guide'),cover_intro,guide_tbl,Spacer(1,3*mm),philosophy,PageBreak(),banner('RACE ANALYSIS','Race Overview | Official Result | Race Edge Verdict'),Spacer(1,4*mm),heading('Race Overview')]
-                meta=[('Date',fs_date),('Track',fs_track),('Race',fs_race_no),('Distance',f'{int(race_distance_input)}m'),('Surface',fs_surface),('Going',fs_going),('Class',fs_race_class),('RPSS',fs_rpss_text),('Race confidence',_fs_stars(fs_race_confidence)),('Runners',str(len(metrics)))]
+                meta=[('Date',fs_date),('Track',fs_track),('Race',fs_race_no),('Distance',f'{int(race_distance_input)}m'),('Surface',fs_surface),('Going',fs_going),('Class',fs_race_class),('RPSS',fs_rpss_text),('Race confidence',fs_race_confidence),('Runners',str(len(metrics)))]
                 meta_data=[]
                 for i in range(0,10,5):
                     row=[]
                     for label,value in meta[i:i+5]:
-                        value_style = star_style if label == 'Race confidence' else body_style
-                        row.append(Table([[Paragraph(label.upper(),muted_style)],[Paragraph(_xml_escape(str(value)),value_style)]],colWidths=[47*mm],style=[('BACKGROUND',(0,0),(-1,-1),colors.white),('LINEBEFORE',(0,0),(0,-1),2.2,GOLD),('BOX',(0,0),(-1,-1),.3,LINE),('LEFTPADDING',(0,0),(-1,-1),6),('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3)]))
+                        value_flowable = pdf_star_rating(value) if label == 'Race confidence' else Paragraph(_xml_escape(str(value)),body_style)
+                        row.append(Table([[Paragraph(label.upper(),muted_style)],[value_flowable]],colWidths=[47*mm],style=[('BACKGROUND',(0,0),(-1,-1),colors.white),('LINEBEFORE',(0,0),(0,-1),2.2,GOLD),('BOX',(0,0),(-1,-1),.3,LINE),('LEFTPADDING',(0,0),(-1,-1),6),('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3)]))
                     meta_data.append(row)
                 meta_tbl=Table(meta_data,colWidths=[50*mm]*5); meta_tbl.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),2),('RIGHTPADDING',(0,0),(-1,-1),2),('TOPPADDING',(0,0),(-1,-1),2),('BOTTOMPADDING',(0,0),(-1,-1),2)]))
                 result_tbl=Table(
