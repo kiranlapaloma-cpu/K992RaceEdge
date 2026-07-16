@@ -3768,41 +3768,6 @@ if _view_is("Form Study"):
                 fs_forgive = st.selectbox("Horse to forgive", fs_options, key="fs_forgive")
             fs_race_summary = st.text_area("Race summary", height=150, key="fs_race_summary")
 
-            # ---------- Final follow list ----------
-            st.markdown("### Final Follow List")
-            fs_follow_df = pd.DataFrame([r for r in fs_follow_rows if r["Follow"]])
-            if fs_follow_df.empty:
-                st.info("No horses selected for the final follow list.")
-            else:
-                # The handicap source can contain duplicate horse-name rows.
-                # Build one stable lookup row per horse before joining the MR fields.
-                fs_mr_lookup = (
-                    fs_edited[
-                        ["Horse", "Race MR", "MR Achieved", "MR Difference"]
-                    ]
-                    .copy()
-                    .dropna(subset=["Horse"])
-                    .drop_duplicates(subset=["Horse"], keep="last")
-                )
-
-                fs_follow_df = fs_follow_df.drop(
-                    columns=["Race MR", "MR Achieved", "MR Difference"],
-                    errors="ignore",
-                ).merge(
-                    fs_mr_lookup,
-                    on="Horse",
-                    how="left",
-                    validate="many_to_one",
-                )
-                fs_final_cols = [
-                    "Horse", "PPS", "PI", "Finish", "Race MR", "MR Achieved", "MR Difference",
-                    "Ideal distance", "Ideal surface", "Preferred pace", "Confidence", "Note",
-                ]
-                fs_follow_display = fs_follow_df[fs_final_cols].copy()
-                for c in ["PPS", "PI", "Race MR", "MR Achieved", "MR Difference"]:
-                    fs_follow_display[c] = pd.to_numeric(fs_follow_display[c], errors="coerce").round(2)
-                st.dataframe(fs_follow_display, width="stretch", hide_index=True)
-
             # ---------- Premium printable report ----------
             def _fs_stars(value):
                 try:
@@ -3910,7 +3875,6 @@ if _view_is("Form Study"):
             fs_report_title = f"{fs_date}_{fs_track or 'Track'}_Race{fs_race_no or 'NA'}_FormStudy"
             fs_report_title = re.sub(r"[^A-Za-z0-9._-]+", "_", fs_report_title)
             fs_cards_html = ''.join(_fs_html_horse_card(r) for _, r in fs_focus.iterrows())
-            fs_follow_table = fs_follow_display if not fs_follow_df.empty else pd.DataFrame()
 
             fs_print_html = f'''<!doctype html><html><head><meta charset="utf-8"><title>{_html.escape(fs_report_title)}</title>
 <style>
@@ -3942,7 +3906,7 @@ table{{width:100%;border-collapse:collapse;margin:5px 0 10px;font-size:8.1px}}th
 <section class="section"><h2 class="section-title">Official Result</h2><div class="result-grid"><div class="result-card"><span>1st</span><b>{_html.escape(fs_result_1st)}</b></div><div class="result-card"><span>2nd</span><b>{_html.escape(fs_result_2nd)}</b></div><div class="result-card"><span>3rd</span><b>{_html.escape(fs_result_3rd)}</b></div></div></section>
 <section class="section"><h2 class="section-title">Race Edge Verdict</h2><div class="verdict-grid"><div class="verdict-card"><span>Horse to follow</span><b>{_html.escape(fs_main_follow)}</b></div><div class="verdict-card"><span>Improver</span><b>{_html.escape(fs_improver)}</b></div><div class="verdict-card"><span>Best handicapped horse</span><b>{_html.escape(fs_best_handicap)}</b></div><div class="verdict-card"><span>Horse to forgive</span><b>{_html.escape(fs_forgive)}</b></div></div><div class="summary"><b>Analyst summary</b><br>{_html.escape(fs_race_summary)}</div></section>
 <div class="page-break"></div><header class="brand"><h1>RACE EDGE FOCUS HORSES</h1><p>Analyst-selected performance profiles</p></header><section class="section"><div class="cards">{fs_cards_html}</div></section>
-<div class="page-break"></div><header class="brand"><h1>HANDICAP REVIEW</h1><p>Performance against the official assessment</p></header><section class="section">{_fs_html_table(fs_edited,'MR Difference')}</section><section class="section"><h2 class="section-title">Final Follow List</h2>{_fs_html_table(fs_follow_table,'MR Difference')}</section>
+<div class="page-break"></div><header class="brand"><h1>HANDICAP REVIEW</h1><p>Performance against the official assessment</p></header><section class="section">{_fs_html_table(fs_edited,'MR Difference')}</section>
 <div class="footer">Property of Race Edge Analytics | Prepared by Kiran Singh | © Race Edge Analytics. All Rights Reserved.</div></body></html>'''
 
             # ---------- Premium PDF export ----------
@@ -4119,14 +4083,14 @@ table{{width:100%;border-collapse:collapse;margin:5px 0 10px;font-size:8.1px}}th
                             body_style,
                         )
                     )
-                story += [PageBreak(),banner('HANDICAP REVIEW','Performance against the official assessment'),Spacer(1,4*mm),make_table(fs_edited,font=5.3,highlight=True),Spacer(1,4*mm),heading('Final Follow List'),make_table(fs_follow_table,font=5.5,highlight=True)]
+                story += [PageBreak(),banner('HANDICAP REVIEW','Performance against the official assessment'),Spacer(1,4*mm),make_table(fs_edited,font=5.3,highlight=True)]
                 doc.build(story,onFirstPage=footer,onLaterPages=footer); buf.seek(0); return buf.getvalue()
 
             st.markdown("### Print & Export")
             st.caption("Large report assets are prepared only when requested, keeping normal app reruns light.")
 
             # HTML is already available as a string and is inexpensive to expose.
-            ex1, ex2, ex3 = st.columns(3)
+            ex1, ex2 = st.columns(2)
             with ex1:
                 st.download_button(
                     "Download print-ready HTML",
@@ -4156,16 +4120,6 @@ table{{width:100%;border-collapse:collapse;margin:5px 0 10px;font-size:8.1px}}th
                         mime="application/pdf",
                         width="stretch",
                     )
-
-            with ex3:
-                fs_export_df = fs_follow_display if not fs_follow_df.empty else fs_top_display
-                st.download_button(
-                    "Download Form Study CSV",
-                    data=fs_export_df.to_csv(index=False).encode("utf-8"),
-                    file_name=f"{fs_report_title}.csv",
-                    mime="text/csv",
-                    width="stretch",
-                )
 
             # Streamlit executes the contents of a collapsed expander. Use a
             # checkbox so the iframe is genuinely absent until requested.
