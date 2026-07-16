@@ -3518,26 +3518,101 @@ if _view_is("Form Study"):
                 fs_plane["Expected_Grind"] = np.nan
                 fs_plane["Class_Residual"] = np.nan
 
-            fs_plane = fs_plane.sort_values(["PPS", "PI" if "PI" in fs_plane.columns else "PPS"], ascending=False)
-            fs_top4 = fs_plane.head(4).copy().reset_index(drop=True)
+            fs_plane = fs_plane.sort_values(
+                ["PPS", "PI" if "PI" in fs_plane.columns else "PPS"],
+                ascending=False,
+            ).reset_index(drop=True)
 
-            # ---------- Top 4 PPS ----------
-            st.markdown("### Top 4 Performance Plane Scores (PPS)")
-            st.caption("Automatically selected by PPS. PPS uses tsSPI : Accel : Grind in a 1 : 1.2 : 1 ratio.")
-            fs_top_cols = [
-                "PPS_Rank", "Horse", "Finish_Pos", "PPS", "PI", "F200_idx",
-                "tsSPI", "Accel", fs_grind_col, "Class_Residual",
-            ]
-            fs_top_cols = [c for c in fs_top_cols if c in fs_top4.columns]
-            fs_top_display = fs_top4[fs_top_cols].copy()
-            fs_top_display = fs_top_display.rename(columns={
-                "PPS_Rank": "PPS Rank", "Finish_Pos": "Finish", "F200_idx": "F200",
-                "Class_Residual": "Residual",
+            # ---------- Race Edge Focus Horses ----------
+            st.markdown("### Race Edge Focus Horses")
+            st.caption(
+                "Select up to four horses for the report. Use the PPS autofill for a standard "
+                "race review, or choose any runner for an owner, trainer or individual-horse report."
+            )
+
+            fs_all_horses = fs_plane["Horse"].astype(str).tolist()
+            fs_focus_options = ["— None —"] + fs_all_horses
+            fs_default_focus = fs_all_horses[:4]
+
+            fs_focus_keys = [f"fs_focus_horse_{i}" for i in range(4)]
+
+            # Initialise each selector with the top four PPS horses.
+            for i, key in enumerate(fs_focus_keys):
+                if key not in st.session_state:
+                    st.session_state[key] = (
+                        fs_default_focus[i] if i < len(fs_default_focus) else "— None —"
+                    )
+                elif st.session_state[key] not in fs_focus_options:
+                    st.session_state[key] = "— None —"
+
+            if st.button(
+                "Auto-fill from PPS",
+                key="fs_autofill_focus_horses",
+                help="Select the four highest PPS horses.",
+            ):
+                for i, key in enumerate(fs_focus_keys):
+                    st.session_state[key] = (
+                        fs_default_focus[i] if i < len(fs_default_focus) else "— None —"
+                    )
+                st.rerun()
+
+            fs_sel_cols = st.columns(4)
+            fs_selected_names = []
+            for i, col in enumerate(fs_sel_cols):
+                with col:
+                    selected = st.selectbox(
+                        f"Focus horse {i + 1}",
+                        fs_focus_options,
+                        key=fs_focus_keys[i],
+                    )
+                    if selected != "— None —":
+                        fs_selected_names.append(selected)
+
+            fs_duplicate_names = sorted({
+                horse for horse in fs_selected_names if fs_selected_names.count(horse) > 1
             })
-            for c in ["PPS", "PI", "F200", "tsSPI", "Accel", "Grind", "Residual"]:
-                if c in fs_top_display.columns:
-                    fs_top_display[c] = pd.to_numeric(fs_top_display[c], errors="coerce").round(2)
-            st.dataframe(fs_top_display, width="stretch", hide_index=True)
+            if fs_duplicate_names:
+                st.warning(
+                    "Each focus horse should be selected only once. Duplicate selection"
+                    + ("s: " if len(fs_duplicate_names) > 1 else ": ")
+                    + ", ".join(fs_duplicate_names)
+                )
+
+            # Preserve selector order and ignore duplicate entries in the generated report.
+            fs_unique_selected = list(dict.fromkeys(fs_selected_names))
+            fs_focus_rows = []
+            for horse in fs_unique_selected:
+                match = fs_plane.loc[fs_plane["Horse"].astype(str) == horse]
+                if not match.empty:
+                    fs_focus_rows.append(match.iloc[0])
+
+            fs_focus = (
+                pd.DataFrame(fs_focus_rows).reset_index(drop=True)
+                if fs_focus_rows
+                else fs_plane.head(0).copy()
+            )
+
+            if fs_focus.empty:
+                st.info("Select at least one focus horse to create the horse assessment section.")
+            else:
+                fs_focus_cols = [
+                    "PPS_Rank", "Horse", "Finish_Pos", "PPS", "PI", "F200_idx",
+                    "tsSPI", "Accel", fs_grind_col, "Class_Residual",
+                ]
+                fs_focus_cols = [c for c in fs_focus_cols if c in fs_focus.columns]
+                fs_focus_display = fs_focus[fs_focus_cols].copy()
+                fs_focus_display = fs_focus_display.rename(columns={
+                    "PPS_Rank": "PPS Rank",
+                    "Finish_Pos": "Finish",
+                    "F200_idx": "F200",
+                    "Class_Residual": "Residual",
+                })
+                for c in ["PPS", "PI", "F200", "tsSPI", "Accel", "Grind", "Residual"]:
+                    if c in fs_focus_display.columns:
+                        fs_focus_display[c] = pd.to_numeric(
+                            fs_focus_display[c], errors="coerce"
+                        ).round(2)
+                st.dataframe(fs_focus_display, width="stretch", hide_index=True)
 
             # ---------- Analyst assessments ----------
             st.markdown("### Analyst Assessment")
@@ -3545,7 +3620,7 @@ if _view_is("Form Study"):
             fs_paces = ["Any", "Slow/tactical", "Even", "Strong", "Fast/collapse"]
             fs_follow_rows = []
 
-            for i, row in fs_top4.iterrows():
+            for i, row in fs_focus.iterrows():
                 horse = str(row["Horse"])
                 safe_key = re.sub(r"[^A-Za-z0-9]+", "_", horse).strip("_")[:40] or f"horse_{i}"
                 with st.expander(f"#{int(row['PPS_Rank'])} — {horse}", expanded=(i == 0)):
@@ -3834,7 +3909,7 @@ if _view_is("Form Study"):
 
             fs_report_title = f"{fs_date}_{fs_track or 'Track'}_Race{fs_race_no or 'NA'}_FormStudy"
             fs_report_title = re.sub(r"[^A-Za-z0-9._-]+", "_", fs_report_title)
-            fs_cards_html = ''.join(_fs_html_horse_card(r) for _, r in fs_top4.iterrows())
+            fs_cards_html = ''.join(_fs_html_horse_card(r) for _, r in fs_focus.iterrows())
             fs_follow_table = fs_follow_display if not fs_follow_df.empty else pd.DataFrame()
 
             fs_print_html = f'''<!doctype html><html><head><meta charset="utf-8"><title>{_html.escape(fs_report_title)}</title>
@@ -3866,7 +3941,7 @@ table{{width:100%;border-collapse:collapse;margin:5px 0 10px;font-size:8.1px}}th
 <div class="race-item"><span>Going</span><b>{_html.escape(fs_going)}</b></div><div class="race-item"><span>Class</span><b>{_html.escape(fs_race_class)}</b></div><div class="race-item"><span>RPSS</span><b>{_html.escape(fs_rpss_text)}</b></div><div class="race-item"><span>Race confidence</span><b class="stars">{_fs_stars(fs_race_confidence)}</b></div><div class="race-item"><span>Runners</span><b>{len(metrics)}</b></div></div></section>
 <section class="section"><h2 class="section-title">Official Result</h2><div class="result-grid"><div class="result-card"><span>1st</span><b>{_html.escape(fs_result_1st)}</b></div><div class="result-card"><span>2nd</span><b>{_html.escape(fs_result_2nd)}</b></div><div class="result-card"><span>3rd</span><b>{_html.escape(fs_result_3rd)}</b></div></div></section>
 <section class="section"><h2 class="section-title">Race Edge Verdict</h2><div class="verdict-grid"><div class="verdict-card"><span>Horse to follow</span><b>{_html.escape(fs_main_follow)}</b></div><div class="verdict-card"><span>Improver</span><b>{_html.escape(fs_improver)}</b></div><div class="verdict-card"><span>Best handicapped horse</span><b>{_html.escape(fs_best_handicap)}</b></div><div class="verdict-card"><span>Horse to forgive</span><b>{_html.escape(fs_forgive)}</b></div></div><div class="summary"><b>Analyst summary</b><br>{_html.escape(fs_race_summary)}</div></section>
-<div class="page-break"></div><header class="brand"><h1>TOP 4 PPS HORSES</h1><p>Race Edge performance shortlist</p></header><section class="section"><div class="cards">{fs_cards_html}</div></section>
+<div class="page-break"></div><header class="brand"><h1>RACE EDGE FOCUS HORSES</h1><p>Analyst-selected performance profiles</p></header><section class="section"><div class="cards">{fs_cards_html}</div></section>
 <div class="page-break"></div><header class="brand"><h1>HANDICAP REVIEW</h1><p>Performance against the official assessment</p></header><section class="section">{_fs_html_table(fs_edited,'MR Difference')}</section><section class="section"><h2 class="section-title">Final Follow List</h2>{_fs_html_table(fs_follow_table,'MR Difference')}</section>
 <div class="footer">Property of Race Edge Analytics | Prepared by Kiran Singh | © Race Edge Analytics. All Rights Reserved.</div></body></html>'''
 
@@ -4020,10 +4095,30 @@ table{{width:100%;border-collapse:collapse;margin:5px 0 10px;font-size:8.1px}}th
                 story += [meta_tbl,Spacer(1,3*mm),heading('Official Result'),result_tbl,Spacer(1,3*mm),heading('Race Edge Verdict')]
                 verdict=Table([[Paragraph('HORSE TO FOLLOW',muted_style),Paragraph('IMPROVER',muted_style),Paragraph('BEST HANDICAPPED HORSE',muted_style),Paragraph('HORSE TO FORGIVE',muted_style)],[ptxt(fs_main_follow,body_style),ptxt(fs_improver,body_style),ptxt(fs_best_handicap,body_style),ptxt(fs_forgive,body_style)]],colWidths=[63*mm]*4); verdict.setStyle(TableStyle([('BOX',(0,0),(-1,-1),.4,LINE),('INNERGRID',(0,0),(-1,-1),.25,LINE),('BACKGROUND',(0,0),(-1,0),SOFT),('LEFTPADDING',(0,0),(-1,-1),5),('RIGHTPADDING',(0,0),(-1,-1),5),('TOPPADDING',(0,0),(-1,-1),5),('BOTTOMPADDING',(0,0),(-1,-1),5)]))
                 summary=Table([[Paragraph('<b>Analyst summary</b><br/>'+_xml_escape(fs_race_summary).replace('\n','<br/>'),body_style)]],colWidths=[252*mm]); summary.setStyle(TableStyle([('BOX',(0,0),(-1,-1),.4,LINE),('LINEBEFORE',(0,0),(0,-1),3,GOLD),('LEFTPADDING',(0,0),(-1,-1),7),('RIGHTPADDING',(0,0),(-1,-1),7),('TOPPADDING',(0,0),(-1,-1),6),('BOTTOMPADDING',(0,0),(-1,-1),6)])); story += [verdict,Spacer(1,3*mm),summary]
-                story += [PageBreak(),banner('TOP 4 PPS HORSES','Race Edge performance shortlist'),Spacer(1,4*mm)]
-                cards=[horse_card(r) for _,r in fs_top4.iterrows()]
-                while len(cards)<4: cards.append(Paragraph('',body_style))
-                grid=Table([[cards[0],cards[1]],[cards[2],cards[3]]],colWidths=[132*mm]*2); grid.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),3),('RIGHTPADDING',(0,0),(-1,-1),3),('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3)])); story.append(grid)
+                story += [PageBreak(),banner('RACE EDGE FOCUS HORSES','Analyst-selected performance profiles'),Spacer(1,4*mm)]
+                cards=[horse_card(r) for _,r in fs_focus.iterrows()]
+                if cards:
+                    while len(cards)<4:
+                        cards.append(Paragraph('',body_style))
+                    grid=Table(
+                        [[cards[0],cards[1]],[cards[2],cards[3]]],
+                        colWidths=[132*mm]*2,
+                    )
+                    grid.setStyle(TableStyle([
+                        ('VALIGN',(0,0),(-1,-1),'TOP'),
+                        ('LEFTPADDING',(0,0),(-1,-1),3),
+                        ('RIGHTPADDING',(0,0),(-1,-1),3),
+                        ('TOPPADDING',(0,0),(-1,-1),3),
+                        ('BOTTOMPADDING',(0,0),(-1,-1),3),
+                    ]))
+                    story.append(grid)
+                else:
+                    story.append(
+                        Paragraph(
+                            'No focus horses were selected for this report.',
+                            body_style,
+                        )
+                    )
                 story += [PageBreak(),banner('HANDICAP REVIEW','Performance against the official assessment'),Spacer(1,4*mm),make_table(fs_edited,font=5.3,highlight=True),Spacer(1,4*mm),heading('Final Follow List'),make_table(fs_follow_table,font=5.5,highlight=True)]
                 doc.build(story,onFirstPage=footer,onLaterPages=footer); buf.seek(0); return buf.getvalue()
 
