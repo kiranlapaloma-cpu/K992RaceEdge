@@ -1196,9 +1196,13 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     w["_MID_spd"] = w.apply(lambda r: _stage_speed(r, mid_cols, float(step)), axis=1)
 
     if step == 100:
+        # Accel always represents 600m remaining to 200m remaining.
+        # With 100m data this is four consecutive 100m panels.
         acc_cols = [c for c in [f"{m}_Time" for m in [500,400,300,200]] if c in w.columns]
     else:
-        acc_cols = [c for c in [f"{m}_Time" for m in [600,400]] if c in w.columns]
+        # With 200m data the same physical 400m phase is represented by
+        # the 600->400 and 400->200 panels, stored as 400_Time and 200_Time.
+        acc_cols = [c for c in [f"{m}_Time" for m in [400,200]] if c in w.columns]
     w["_ACC_spd"] = w.apply(lambda r: _stage_speed(r, acc_cols, float(step)), axis=1)
 
     w["_GR_spd"]  = w.apply(lambda r: _grind_speed(r, step), axis=1)
@@ -1253,29 +1257,39 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
         return 100.0 + 0.5*(g-100.0) if (dg < 97.0 and g > 100.0) else g
     w["Grind_CG"] = [ _fade_cap(g, dg) for g, dg in zip(w["Grind_CG"], w["DeltaG"]) ]
 
-    # ----- PI v4.3: distance-aware four-core model -----
-    # PI is based only on F200, tsSPI, Accel and raw Grind.
-    # F200 remains proportional to the race distance. The remaining influence
-    # is divided in the ratio tsSPI : Accel : Grind = 1 : 1.2 : 1.
+    # ----- PI v4.4: actual-opening-block four-core model -----
+    # PI is based only on the opening-block index, tsSPI, Accel and raw Grind.
+    # The opening index receives the exact percentage of the race represented
+    # by the detected opening block (for example F100, F150, F160, F200 or F250).
+    # The remaining influence is divided using:
+    # tsSPI : Accel : Grind = 1 : (1 + 200 / race distance) : 1.
+    # The Accel premium is therefore tied to the percentage that an additional
+    # 200 m represents of the complete race, while the opening weight remains
+    # faithful to the actual sectional block used.
     GR_COL = "Grind"
 
-    race_distance = max(float(D), 200.0)
-    w_f200 = float(np.clip(200.0 / race_distance, 0.0, 1.0))
+    race_distance = max(float(D), 1.0)
+    opening_block_m = float(np.clip(f_dist, 0.0, race_distance))
+    w_f200 = opening_block_m / race_distance
     remaining = max(0.0, 1.0 - w_f200)
-    ratio_total = 3.2
+    accel_ratio = 1.0 + (200.0 / race_distance)
+    ratio_total = 1.0 + accel_ratio + 1.0
 
     PI_W = {
         "F200_idx": w_f200,
         "tsSPI": remaining * (1.0 / ratio_total),
-        "Accel": remaining * (1.2 / ratio_total),
+        "Accel": remaining * (accel_ratio / ratio_total),
         "Grind": remaining * (1.0 / ratio_total),
     }
 
     # Keep metadata available to the dashboard, exports and reports.
     w.attrs["GOING"] = GOING_TYPE if "GOING_TYPE" in globals() else "Good"
     w.attrs["PI_GOING_META"] = {
-        "method": "distance_f200_ratio_1_1.2_1",
+        "method": "actual_opening_block_ratio_1_1_plus_200_over_distance_1",
         "distance_m": int(round(race_distance)),
+        "opening_block_m": round(opening_block_m, 2),
+        "opening_label": f"F{int(round(opening_block_m))}" if opening_block_m > 0 else "Opening",
+        "weights": PI_W.copy(),
     }
     w.attrs["PI_MASS_NOTE"] = {
         "mass_col": "(not used in PI)",
@@ -1304,15 +1318,15 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     w.attrs["PI_REFINED_META"] = {
         "distance_m": int(round(race_distance)),
         "weights": PI_W.copy(),
-        "method": "f200_distance_proportional_remaining_ratio_1_1.2_1",
+        "method": "f200_distance_proportional_remaining_ratio_1_1_plus_200_over_distance_1",
         "inputs": ["F200_idx", "tsSPI", "Accel", "Grind"],
         "uses_race_time": False,
         "uses_corrected_grind": False,
         "uses_weight_adjustment": False,
     }
 
-    # Race-relative 0-10 scale. The field median centres on 5, while the
-    # non-linear mapping preserves separation without forcing the leader to 10.
+    # Race-relative robust linear scale. The field median centres on 5,
+    # while genuine above- and below-field separation is preserved.
     pts = pd.to_numeric(w["PI_pts"], errors="coerce")
     finite_pts = pts[np.isfinite(pts)]
     med = float(np.nanmedian(finite_pts)) if len(finite_pts) else 0.0
@@ -1320,13 +1334,22 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
     sigma = mad_std(centered)
     sigma = 0.75 if (not np.isfinite(sigma) or sigma < 0.75) else float(sigma)
 
+    z_score = centered / sigma
     w["PI"] = (
-        5.0 + 2.75 * np.tanh((centered / sigma) / 1.35)
-    ).clip(0.0, 10.0).round(2)
+        5.0 + 1.5 * z_score
+    ).clip(0.5, 9.5).round(2)
+
+    w.attrs["PI_REFINED_META"].update({
+        "scale_method": "robust_linear_median_mad",
+        "scale_slope": 1.5,
+        "scale_floor": 0.5,
+        "scale_ceiling": 9.5,
+        "median_center": 5.0,
+        "mad_floor": 0.75,
+    })
 
     # ----- Phase PI decomposition -----
-    # Diagnostic weighted contributions. Final PI is non-linear, so these
-    # components explain influence but are not expected to add exactly to PI.
+    # Diagnostic weighted contributions showing each phase's raw influence.
     total_pi_w = sum(PI_W.values()) or 1.0
     pi_scale = 1.0
     pi_intercept = 5.0
@@ -1736,12 +1759,13 @@ if _view_is("Core Metrics"):
     GR_COL = metrics.attrs.get("GR_COL", "Grind")
 
     show_cols = [
-        "Horse","Finish_Pos","RaceTime_s",
-        "F200_idx","tsSPI","Accel","TOF","TOF_Profile","Grind","Grind_CG",
+        "Horse","Finish_Pos","PI",
+        "F200_idx","tsSPI","Accel","Grind","Grind_CG",
+        "RaceTime_s","TOF","TOF_Profile",
         "EARLY_idx","LATE_idx",
         "Peak_Speed","Peak_Location","SRI","SRI_Profile",
         "GrindAdjPts","DeltaG",
-        "PI","PI_pts","Sprint_Conversion_Penalty"
+        "Sprint_Conversion_Penalty"
     ]
 
     # ---- make the column pick robust (no KeyError if some are missing) ----
@@ -1866,10 +1890,23 @@ if _view_is("Core Metrics"):
             # 4) Safety rails (avoid crazy kg if β too tiny or huge)
             beta_eff = float(np.clip(beta_eff, 0.22, 0.70))  # keep within realistic PI/kg bounds
 
-            # 5) Convert each horse’s PI to ΔPI vs field median, then to kg & lb
+            # 5) Convert each horse’s PI to ΔPI vs field median, then to kg and MR.
+            #    PI itself remains unchanged. Only the PI-to-weight/MR conversion is
+            #    confidence-adjusted in fields with fewer than 12 valid runners.
             PI_med = float(np.nanmedian(df["PI"]))
             df["ΔPI_vs_med"] = df["PI"] - PI_med
-            df["RanAbove_kg"] = df["ΔPI_vs_med"] / beta_eff
+
+            field_size = int(df["PI"].notna().sum())
+            field_conversion_factor = {
+                7: 0.68,
+                8: 0.76,
+                9: 0.84,
+                10: 0.90,
+                11: 0.95,
+            }.get(field_size, 1.00 if field_size >= 12 else 0.60)
+
+            raw_ran_above_kg = df["ΔPI_vs_med"] / beta_eff
+            df["RanAbove_kg"] = raw_ran_above_kg * field_conversion_factor
             df["RanAbove_MR"] = df["RanAbove_kg"] * 2
         
             # 6) Friendly view
@@ -1897,11 +1934,18 @@ if _view_is("Core Metrics"):
             with colC:
                 st.metric("β_eff (this race)", f"{beta_eff:.2f} PI per kg")
 
+            if field_size < 12:
+                st.caption(
+                    f"Small-field conversion adjustment: {field_size} valid runners → "
+                    f"{field_conversion_factor:.0%} of the raw PI-to-kg/MR conversion. PI scores are unchanged."
+                )
+
             st.caption(
                 "Interpretation: **RanAbove (kg)** estimates how many kilograms a horse effectively ran above/below the "
                 "field median, *within this single race*. Positive = ran as if it could carry more and still match median. "
                 "Slope (β_eff) is distance-based, gently adjusted by (i) how weight correlated with PI in this field and "
-                "(ii) race shape (fast-early increases weight bite; slow-early reduces it)."
+                "(ii) race shape. For fields below 12 valid runners, only the kg/MR conversion is reduced to reflect the "
+                "smaller dataset; the underlying PI scores and rankings remain unchanged."
             )
 
             # Optional CSV download (small footprint)
@@ -2574,8 +2618,8 @@ if _view_is("Pressure Retention"):
 if _view_is("Race Plane Analysis", "Class Plane Analysis"):
     st.markdown("## Race Plane Analysis")
     st.caption(
-        "PPS identifies the strongest overall position in tsSPI–Accel–Grind space. "
-        "Class Residual remains a separate signal of above- or below-plane sustain."
+        "PPS identifies the strongest field-relative overall performance across tsSPI, Accel and Grind, using PI's three-phase ratio while excluding the noisy opening block. "
+        "Sustain Residual remains a separate signal of above- or below-plane sustain."
     )
 
     req = {"Horse", "tsSPI", "Accel", "Grind"}
@@ -2602,7 +2646,10 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
         with cpa3:
             show_3d_plane = st.toggle("Show 3D plane", value=True)
 
-        plane_df = metrics.loc[:, ["Horse", "tsSPI", "Accel", plane_grind_col]].copy()
+        # PPS and the plane deliberately exclude the noisy opening block.
+        # The module uses only tsSPI, Accel and Grind.
+        base_plane_cols = ["Horse", "tsSPI", "Accel", plane_grind_col]
+        plane_df = metrics.loc[:, base_plane_cols].copy()
         extra_cols = [c for c in ["TOF", "PI", "SRI", "Peak_Location", "Finish_Pos"] if c in metrics.columns]
         for c in extra_cols:
             plane_df[c] = metrics[c]
@@ -2640,10 +2687,10 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
 
             if centre_values:
                 plane_df["Expected_Grind"] = 100.0 + expected_z
-                plane_df["Class_Residual"] = plane_df[plane_grind_col] - plane_df["Expected_Grind"]
+                plane_df["Sustain_Residual"] = plane_df[plane_grind_col] - plane_df["Expected_Grind"]
             else:
                 plane_df["Expected_Grind"] = expected_z
-                plane_df["Class_Residual"] = plane_df[plane_grind_col] - plane_df["Expected_Grind"]
+                plane_df["Sustain_Residual"] = plane_df[plane_grind_col] - plane_df["Expected_Grind"]
 
             z_mean = float(np.nanmean(z))
             ss_res = float(np.nansum((z - expected_z) ** 2))
@@ -2665,9 +2712,9 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
                     return "🟠 Below expectation"
                 return "🔴 Emptied / weak sustain"
 
-            plane_df["CR_Profile"] = plane_df["Class_Residual"].map(_cr_profile)
+            plane_df["Sustain_Profile"] = plane_df["Sustain_Residual"].map(_cr_profile)
             plane_df["Expected_Grind"] = plane_df["Expected_Grind"].round(2)
-            plane_df["Class_Residual"] = plane_df["Class_Residual"].round(2)
+            plane_df["Sustain_Residual"] = plane_df["Sustain_Residual"].round(2)
 
             # --- Race DNA: relative contribution of each race-plane input ---
             denom = abs(b_tsspi) + abs(c_accel)
@@ -2678,8 +2725,8 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
                 travel_share = np.nan
                 accel_share = np.nan
 
-            residual_std = float(np.nanstd(plane_df["Class_Residual"].to_numpy(dtype=float), ddof=1)) if len(plane_df) > 1 else np.nan
-            residual_range = float(np.nanmax(plane_df["Class_Residual"]) - np.nanmin(plane_df["Class_Residual"])) if len(plane_df) else np.nan
+            residual_std = float(np.nanstd(plane_df["Sustain_Residual"].to_numpy(dtype=float), ddof=1)) if len(plane_df) > 1 else np.nan
+            residual_range = float(np.nanmax(plane_df["Sustain_Residual"]) - np.nanmin(plane_df["Sustain_Residual"])) if len(plane_df) else np.nan
 
             def _influence_label(coef, name):
                 sign = "positive" if coef > 0 else "negative" if coef < 0 else "neutral"
@@ -2709,7 +2756,7 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
             )
             st.caption(
                 f"R² = {r2:.3f} · runners used = {len(plane_df)} · rank = {rank}. "
-                "Class Residual = Actual Grind − Expected Grind. Positive means the horse sustained better than the race plane predicted."
+                "Sustain Residual = Actual Grind − Expected Grind. Positive means the horse sustained better than the race plane predicted."
             )
 
             st.markdown("### Race DNA")
@@ -2727,8 +2774,8 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
             if rank < 3:
                 st.warning("The plane is not fully stable because the points are close to collinear. Treat residuals cautiously.")
 
-            # --- Plane Position Score (PPS): overall strength of the horse's location in
-            # tsSPI–Accel–Grind space. Residual remains a separate upside/underperformance signal.
+            # --- Plane Position Score (PPS): field-relative overall performance using
+            # the exact same phase weighting as PI. Sustain Residual remains separate.
             def _pps_robust_z(series):
                 s = pd.to_numeric(series, errors="coerce").astype(float)
                 med = float(np.nanmedian(s)) if np.isfinite(s).any() else 0.0
@@ -2744,13 +2791,27 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
             plane_df["PPS_z_tsSPI"] = _pps_robust_z(plane_df["tsSPI"])
             plane_df["PPS_z_Accel"] = _pps_robust_z(plane_df["Accel"])
             plane_df["PPS_z_Grind"] = _pps_robust_z(plane_df[plane_grind_col])
-            # PPS weighting ratio: tsSPI : Accel : Grind = 1 : 1.2 : 1
-            # Normalised weights are 31.25%, 37.50%, 31.25%.
-            plane_df["PPS_Core"] = (
-                0.3125 * plane_df["PPS_z_tsSPI"]
-                + 0.3750 * plane_df["PPS_z_Accel"]
-                + 0.3125 * plane_df["PPS_z_Grind"]
-            )
+
+            # PPS follows PI's tsSPI : Accel : Grind relationship, but deliberately
+            # excludes F200/the opening block because that section is noisy. The
+            # three retained PI weights are therefore normalised back to 100%.
+            pi_phase_weights = dict(metrics.attrs.get("PI_PHASE_WEIGHTS", {}) or {})
+            default_accel_ratio = 1.0 + 200.0 / max(float(race_distance_input), 1.0)
+            raw_pps_weights = {
+                "tsSPI": float(pi_phase_weights.get("tsSPI", 1.0)),
+                "Accel": float(pi_phase_weights.get("Accel", default_accel_ratio)),
+                "Grind": float(pi_phase_weights.get("Grind", 1.0)),
+            }
+            raw_total = sum(max(0.0, v) for v in raw_pps_weights.values()) or 1.0
+            pps_weights = {k: max(0.0, v) / raw_total for k, v in raw_pps_weights.items()}
+            available_pps = {
+                "tsSPI": "PPS_z_tsSPI",
+                "Accel": "PPS_z_Accel",
+                "Grind": "PPS_z_Grind",
+            }
+            plane_df["PPS_Core"] = 0.0
+            for phase, z_col in available_pps.items():
+                plane_df["PPS_Core"] += pps_weights[phase] * plane_df[z_col]
             plane_df["PPS"] = np.clip(
                 5.0 + 2.75 * np.tanh(plane_df["PPS_Core"] / 1.35),
                 0.0,
@@ -2759,28 +2820,70 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
             plane_df["PPS"] = plane_df["PPS"].round(2)
             plane_df["PPS_Rank"] = plane_df["PPS"].rank(method="min", ascending=False).astype(int)
 
+            pps_hi = float(np.nanquantile(plane_df["PPS"], 0.67))
+            pps_lo = float(np.nanquantile(plane_df["PPS"], 0.33))
+            sr_spread = float(np.nanstd(plane_df["Sustain_Residual"], ddof=1)) if len(plane_df) > 1 else 0.0
+            sr_cut = max(1.0, 0.65 * sr_spread) if np.isfinite(sr_spread) else 1.0
+
+            def _performance_architecture(row):
+                pps = float(row.get("PPS", np.nan))
+                sr = float(row.get("Sustain_Residual", np.nan))
+                if not (np.isfinite(pps) and np.isfinite(sr)):
+                    return "Unclear profile"
+                if pps >= pps_hi and sr >= sr_cut:
+                    return "Complete performance"
+                if pps >= pps_hi and sr <= -sr_cut:
+                    return "Strong but incomplete"
+                if pps >= pps_hi:
+                    return "Strong balanced run"
+                if pps <= pps_lo and sr >= sr_cut:
+                    return "Honest sustain, limited level"
+                if pps <= pps_lo and sr <= -sr_cut:
+                    return "Below benchmark"
+                if sr >= sr_cut:
+                    return "Hidden finishing strength"
+                if sr <= -sr_cut:
+                    return "Acceleration-led, weak sustain"
+                return "Balanced / expected"
+
+            plane_df["Performance_Architecture"] = plane_df.apply(_performance_architecture, axis=1)
+
             st.markdown("### Performance Plane Rankings (PPS)")
+            weight_note = (
+                f"tsSPI {pps_weights['tsSPI']*100:.1f}% · "
+                f"Accel {pps_weights['Accel']*100:.1f}% · Grind {pps_weights['Grind']*100:.1f}%"
+            )
             st.caption(
-                "PPS ranks the strongest overall position in tsSPI–Accel–Grind space using a 1:1.2:1 ratio. "
-                "Class Residual remains separate: it indicates above- or below-plane performance, not overall plane quality."
+                f"PPS excludes the noisy opening block and uses PI's normalised three-phase ratio: {weight_note}. "
+                "Sustain Residual remains separate: it shows whether the horse sustained better or worse than its earlier effort predicted."
             )
 
             top_pps_row = plane_df.sort_values(["PPS", "PI" if "PI" in plane_df.columns else "PPS"], ascending=False).iloc[0]
-            high_cr_row = plane_df.sort_values("Class_Residual", ascending=False).iloc[0]
-            low_cr_row = plane_df.sort_values("Class_Residual", ascending=True).iloc[0]
+            high_cr_row = plane_df.sort_values("Sustain_Residual", ascending=False).iloc[0]
+            incomplete_pool = plane_df[
+                (plane_df["Sustain_Residual"] < -sr_cut) & (plane_df["PPS"] >= pps_hi)
+            ].copy()
             pps_cards = st.columns(3)
-            pps_cards[0].metric("Top Plane Position", str(top_pps_row["Horse"]), f"PPS {float(top_pps_row['PPS']):.2f}")
-            pps_cards[1].metric("Highest Positive Residual", str(high_cr_row["Horse"]), f"CR {float(high_cr_row['Class_Residual']):+.2f}")
-            pps_cards[2].metric("Lowest Residual", str(low_cr_row["Horse"]), f"CR {float(low_cr_row['Class_Residual']):+.2f}")
+            pps_cards[0].metric("Best Overall Performance", str(top_pps_row["Horse"]), f"PPS {float(top_pps_row['PPS']):.2f}")
+            pps_cards[1].metric("Best Sustain Relative to Effort", str(high_cr_row["Horse"]), f"SR {float(high_cr_row['Sustain_Residual']):+.2f}")
+            if len(incomplete_pool):
+                incomplete_row = incomplete_pool.sort_values("PPS", ascending=False).iloc[0]
+                pps_cards[2].metric(
+                    "Strong but Incomplete",
+                    str(incomplete_row["Horse"]),
+                    f"PPS {float(incomplete_row['PPS']):.2f} · SR {float(incomplete_row['Sustain_Residual']):+.2f}",
+                )
+            else:
+                pps_cards[2].metric("Strong but Incomplete", "None flagged", "No high-PPS negative sustain")
 
             out_cols = [
                 "PPS_Rank", "Horse", "Finish_Pos", "PPS", "PI",
                 "tsSPI", "Accel", plane_grind_col,
-                "Expected_Grind", "Class_Residual", "CR_Profile",
+                "Expected_Grind", "Sustain_Residual", "Sustain_Profile", "Performance_Architecture",
             ]
             out_cols = [c for c in out_cols if c in plane_df.columns]
             out_cols += [c for c in ["TOF", "SRI", "Peak_Location"] if c in plane_df.columns and c not in out_cols]
-            rank_df = plane_df.sort_values(["PPS", "Class_Residual"], ascending=[False, False]).reset_index(drop=True)
+            rank_df = plane_df.sort_values(["PPS", "Sustain_Residual"], ascending=[False, False]).reset_index(drop=True)
             st.dataframe(rank_df[out_cols], use_container_width=True, hide_index=True)
 
             csv = rank_df[out_cols].to_csv(index=False).encode("utf-8")
@@ -2801,7 +2904,7 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
                     ax.set_facecolor("#0b1220")
 
                     # The plane stays analytical; PPS controls marker size and label priority.
-                    cr_vals = plane_df["Class_Residual"].to_numpy(dtype=float)
+                    cr_vals = plane_df["Sustain_Residual"].to_numpy(dtype=float)
                     vmax = float(np.nanmax(np.abs(cr_vals))) if np.isfinite(cr_vals).any() else 1.0
                     vmax = max(vmax, 1.0)
                     pps_vals = plane_df["PPS"].to_numpy(dtype=float)
@@ -2906,7 +3009,7 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
                     )
 
                     cbar = fig.colorbar(sc, ax=ax, shrink=0.62, pad=0.09)
-                    cbar.set_label("Class Residual", color="#e7eef7")
+                    cbar.set_label("Sustain Residual", color="#e7eef7")
                     cbar.ax.tick_params(colors="#b8c5d4")
                     for spine in cbar.ax.spines.values():
                         spine.set_edgecolor("#6f8197")
@@ -2914,8 +3017,8 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
                     st.pyplot(fig, use_container_width=True)
                     plt.close(fig)
                     st.caption(
-                        "Marker size follows PPS (best overall position on the plane). "
-                        "Colour shows Class Residual separately: positive residual suggests more late sustain than the plane predicted."
+                        "Marker size follows PPS (best overall field-relative performance). "
+                        "Colour shows Sustain Residual separately: positive residual suggests more late sustain than the plane predicted."
                     )
                 except Exception as e:
                     st.info(f"3D plane could not be rendered: {e}")
@@ -2923,13 +3026,14 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
             with st.expander("How to read this module"):
                 st.markdown(
                     """
-- **PPS:** overall strength of the horse's position in tsSPI–Accel–Grind space. This is the module's main ranking.
+- **PPS:** field-relative overall performance strength using only tsSPI, Accel and Grind. It follows PI's ratio across those three phases, with the noisy opening block excluded.
 - **PPS Rank:** where the horse sits from strongest to weakest overall plane position.
 - **Race Plane Formula:** the race-specific expected relationship between sustained speed, acceleration and Grind.
 - **Expected Grind:** what the model predicts a horse should have produced from its tsSPI and Accel.
-- **Class Residual:** actual Grind minus expected Grind. It is a separate upside/underperformance signal, not the best-position ranking.
-- **Positive CR:** the horse sustained better than expected.
-- **Negative CR:** the horse did less late than its travel/acceleration profile suggested.
+- **Sustain Residual:** actual Grind minus expected Grind. It measures how well the horse completed the performance relative to its earlier travelling speed and acceleration.
+- **Performance Architecture:** combines PPS and Sustain Residual to describe whether the run was complete, balanced, hidden, acceleration-led or incomplete.
+- **Positive Sustain Residual:** the horse sustained better than expected.
+- **Negative Sustain Residual:** the horse did less late than its travel/acceleration profile suggested.
 
 - **Race DNA:** relative contribution of tsSPI and Accel to the formula, plus R² explainability and residual spread.
 
@@ -2938,8 +3042,311 @@ This is experimental. In small fields or unusual race shapes, use it as a guide 
                 )
 
 
+# ======================= Race Shape Verdict =======================
+def compute_race_shape_verdict(metrics_df: pd.DataFrame, rpss_info=None) -> pd.DataFrame:
+    """Create RPSS-aware, time-only narrative verdicts for each runner.
+
+    The module interprets the existing Race Edge phase indices. It does not alter
+    PI and deliberately ignores position, draw and positional gains.
+    """
+    if metrics_df is None or metrics_df.empty or "Horse" not in metrics_df.columns:
+        return pd.DataFrame()
+
+    df = metrics_df.copy()
+    grind_col = "Grind_CG" if "Grind_CG" in df.columns else "Grind"
+    required = ["tsSPI", "Accel", grind_col]
+    if any(c not in df.columns for c in required):
+        return pd.DataFrame()
+
+    for c in required + ["PI", "Grind"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    def _rz(s: pd.Series) -> pd.Series:
+        x = pd.to_numeric(s, errors="coerce")
+        med = float(np.nanmedian(x)) if np.isfinite(x).any() else 0.0
+        mad = float(np.nanmedian(np.abs(x - med))) if np.isfinite(x).any() else 0.0
+        scale = 1.4826 * mad
+        if not np.isfinite(scale) or scale < 0.20:
+            scale = float(np.nanstd(x, ddof=0))
+        if not np.isfinite(scale) or scale < 0.20:
+            scale = 1.0
+        return ((x - med) / scale).clip(-3.0, 3.0)
+
+    z_ts = _rz(df["tsSPI"])
+    z_ac = _rz(df["Accel"])
+    z_gr = _rz(df[grind_col])
+    z_pi = _rz(df["PI"]) if "PI" in df.columns else pd.Series(0.0, index=df.index)
+
+    rpss = np.nan
+    rpss_label = "Unknown"
+    if isinstance(rpss_info, dict):
+        rpss = pd.to_numeric(rpss_info.get("rpss"), errors="coerce")
+        rpss_label = str(rpss_info.get("verdict") or "Unknown")
+    if np.isfinite(rpss):
+        if float(rpss) < 94.0:
+            context = "Slow"
+        elif float(rpss) < 98.0:
+            context = "Even"
+        else:
+            context = "Fast"
+    else:
+        context = "Unknown"
+
+    rows = []
+    for i, r in df.iterrows():
+        horse = str(r.get("Horse", "Unknown"))
+        ts, ac, gr, pi = [float(v) if np.isfinite(v) else 0.0 for v in (z_ts.loc[i], z_ac.loc[i], z_gr.loc[i], z_pi.loc[i])]
+        raw_ts = pd.to_numeric(r.get("tsSPI"), errors="coerce")
+        raw_ac = pd.to_numeric(r.get("Accel"), errors="coerce")
+        raw_gr = pd.to_numeric(r.get(grind_col), errors="coerce")
+        raw_pi = pd.to_numeric(r.get("PI"), errors="coerce")
+
+        balanced = max(ts, ac, gr) - min(ts, ac, gr) <= 0.85
+        complete = ts >= 0.55 and ac >= 0.55 and gr >= 0.55
+        cruise_led = ts >= 0.65 and ts >= ac + 0.45
+        burst_led = ac >= 0.75 and ac >= ts + 0.55
+        controlled_finish = gr > -0.85
+        collapse = gr <= -1.20
+        strong_quality = pi >= 0.20 or max(ts, ac, gr) >= 0.80
+
+        if context == "Slow":
+            if strong_quality and cruise_led and controlled_finish:
+                label = "Hidden Improver"
+                verdict = (
+                    "This slow-run race placed a premium on a sharp late sprint, which did not fully suit this horse's profile. "
+                    "Its strongest evidence came through sustained travelling speed rather than a short burst, while the finish weakened without becoming a complete collapse. "
+                    "A more genuinely run race should allow that cruising strength to play a greater role, and additional distance may also suit."
+                )
+                action = "Follow in a truer-run race or over further."
+                confidence = "High" if ts >= 1.0 and controlled_finish and pi >= 0 else "Moderate"
+            elif burst_led and gr >= -0.35:
+                label = "Tactical Specialist"
+                verdict = (
+                    "This tactical race played directly to the horse's sharp acceleration. The strongest part of the performance was concentrated in the sprint phase after energy had been conserved earlier. "
+                    "The run deserves respect, but it offers less proof that the same level will be reproduced when pressure is sustained from further out."
+                )
+                action = "Best suited by another tactical setup; seek confirmation in a true-run race."
+                confidence = "High" if ac >= 1.15 else "Moderate"
+            elif burst_led and collapse:
+                label = "Short-Burst Profile"
+                verdict = (
+                    "The horse produced a notable acceleration in this slow-run contest but could not sustain it through the finish. "
+                    "That points to short-speed ability rather than clear evidence that a stronger tempo or extra distance will help."
+                )
+                action = "Prefer a tactical race at the same or shorter trip."
+                confidence = "Moderate"
+            elif complete or (balanced and pi >= 0.35):
+                label = "Race-Shape Versatile"
+                verdict = (
+                    "Although the race was tactical, this horse produced a well-distributed performance across travelling speed, acceleration and finishing strength. "
+                    "The evidence is not dependent on one isolated phase, suggesting the performance can transfer to a wider range of race shapes."
+                )
+                action = "Respect under both tactical and more genuine conditions."
+                confidence = "High" if complete else "Moderate"
+            elif not strong_quality and collapse:
+                label = "Limited Evidence"
+                verdict = (
+                    "The tactical race did not produce enough sustained time evidence to support a positive projection. "
+                    "The horse was unable to convert the conserved-energy setup into a competitive late performance."
+                )
+                action = "No upgrade from this run."
+                confidence = "High"
+            else:
+                label = "Shape Inconclusive"
+                verdict = (
+                    "This slow-run race did not provide a complete test of the horse's ability, but the sectional profile is mixed rather than clearly positive or tactically dependent. "
+                    "More evidence is required before projecting a meaningful improvement or regression under a different tempo."
+                )
+                action = "Treat the run cautiously until tested in a clearer race shape."
+                confidence = "Moderate"
+
+        elif context == "Fast":
+            if complete and pi >= 0.45:
+                label = "Elite Confirmation"
+                verdict = (
+                    "This genuinely run race provided a full test of sustained ability, and the horse performed strongly through every major phase. "
+                    "It travelled, accelerated and maintained its effort under pressure, confirming that the performance was not created by a favourable tactical setup."
+                )
+                action = "Treat as fully proven under sustained pressure."
+                confidence = "High"
+            elif strong_quality and gr >= 0.35 and ts >= 0.0:
+                label = "Genuine Performer"
+                verdict = (
+                    "The strong race tempo tested the horse's ability to absorb sustained pressure, and its sectional profile held together well. "
+                    "This is credible, repeatable evidence rather than a performance dependent on a short sprint."
+                )
+                action = "Expect the form to remain reliable in another true-run race."
+                confidence = "High" if pi >= 0.5 else "Moderate"
+            elif burst_led and gr < -0.55:
+                label = "Pressure Vulnerable"
+                verdict = (
+                    "The horse showed acceleration but could not maintain that effort once the genuine tempo took full effect. "
+                    "The profile suggests it may be more effective when the race develops into a shorter tactical sprint."
+                )
+                action = "Prefer an easier tempo or shorter pressure phase."
+                confidence = "Moderate"
+            elif collapse:
+                label = "True-Run Exposed"
+                verdict = (
+                    "The genuine tempo exposed a clear weakness in sustaining speed through the finish. "
+                    "This run provides little support for stepping up in distance unless the horse can distribute its effort more efficiently."
+                )
+                action = "Be cautious over further or in another strongly run race."
+                confidence = "High"
+            else:
+                label = "Credible Under Pressure"
+                verdict = (
+                    "This race provided a genuine examination, and the horse's performance was broadly supported by the sectional times. "
+                    "It was not dominant across every phase, but the run carries more weight than form achieved in a tactical contest."
+                )
+                action = "Use as reliable evidence under similar conditions."
+                confidence = "Moderate"
+
+        else:  # Even or RPSS unavailable
+            if complete or (balanced and pi >= 0.45):
+                label = "Versatile Confirmation"
+                verdict = (
+                    "The race provided a balanced test, and this horse performed consistently across the major phases. "
+                    "Its ability was not concentrated in one short section, supporting a reliable and adaptable performance profile."
+                )
+                action = "Respect across a range of normal race shapes."
+                confidence = "High" if complete else "Moderate"
+            elif burst_led:
+                label = "Acceleration-Led"
+                verdict = (
+                    "The performance was driven primarily by acceleration rather than evenly sustained strength. "
+                    "That sharp speed is a genuine asset, although a stronger tempo may place greater pressure on the finishing phase."
+                )
+                action = "Most appealing when a decisive turn of foot is likely to matter."
+                confidence = "Moderate"
+            elif cruise_led and controlled_finish and strong_quality:
+                label = "Further Potential"
+                verdict = (
+                    "The horse's strongest evidence came through sustained travelling speed, with enough finishing integrity to suggest the effort was not exhausted. "
+                    "A slightly stronger tempo or additional distance may allow this profile to become more effective."
+                )
+                action = "Consider over further or when the pace is more sustained."
+                confidence = "Moderate"
+            elif collapse:
+                label = "Finish Concern"
+                verdict = (
+                    "The horse was unable to sustain its effort through the final phase of this balanced contest. "
+                    "That weakens the case for extra distance and raises a question about finishing durability."
+                )
+                action = "Prefer the same or shorter trip until finishing strength improves."
+                confidence = "High"
+            else:
+                label = "Honest Run"
+                verdict = (
+                    "The sectional profile broadly matches the balanced nature of the race. "
+                    "There is no strong evidence that the horse was either substantially helped or hindered by the tempo."
+                )
+                action = "No major race-shape upgrade or downgrade."
+                confidence = "Moderate"
+
+        # Race files used by Race Edge normally store the result as Finish_Pos,
+        # while some older imports used Finish Position/Finish. Resolve all known
+        # formats so the verdict table never loses finishing-position context.
+        finish_value = np.nan
+        for finish_col in ("Finish_Pos", "Finish Position", "Finish", "Position", "Pos"):
+            if finish_col in df.columns:
+                candidate = pd.to_numeric(r.get(finish_col), errors="coerce")
+                if pd.notna(candidate):
+                    finish_value = candidate
+                    break
+
+        rows.append({
+            "Horse": horse,
+            "Finish": finish_value,
+            "PI": raw_pi,
+            "Verdict": label,
+            "Confidence": confidence,
+            "Narrative": verdict,
+            "Action": action,
+            "tsSPI": raw_ts,
+            "Accel": raw_ac,
+            "Grind": raw_gr,
+        })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out["Finish"] = pd.to_numeric(out["Finish"], errors="coerce").astype("Int64")
+    for c in ["PI", "tsSPI", "Accel", "Grind"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce").round(2)
+    out.attrs["rpss"] = rpss
+    out.attrs["rpss_label"] = rpss_label
+    out.attrs["context"] = context
+    return out.sort_values(["PI", "Finish"], ascending=[False, True], na_position="last").reset_index(drop=True)
+
+
 # ======================= Advanced Models =======================
 if _view_is("Advanced Models"):
+    st.markdown("## 🧠 Race Shape Verdict")
+    st.caption(
+        "An RPSS-aware interpretation of what each horse's sectional profile revealed beyond the finishing position. "
+        "The verdict uses time-based phase evidence only and does not alter PI."
+    )
+
+    verdict_view = compute_race_shape_verdict(metrics, RPSS_INFO)
+    if verdict_view.empty:
+        st.info("Race Shape Verdict needs usable tsSPI, Accel and Grind metrics and could not be generated for this race.")
+    else:
+        _rp = verdict_view.attrs.get("rpss", np.nan)
+        _ctx = verdict_view.attrs.get("context", "Unknown")
+        _rp_txt = f"{float(_rp):.2f}" if np.isfinite(_rp) else "unavailable"
+        st.info(f"Race context: **{_ctx}** • RPSS: **{_rp_txt}**")
+
+        horse_options = verdict_view["Horse"].astype(str).tolist()
+        default_horses = horse_options[:min(6, len(horse_options))]
+        selected_horses = st.multiselect(
+            "Horses to display",
+            options=horse_options,
+            default=default_horses,
+            help="The verdict is calculated for every runner. Select the horses you want to review in detail."
+        )
+
+        selected_view = verdict_view[verdict_view["Horse"].astype(str).isin(selected_horses)]
+        for _, vr in selected_view.iterrows():
+            st.markdown(f"### {vr['Horse']} — {vr['Verdict']}")
+            meta = []
+            if pd.notna(vr.get("Finish")):
+                meta.append(f"Finish {int(vr['Finish'])}")
+            if pd.notna(vr.get("PI")):
+                meta.append(f"PI {float(vr['PI']):.2f}")
+            meta.append(f"Confidence: {vr['Confidence']}")
+            st.caption(" • ".join(meta))
+            st.write(vr["Narrative"])
+            st.markdown(f"**Race Edge action:** {vr['Action']}")
+
+        st.markdown("### All-runner verdict table")
+        table_cols = ["Horse", "Finish", "PI", "Verdict", "Confidence", "Action"]
+        verdict_table = verdict_view[table_cols].copy()
+        verdict_table = verdict_table.rename(columns={"Finish": "Pos"})
+        st.dataframe(
+            verdict_table,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Pos": st.column_config.NumberColumn("Pos", format="%d"),
+                "PI": st.column_config.NumberColumn("PI", format="%.2f"),
+            },
+        )
+
+        with st.expander("How Race Shape Verdict works"):
+            st.markdown(
+                """
+- **Slow RPSS (<94):** looks for hidden true-run/further improvers, tactical specialists and performances flattered by a short sprint.
+- **Even RPSS (94–98):** looks for balanced, versatile profiles and mild distance or tempo projections.
+- **Fast RPSS (≥98):** reinforces horses proven under sustained pressure and flags profiles exposed by a genuine tempo.
+- Evidence comes from **tsSPI, Accel, Grind/Corrected Grind and PI quality**.
+- The module deliberately ignores position, positional gains and draw.
+- The narrative is an interpretation of this single performance, not a permanent statement about the horse.
+                """
+            )
+
+    st.divider()
     # ======================= Hidden Horses =======================
     st.markdown("## Hidden Horses v2 (Shape-aware)")
 
