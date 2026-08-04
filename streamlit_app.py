@@ -607,7 +607,7 @@ with st.sidebar:
 
     APP_VIEW = st.radio(
         "App View",
-        ["Core Metrics", "Pressure Retention", "Pace Curve", "Ability Radar", "Race Plane Analysis", "Advanced Models", "Form Study"],
+        ["Core Metrics", "Pressure Retention", "Pace Curve", "Ability Radar", "Race Plane Analysis", "Advanced Models"],
         index=0,
     )
 
@@ -2614,6 +2614,142 @@ if _view_is("Pressure Retention"):
                 """
             )
 
+
+# ======================= Shared Race Test Profile =======================
+def compute_race_test_profile(metrics_df: pd.DataFrame, rpss_info=None, grind_col: str = "Grind") -> dict:
+    """Interpret what the fitted Race Plane tested without changing any ratings.
+
+    The profile uses the existing regression relationship:
+        Grind = intercept + b(tsSPI) + c(Accel)
+    Positive coefficient shares describe positive reward only. Negative
+    coefficients are retained as inverse relationships rather than being turned
+    into misleading positive percentages.
+    """
+    out = {
+        "valid": False,
+        "label": "Inconclusive race test",
+        "mode": "Inconclusive",
+        "confidence": "Low",
+        "summary": "The race did not produce a sufficiently stable relationship to identify one clear performance test.",
+        "r2": np.nan,
+        "intercept": np.nan,
+        "travel_coef": np.nan,
+        "accel_coef": np.nan,
+        "travel_reward_share": np.nan,
+        "accel_reward_share": np.nan,
+        "rpss": np.nan,
+        "tempo": "Unknown",
+        "runners": 0,
+        "rank": 0,
+    }
+    if metrics_df is None or metrics_df.empty:
+        return out
+    if grind_col not in metrics_df.columns:
+        grind_col = "Grind" if "Grind" in metrics_df.columns else grind_col
+    required = ["tsSPI", "Accel", grind_col]
+    if any(c not in metrics_df.columns for c in required):
+        return out
+
+    d = metrics_df[required].copy()
+    for c in required:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna()
+    out["runners"] = int(len(d))
+    if len(d) < 4:
+        out["summary"] = "Fewer than four complete runners were available, so the Race Plane test is not considered reliable."
+        return out
+
+    x = (d["tsSPI"] - 100.0).to_numpy(dtype=float)
+    y = (d["Accel"] - 100.0).to_numpy(dtype=float)
+    z = (d[grind_col] - 100.0).to_numpy(dtype=float)
+    X = np.column_stack([np.ones(len(d)), x, y])
+    coef, _, rank, _ = np.linalg.lstsq(X, z, rcond=None)
+    intercept, b_tsspi, c_accel = [float(v) for v in coef]
+    expected = X @ coef
+    ss_res = float(np.nansum((z - expected) ** 2))
+    ss_tot = float(np.nansum((z - float(np.nanmean(z))) ** 2))
+    r2 = np.nan if ss_tot <= 1e-12 else 1.0 - ss_res / ss_tot
+
+    rpss = np.nan
+    if isinstance(rpss_info, dict):
+        rpss = pd.to_numeric(rpss_info.get("rpss"), errors="coerce")
+    if np.isfinite(rpss):
+        tempo = "Slow" if float(rpss) < 94.0 else "Even" if float(rpss) < 98.0 else "Fast"
+    else:
+        tempo = "Unknown"
+
+    pos_travel = max(b_tsspi, 0.0)
+    pos_accel = max(c_accel, 0.0)
+    positive_total = pos_travel + pos_accel
+    if positive_total > 1e-12:
+        travel_share = pos_travel / positive_total
+        accel_share = pos_accel / positive_total
+    else:
+        travel_share = np.nan
+        accel_share = np.nan
+
+    if not np.isfinite(r2) or r2 < 0.30 or rank < 3 or positive_total <= 1e-12:
+        mode = "Inconclusive"
+    elif accel_share >= 0.65:
+        mode = "Acceleration"
+    elif travel_share >= 0.65:
+        mode = "Sustained Pressure"
+    else:
+        mode = "Balanced"
+
+    if not np.isfinite(r2) or r2 < 0.30 or rank < 3:
+        confidence = "Low"
+    elif r2 < 0.50:
+        confidence = "Tentative"
+    elif r2 < 0.70:
+        confidence = "Meaningful"
+    else:
+        confidence = "Strong"
+
+    if mode == "Inconclusive":
+        label = "Inconclusive race test"
+        summary = (
+            "The fitted plane did not explain enough of the field to identify one dependable race requirement. "
+            "Horse-level residuals can still be useful, but the slope should not drive a strong race-shape conclusion."
+        )
+    elif mode == "Acceleration":
+        label = "Tactical sprint test" if tempo == "Slow" else "Acceleration-led test"
+        summary = (
+            f"This {tempo.lower() if tempo != 'Unknown' else 'race'} contest linked finishing strength more closely to acceleration than sustained travelling speed. "
+            "A decisive change of speed was the clearest positive requirement produced by the field."
+        )
+    elif mode == "Sustained Pressure":
+        label = "Sustained-pressure test"
+        summary = (
+            f"This {tempo.lower() if tempo != 'Unknown' else 'race'} contest linked finishing strength most strongly to sustained travelling speed. "
+            "Horses able to carry pressure before the finish were positively rewarded."
+        )
+    else:
+        label = "Balanced all-round test"
+        summary = (
+            f"This {tempo.lower() if tempo != 'Unknown' else 'race'} contest required a combination of sustained travelling speed and acceleration. "
+            "No single earlier phase dominated the positive relationship with finishing strength."
+        )
+
+    out.update({
+        "valid": True,
+        "label": label,
+        "mode": mode,
+        "confidence": confidence,
+        "summary": summary,
+        "r2": r2,
+        "intercept": intercept,
+        "travel_coef": b_tsspi,
+        "accel_coef": c_accel,
+        "travel_reward_share": travel_share,
+        "accel_reward_share": accel_share,
+        "rpss": rpss,
+        "tempo": tempo,
+        "runners": int(len(d)),
+        "rank": int(rank),
+    })
+    return out
+
 # ======================= Race Plane Analysis — Experimental =======================
 if _view_is("Race Plane Analysis", "Class Plane Analysis"):
     st.markdown("## Race Plane Analysis")
@@ -2716,38 +2852,12 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
             plane_df["Expected_Grind"] = plane_df["Expected_Grind"].round(2)
             plane_df["Sustain_Residual"] = plane_df["Sustain_Residual"].round(2)
 
-            # --- Race DNA: relative contribution of each race-plane input ---
-            denom = abs(b_tsspi) + abs(c_accel)
-            if denom > 1e-12:
-                travel_share = abs(b_tsspi) / denom
-                accel_share = abs(c_accel) / denom
-            else:
-                travel_share = np.nan
-                accel_share = np.nan
-
+            # --- Race Test Profile: positive reward only; negative coefficients remain inverse relationships. ---
+            race_test_profile = compute_race_test_profile(metrics, RPSS_INFO, plane_grind_col)
+            travel_share = race_test_profile.get("travel_reward_share", np.nan)
+            accel_share = race_test_profile.get("accel_reward_share", np.nan)
             residual_std = float(np.nanstd(plane_df["Sustain_Residual"].to_numpy(dtype=float), ddof=1)) if len(plane_df) > 1 else np.nan
             residual_range = float(np.nanmax(plane_df["Sustain_Residual"]) - np.nanmin(plane_df["Sustain_Residual"])) if len(plane_df) else np.nan
-
-            def _influence_label(coef, name):
-                sign = "positive" if coef > 0 else "negative" if coef < 0 else "neutral"
-                return f"{name} {sign}"
-
-            def _race_identity(r2_val, travel_sh, accel_sh, b_coef, c_coef):
-                if not np.isfinite(r2_val):
-                    return "Unclear race plane"
-                if r2_val < 0.30:
-                    return "Low-explainability / hidden-quality race"
-                if np.isfinite(accel_sh) and accel_sh >= 0.70 and c_coef > 0:
-                    return "Acceleration-dominated race"
-                if np.isfinite(travel_sh) and travel_sh >= 0.70 and b_coef > 0:
-                    return "Travel-dominated race"
-                if b_coef > 0 and c_coef > 0:
-                    return "Balanced travel + acceleration race"
-                if c_coef > 0 and b_coef <= 0:
-                    return "Acceleration-led / travel not rewarded"
-                return "Mixed race plane"
-
-            race_identity = _race_identity(r2, travel_share, accel_share, b_tsspi, c_accel)
 
             st.markdown("### Race Plane Formula")
             st.code(
@@ -2759,18 +2869,24 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
                 "Sustain Residual = Actual Grind − Expected Grind. Positive means the horse sustained better than the race plane predicted."
             )
 
-            st.markdown("### Race DNA")
-            dna_cols = st.columns(4)
-            dna_cols[0].metric("Travel influence", "-" if not np.isfinite(travel_share) else f"{travel_share*100:.0f}%", f"coef {b_tsspi:+.2f}")
-            dna_cols[1].metric("Acceleration influence", "-" if not np.isfinite(accel_share) else f"{accel_share*100:.0f}%", f"coef {c_accel:+.2f}")
-            dna_cols[2].metric("Explainability", "-" if not np.isfinite(r2) else f"{r2*100:.0f}%", "R²")
-            dna_cols[3].metric("Residual spread", "-" if not np.isfinite(residual_std) else f"{residual_std:.2f}", "std dev")
+            st.markdown("### Race Test Profile")
+            profile_cols = st.columns(4)
+            profile_cols[0].metric("Travel reward", "-" if not np.isfinite(travel_share) else f"{travel_share*100:.0f}%", f"coef {b_tsspi:+.2f}")
+            profile_cols[1].metric("Acceleration reward", "-" if not np.isfinite(accel_share) else f"{accel_share*100:.0f}%", f"coef {c_accel:+.2f}")
+            profile_cols[2].metric("Explainability", "-" if not np.isfinite(r2) else f"{r2*100:.0f}%", race_test_profile.get("confidence", "Low"))
+            profile_cols[3].metric("Residual spread", "-" if not np.isfinite(residual_std) else f"{residual_std:.2f}", "std dev")
 
             st.info(
-                f"**Race identity:** {race_identity}. "
-                f"Travel coefficient is {b_tsspi:+.3f}; Accel coefficient is {c_accel:+.3f}. "
-                "The percentages use absolute coefficient size, while the sign tells whether that influence was positive or negative."
+                f"**{race_test_profile.get('label', 'Inconclusive race test')} — {race_test_profile.get('confidence', 'Low')} confidence.**  "
+                f"{race_test_profile.get('summary', '')}"
             )
+            inverse_notes = []
+            if b_tsspi < 0:
+                inverse_notes.append(f"tsSPI had an inverse relationship with Grind ({b_tsspi:+.3f})")
+            if c_accel < 0:
+                inverse_notes.append(f"Accel had an inverse relationship with Grind ({c_accel:+.3f})")
+            if inverse_notes:
+                st.caption("Inverse relationship detected: " + "; ".join(inverse_notes) + ". Negative coefficients are not counted as positive reward shares.")
             if rank < 3:
                 st.warning("The plane is not fully stable because the points are close to collinear. Treat residuals cautiously.")
 
@@ -2895,133 +3011,352 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
             )
 
             if show_3d_plane:
-                st.markdown("### 3D Performance Plane")
+                st.markdown("### Interactive 3D Performance Plane")
                 try:
-                    from mpl_toolkits.mplot3d import Axes3D, proj3d  # noqa: F401
+                    import plotly.graph_objects as go
 
-                    fig = plt.figure(figsize=(10.5, 7.8), facecolor="#0b1220")
-                    ax = fig.add_subplot(111, projection="3d")
-                    ax.set_facecolor("#0b1220")
+                    view_col, horse_col, label_col = st.columns([1.15, 1.5, 1.0])
+                    with view_col:
+                        plane_view = st.selectbox(
+                            "Plane view",
+                            ["Performance View", "Sustain View", "Race Test View", "Top View"],
+                            index=0,
+                            help="Preset camera angles. You can still rotate the chart manually.",
+                        )
+                    with horse_col:
+                        horse_choices = ["None"] + plane_df.sort_values("PPS", ascending=False)["Horse"].astype(str).tolist()
+                        highlighted_horse = st.selectbox(
+                            "Highlight horse",
+                            horse_choices,
+                            index=0,
+                            help="Focus on one horse while keeping the full field visible.",
+                        )
+                    with label_col:
+                        label_mode = st.selectbox(
+                            "Labels",
+                            ["Key horses", "All horses", "Hover only"],
+                            index=0,
+                        )
 
-                    # The plane stays analytical; PPS controls marker size and label priority.
+                    # Visual encodings only. The underlying Race Plane calculations are unchanged.
                     cr_vals = plane_df["Sustain_Residual"].to_numpy(dtype=float)
-                    vmax = float(np.nanmax(np.abs(cr_vals))) if np.isfinite(cr_vals).any() else 1.0
-                    vmax = max(vmax, 1.0)
                     pps_vals = plane_df["PPS"].to_numpy(dtype=float)
-                    marker_sizes = 55.0 + 95.0 * np.clip((pps_vals - 3.0) / 5.0, 0.0, 1.0)
+                    horse_names = plane_df["Horse"].astype(str).to_numpy()
+                    expected_plot_z = expected_z
+                    actual_plot_z = z
 
-                    sc = ax.scatter(
-                        x, y, z,
-                        c=cr_vals,
-                        cmap="coolwarm",
-                        vmin=-vmax,
-                        vmax=vmax,
-                        s=marker_sizes,
-                        edgecolor="white",
-                        linewidth=0.9,
-                        depthshade=True,
-                        alpha=0.96,
-                    )
+                    sr_abs = float(np.nanmax(np.abs(cr_vals))) if np.isfinite(cr_vals).any() else 1.0
+                    sr_abs = max(sr_abs, 1.0)
+                    marker_sizes = 9.0 + 13.0 * np.clip((pps_vals - 3.0) / 5.0, 0.0, 1.0)
 
-                    x_grid = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 18)
-                    y_grid = np.linspace(float(np.nanmin(y)), float(np.nanmax(y)), 18)
+                    # Key labels: best PPS, best positive sustain, weakest sustain, winner, and selected horse.
+                    key_names = set()
+                    if len(plane_df):
+                        key_names.add(str(plane_df.loc[plane_df["PPS"].idxmax(), "Horse"]))
+                        key_names.add(str(plane_df.loc[plane_df["Sustain_Residual"].idxmax(), "Horse"]))
+                        key_names.add(str(plane_df.loc[plane_df["Sustain_Residual"].idxmin(), "Horse"]))
+                    if "Finish_Pos" in plane_df.columns:
+                        winners = plane_df[pd.to_numeric(plane_df["Finish_Pos"], errors="coerce") == 1]
+                        key_names.update(winners["Horse"].astype(str).tolist())
+                    if highlighted_horse != "None":
+                        key_names.add(highlighted_horse)
+
+                    if label_mode == "All horses":
+                        text_labels = horse_names.tolist()
+                    elif label_mode == "Hover only":
+                        text_labels = [""] * len(plane_df)
+                    else:
+                        text_labels = [name if name in key_names else "" for name in horse_names]
+
+                    selected_mask = np.zeros(len(plane_df), dtype=bool)
+                    line_widths = np.full(len(plane_df), 1.1, dtype=float)
+                    if highlighted_horse != "None":
+                        selected_mask = horse_names == highlighted_horse
+                        marker_sizes[selected_mask] = marker_sizes[selected_mask] * 1.45
+                        line_widths[selected_mask] = 3.0
+
+                    fig3d = go.Figure()
+
+                    # Neutral fitted plane.
+                    x_grid = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 22)
+                    y_grid = np.linspace(float(np.nanmin(y)), float(np.nanmax(y)), 22)
                     Xg, Yg = np.meshgrid(x_grid, y_grid)
                     Zg = intercept + b_tsspi * Xg + c_accel * Yg
-                    ax.plot_surface(
-                        Xg, Yg, Zg,
-                        color="#5f7896",
-                        alpha=0.20,
-                        linewidth=0,
-                        antialiased=True,
-                        shade=True,
-                    )
+                    fig3d.add_trace(go.Surface(
+                        x=Xg,
+                        y=Yg,
+                        z=Zg,
+                        colorscale=[[0, "#41546d"], [1, "#7387a0"]],
+                        showscale=False,
+                        opacity=0.23,
+                        hoverinfo="skip",
+                        name="Expected Grind plane",
+                    ))
 
-                    # Premium dark-axis treatment.
-                    ax.set_xlabel("Sustained Speed" if centre_values else x_label, color="#e7eef7", labelpad=10)
-                    ax.set_ylabel("Acceleration" if centre_values else y_label, color="#e7eef7", labelpad=10)
-                    ax.set_zlabel("Finishing Strength" if centre_values else z_label, color="#e7eef7", labelpad=10)
-                    ax.set_title("Performance Plane", color="white", fontsize=16, pad=18, weight="bold")
-                    ax.view_init(elev=22, azim=-58)
-                    ax.tick_params(colors="#b8c5d4", labelsize=8)
-                    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
-                        axis.pane.set_facecolor((0.05, 0.08, 0.13, 0.35))
-                        axis.pane.set_edgecolor((0.45, 0.55, 0.68, 0.28))
-                        axis._axinfo["grid"]["color"] = (0.55, 0.62, 0.72, 0.16)
+                    # Residual lines and expected-position markers.
+                    for i, row in plane_df.iterrows():
+                        positive = float(row["Sustain_Residual"]) >= 0
+                        line_colour = "#d5b45d" if positive else "#a95f5f"
+                        line_alpha = 0.92 if highlighted_horse in ("None", str(row["Horse"])) else 0.22
+                        fig3d.add_trace(go.Scatter3d(
+                            x=[x[i], x[i]],
+                            y=[y[i], y[i]],
+                            z=[expected_plot_z[i], actual_plot_z[i]],
+                            mode="lines",
+                            line=dict(color=line_colour, width=float(line_widths[i]) + 1.0),
+                            opacity=line_alpha,
+                            hoverinfo="skip",
+                            showlegend=False,
+                        ))
 
-                    # Place labels directly in the 3D coordinate system so each
-                    # horse name remains visibly attached to its marker.
-                    horse_names = plane_df["Horse"].astype(str).tolist()
+                    fig3d.add_trace(go.Scatter3d(
+                        x=x,
+                        y=y,
+                        z=expected_plot_z,
+                        mode="markers",
+                        marker=dict(size=4, color="#8392a6", opacity=0.48, symbol="circle"),
+                        customdata=np.column_stack([horse_names, plane_df["Expected_Grind"].to_numpy(dtype=float)]),
+                        hovertemplate="<b>%{customdata[0]}</b><br>Expected Grind: %{customdata[1]:.2f}<extra></extra>",
+                        name="Expected Grind",
+                    ))
 
-                    # Small data-space offsets based on the axis spans.
-                    x_span = max(float(np.nanmax(x) - np.nanmin(x)), 1e-6)
-                    y_span = max(float(np.nanmax(y) - np.nanmin(y)), 1e-6)
-                    z_span = max(float(np.nanmax(z) - np.nanmin(z)), 1e-6)
+                    finish_vals = plane_df["Finish_Pos"].fillna("").astype(str).to_numpy() if "Finish_Pos" in plane_df.columns else np.array([""] * len(plane_df))
+                    pi_vals = plane_df["PI"].to_numpy(dtype=float) if "PI" in plane_df.columns else np.full(len(plane_df), np.nan)
+                    architecture_vals = plane_df["Performance_Architecture"].astype(str).to_numpy()
+                    customdata = list(zip(
+                        horse_names.tolist(),
+                        finish_vals.tolist(),
+                        pi_vals.tolist(),
+                        pps_vals.tolist(),
+                        plane_df["tsSPI"].to_numpy(dtype=float).tolist(),
+                        plane_df["Accel"].to_numpy(dtype=float).tolist(),
+                        plane_df[plane_grind_col].to_numpy(dtype=float).tolist(),
+                        plane_df["Expected_Grind"].to_numpy(dtype=float).tolist(),
+                        cr_vals.tolist(),
+                        architecture_vals.tolist(),
+                    ))
 
-                    dx = 0.018 * x_span
-                    dy = 0.010 * y_span
-                    dz = 0.008 * z_span
+                    def add_actual_performance_trace(indices, *, opacity, show_scale, trace_name):
+                        """Add one supported Scatter3d trace with scalar opacity.
 
-                    for xi, yi, zi, horse_name in zip(x, y, z, horse_names):
-                        # Default to the right of the marker; flip left only for
-                        # points near the right edge of the x-range.
-                        x_mid = float(np.nanmin(x) + 0.78 * x_span)
-                        if xi >= x_mid:
-                            label_x = xi - dx
-                            ha = "right"
-                        else:
-                            label_x = xi + dx
-                            ha = "left"
+                        Plotly 3D markers do not accept per-point opacity arrays, so highlighted
+                        and non-highlighted runners are deliberately rendered as separate traces.
+                        """
+                        indices = np.asarray(indices, dtype=int)
+                        if indices.size == 0:
+                            return
+                        fig3d.add_trace(go.Scatter3d(
+                            x=x[indices],
+                            y=y[indices],
+                            z=actual_plot_z[indices],
+                            mode="markers+text",
+                            text=[text_labels[i] for i in indices],
+                            textposition="top center",
+                            textfont=dict(color="#f4f6fa", size=11),
+                            marker=dict(
+                                size=marker_sizes[indices],
+                                color=cr_vals[indices],
+                                colorscale=[
+                                    [0.00, "#8e4e4e"],
+                                    [0.42, "#c4cbd4"],
+                                    [0.50, "#f2f4f7"],
+                                    [0.58, "#d8c58a"],
+                                    [1.00, "#c49a32"],
+                                ],
+                                cmin=-sr_abs,
+                                cmax=sr_abs,
+                                showscale=show_scale,
+                                colorbar=dict(
+                                    title=dict(
+                                        text="Sustain<br>Residual",
+                                        font=dict(color="#e9edf3"),
+                                    ),
+                                    thickness=14,
+                                    len=0.65,
+                                    tickfont=dict(color="#c9d2de"),
+                                    outlinecolor="#526174",
+                                ) if show_scale else None,
+                                line=dict(color="#f4f6fa", width=1.0),
+                                opacity=float(opacity),
+                            ),
+                            customdata=[customdata[i] for i in indices],
+                            hovertemplate=(
+                                "<b>%{customdata[0]}</b><br>"
+                                "Finish: %{customdata[1]}<br>"
+                                "PI: %{customdata[2]:.2f}<br>"
+                                "PPS: %{customdata[3]:.2f}<br><br>"
+                                "tsSPI: %{customdata[4]:.2f}<br>"
+                                "Accel: %{customdata[5]:.2f}<br>"
+                                "Grind: %{customdata[6]:.2f}<br>"
+                                "Expected Grind: %{customdata[7]:.2f}<br>"
+                                "Sustain Residual: %{customdata[8]:+.2f}<br>"
+                                "Architecture: %{customdata[9]}"
+                                "<extra></extra>"
+                            ),
+                            name=trace_name,
+                            showlegend=False,
+                        ))
 
-                        label_y = yi + dy
-                        label_z = zi + dz
-
-                        txt = ax.text(
-                            label_x,
-                            label_y,
-                            label_z,
-                            horse_name,
-                            fontsize=7.2,
-                            fontweight="semibold",
-                            color="#f2f6fb",
-                            ha=ha,
-                            va="center",
-                            zorder=20,
-                            clip_on=False,
+                    all_indices = np.arange(len(plane_df), dtype=int)
+                    if highlighted_horse == "None":
+                        add_actual_performance_trace(
+                            all_indices,
+                            opacity=1.0,
+                            show_scale=True,
+                            trace_name="Actual performance",
                         )
-                        txt.set_path_effects([
-                            pe.Stroke(linewidth=2.2, foreground="#07101d", alpha=0.98),
-                            pe.Normal(),
-                        ])
+                    else:
+                        dim_indices = all_indices[~selected_mask]
+                        selected_indices = all_indices[selected_mask]
+                        add_actual_performance_trace(
+                            dim_indices,
+                            opacity=0.30,
+                            show_scale=True,
+                            trace_name="Other runners",
+                        )
+                        add_actual_performance_trace(
+                            selected_indices,
+                            opacity=1.0,
+                            show_scale=False,
+                            trace_name="Highlighted runner",
+                        )
 
-                    # PPS is communicated through marker size. Give the top three
-                    # positions a restrained outer ring rather than longer labels.
-                    top_three_idx = plane_df.nsmallest(3, "PPS_Rank").index.to_numpy(dtype=int)
-                    ax.scatter(
-                        x[top_three_idx],
-                        y[top_three_idx],
-                        z[top_three_idx],
-                        s=marker_sizes[top_three_idx] + 75.0,
-                        facecolors="none",
-                        edgecolors="#f4d77a",
-                        linewidths=1.25,
-                        depthshade=False,
-                        alpha=0.95,
+                    cameras = {
+                        "Performance View": dict(eye=dict(x=1.55, y=-1.65, z=1.15)),
+                        "Sustain View": dict(eye=dict(x=1.10, y=-1.05, z=1.85)),
+                        "Race Test View": dict(
+                            eye=dict(
+                                x=1.85 if abs(b_tsspi) >= abs(c_accel) else 0.85,
+                                y=-0.85 if abs(b_tsspi) >= abs(c_accel) else -1.85,
+                                z=1.10,
+                            )
+                        ),
+                        "Top View": dict(eye=dict(x=0.01, y=0.01, z=2.75)),
+                    }
+
+                    fig3d.update_layout(
+                        height=760,
+                        margin=dict(l=0, r=0, t=42, b=0),
+                        paper_bgcolor="#0b1220",
+                        plot_bgcolor="#0b1220",
+                        font=dict(color="#e8edf4"),
+                        title=dict(
+                            text=f"{race_test_profile.get('label', 'Race Plane')} · R² {r2:.2f}",
+                            x=0.02,
+                            font=dict(size=18, color="#f6f7f9"),
+                        ),
+                        legend=dict(
+                            orientation="h",
+                            x=0.0,
+                            y=1.02,
+                            bgcolor="rgba(0,0,0,0)",
+                            font=dict(color="#d6dee8"),
+                        ),
+                        scene=dict(
+                            xaxis=dict(
+                                title="tsSPI — Travelling Strength" + (" (centred)" if centre_values else ""),
+                                backgroundcolor="#0b1220",
+                                gridcolor="rgba(160,175,195,0.16)",
+                                zerolinecolor="rgba(160,175,195,0.20)",
+                                color="#cfd7e2",
+                            ),
+                            yaxis=dict(
+                                title="Accel — Change of Speed" + (" (centred)" if centre_values else ""),
+                                backgroundcolor="#0b1220",
+                                gridcolor="rgba(160,175,195,0.16)",
+                                zerolinecolor="rgba(160,175,195,0.20)",
+                                color="#cfd7e2",
+                            ),
+                            zaxis=dict(
+                                title="Grind — Finishing Sustain" + (" (centred)" if centre_values else ""),
+                                backgroundcolor="#0b1220",
+                                gridcolor="rgba(160,175,195,0.16)",
+                                zerolinecolor="rgba(160,175,195,0.20)",
+                                color="#cfd7e2",
+                            ),
+                            camera=cameras[plane_view],
+                            aspectmode="auto",
+                        ),
                     )
-
-                    cbar = fig.colorbar(sc, ax=ax, shrink=0.62, pad=0.09)
-                    cbar.set_label("Sustain Residual", color="#e7eef7")
-                    cbar.ax.tick_params(colors="#b8c5d4")
-                    for spine in cbar.ax.spines.values():
-                        spine.set_edgecolor("#6f8197")
-
-                    st.pyplot(fig, use_container_width=True)
-                    plt.close(fig)
+                    st.plotly_chart(fig3d, width="stretch", config={"displaylogo": False, "scrollZoom": True})
                     st.caption(
-                        "Marker size follows PPS (best overall field-relative performance). "
-                        "Colour shows Sustain Residual separately: positive residual suggests more late sustain than the plane predicted."
+                        "Marker size = PPS · Marker colour = Sustain Residual · Vertical line = Expected Grind to Actual Grind. "
+                        "Gold indicates above-expected sustain; muted red indicates below-expected sustain."
                     )
+
+                    if highlighted_horse != "None":
+                        selected = plane_df[plane_df["Horse"].astype(str) == highlighted_horse].iloc[0]
+                        selected_sr = float(selected["Sustain_Residual"])
+                        selected_direction = "above" if selected_sr > 0 else "below" if selected_sr < 0 else "in line with"
+                        st.info(
+                            f"**{highlighted_horse}:** PPS {float(selected['PPS']):.2f} · "
+                            f"Sustain Residual {selected_sr:+.2f}. The horse finished {selected_direction} the Grind level "
+                            f"predicted from its travelling speed and acceleration. Profile: {selected['Performance_Architecture']}."
+                        )
+
+                    st.markdown("### Performance Architecture Map")
+                    median_pps = float(np.nanmedian(plane_df["PPS"]))
+                    fig2d = go.Figure()
+                    fig2d.add_vline(x=median_pps, line_width=1, line_dash="dash", line_color="rgba(210,220,232,0.38)")
+                    fig2d.add_hline(y=0, line_width=1, line_dash="dash", line_color="rgba(210,220,232,0.38)")
+                    def add_architecture_trace(indices, *, opacity, trace_name):
+                        indices = np.asarray(indices, dtype=int)
+                        if indices.size == 0:
+                            return
+                        fig2d.add_trace(go.Scatter(
+                            x=plane_df["PPS"].to_numpy(dtype=float)[indices],
+                            y=plane_df["Sustain_Residual"].to_numpy(dtype=float)[indices],
+                            mode="markers+text",
+                            text=[
+                                horse_names[i] if label_mode != "Hover only" and horse_names[i] in key_names else ""
+                                for i in indices
+                            ],
+                            textposition="top center",
+                            marker=dict(
+                                size=(marker_sizes * 0.9)[indices],
+                                color=cr_vals[indices],
+                                colorscale=[[0.00, "#8e4e4e"], [0.50, "#f2f4f7"], [1.00, "#c49a32"]],
+                                cmin=-sr_abs,
+                                cmax=sr_abs,
+                                line=dict(color="#f4f6fa", width=1),
+                                showscale=False,
+                                opacity=float(opacity),
+                            ),
+                            customdata=[
+                                (horse_names[i], architecture_vals[i], finish_vals[i], pi_vals[i])
+                                for i in indices
+                            ],
+                            hovertemplate=(
+                                "<b>%{customdata[0]}</b><br>"
+                                "Finish: %{customdata[2]}<br>PI: %{customdata[3]:.2f}<br>"
+                                "PPS: %{x:.2f}<br>Sustain Residual: %{y:+.2f}<br>"
+                                "%{customdata[1]}<extra></extra>"
+                            ),
+                            name=trace_name,
+                            showlegend=False,
+                        ))
+
+                    if highlighted_horse == "None":
+                        add_architecture_trace(all_indices, opacity=1.0, trace_name="Field")
+                    else:
+                        add_architecture_trace(all_indices[~selected_mask], opacity=0.30, trace_name="Other runners")
+                        add_architecture_trace(all_indices[selected_mask], opacity=1.0, trace_name="Highlighted runner")
+                    fig2d.add_annotation(x=0.99, y=0.98, xref="paper", yref="paper", text="Complete / high-level sustain", showarrow=False, font=dict(color="#d8c58a", size=11), xanchor="right")
+                    fig2d.add_annotation(x=0.99, y=0.04, xref="paper", yref="paper", text="Strong but incomplete", showarrow=False, font=dict(color="#b97676", size=11), xanchor="right")
+                    fig2d.add_annotation(x=0.01, y=0.98, xref="paper", yref="paper", text="Hidden sustainer", showarrow=False, font=dict(color="#d8c58a", size=11), xanchor="left")
+                    fig2d.add_annotation(x=0.01, y=0.04, xref="paper", yref="paper", text="Below race structure", showarrow=False, font=dict(color="#b97676", size=11), xanchor="left")
+                    fig2d.update_layout(
+                        height=470,
+                        margin=dict(l=25, r=20, t=25, b=30),
+                        paper_bgcolor="#0b1220",
+                        plot_bgcolor="#0b1220",
+                        font=dict(color="#e8edf4"),
+                        xaxis=dict(title="PPS — Overall Three-Phase Performance", gridcolor="rgba(160,175,195,0.15)", zeroline=False),
+                        yaxis=dict(title="Sustain Residual", gridcolor="rgba(160,175,195,0.15)", zeroline=False),
+                    )
+                    st.plotly_chart(fig2d, width="stretch", config={"displaylogo": False})
                 except Exception as e:
-                    st.info(f"3D plane could not be rendered: {e}")
+                    st.info(f"Interactive Race Plane could not be rendered: {e}")
 
             with st.expander("How to read this module"):
                 st.markdown(
@@ -3035,7 +3370,8 @@ if _view_is("Race Plane Analysis", "Class Plane Analysis"):
 - **Positive Sustain Residual:** the horse sustained better than expected.
 - **Negative Sustain Residual:** the horse did less late than its travel/acceleration profile suggested.
 
-- **Race DNA:** relative contribution of tsSPI and Accel to the formula, plus R² explainability and residual spread.
+- **Race Test Profile:** what the fitted plane positively rewarded. Reward shares use only positive coefficients; negative coefficients are shown separately as inverse relationships.
+- **Confidence:** based on the plane’s R² and regression stability. A low-confidence profile should not drive a strong conclusion.
 
 This is experimental. In small fields or unusual race shapes, use it as a guide rather than a final rating.
                     """
@@ -3043,11 +3379,12 @@ This is experimental. In small fields or unusual race shapes, use it as a guide 
 
 
 # ======================= Race Shape Verdict =======================
-def compute_race_shape_verdict(metrics_df: pd.DataFrame, rpss_info=None) -> pd.DataFrame:
+def compute_race_shape_verdict(metrics_df: pd.DataFrame, rpss_info=None, race_test_profile=None) -> pd.DataFrame:
     """Create RPSS-aware, time-only narrative verdicts for each runner.
 
-    The module interprets the existing Race Edge phase indices. It does not alter
-    PI and deliberately ignores position, draw and positional gains.
+    The module interprets the existing Race Edge phase indices within the shared
+    Race Test Profile. It does not alter PI and deliberately ignores position,
+    draw and positional gains.
     """
     if metrics_df is None or metrics_df.empty or "Horse" not in metrics_df.columns:
         return pd.DataFrame()
@@ -3092,6 +3429,12 @@ def compute_race_shape_verdict(metrics_df: pd.DataFrame, rpss_info=None) -> pd.D
             context = "Fast"
     else:
         context = "Unknown"
+
+    if not isinstance(race_test_profile, dict):
+        race_test_profile = compute_race_test_profile(df, rpss_info, "Grind")
+    test_mode = str(race_test_profile.get("mode", "Inconclusive"))
+    test_label = str(race_test_profile.get("label", "Inconclusive race test"))
+    test_confidence = str(race_test_profile.get("confidence", "Low"))
 
     rows = []
     for i, r in df.iterrows():
@@ -3245,6 +3588,45 @@ def compute_race_shape_verdict(metrics_df: pd.DataFrame, rpss_info=None) -> pd.D
                 action = "No major race-shape upgrade or downgrade."
                 confidence = "Moderate"
 
+        # Interpret the horse relative to what the Race Plane says the race tested.
+        if test_mode == "Acceleration":
+            if cruise_led and controlled_finish:
+                verdict = (
+                    f"The Race Plane identifies this as an {test_label.lower()}, which placed greater positive emphasis on acceleration than sustained travelling speed. "
+                    "This horse's stronger evidence came through travelling strength, so the race did not fully test its preferred profile. " + verdict
+                )
+                action = "Upgrade in a truer sustained-pressure race; " + action[:1].lower() + action[1:]
+            elif burst_led:
+                verdict = (
+                    f"The Race Plane identifies this as an {test_label.lower()}, and this horse's acceleration-led profile matched that requirement. " + verdict
+                )
+                action = "The setup suited; seek confirmation when the test changes. " + action
+        elif test_mode == "Sustained Pressure":
+            if cruise_led or (ts >= 0.35 and controlled_finish):
+                verdict = (
+                    f"The Race Plane identifies this as a {test_label.lower()}, and this horse's travelling strength was aligned with the main positive requirement. " + verdict
+                )
+                action = "Treat the performance as supported by the race test. " + action
+            elif burst_led:
+                verdict = (
+                    f"The Race Plane identifies this as a {test_label.lower()}, while this horse relied more heavily on acceleration. "
+                    "Its strongest attribute was not the principal quality rewarded by the race. " + verdict
+                )
+                action = "Consider a more tactical setup; " + action[:1].lower() + action[1:]
+        elif test_mode == "Balanced":
+            if balanced or complete:
+                verdict = (
+                    f"The Race Plane identifies this as a {test_label.lower()}, and this horse produced an appropriately balanced sectional profile. " + verdict
+                )
+            elif burst_led or cruise_led:
+                verdict = (
+                    f"The Race Plane identifies this as a {test_label.lower()}, but this horse's performance was concentrated more heavily in one phase. " + verdict
+                )
+        else:
+            verdict = (
+                f"The Race Test Profile is inconclusive ({test_confidence.lower()} confidence), so the horse-level phase evidence carries more weight than the plane slope. " + verdict
+            )
+
         # Race files used by Race Edge normally store the result as Finish_Pos,
         # while some older imports used Finish Position/Finish. Resolve all known
         # formats so the verdict table never loses finishing-position context.
@@ -3278,26 +3660,41 @@ def compute_race_shape_verdict(metrics_df: pd.DataFrame, rpss_info=None) -> pd.D
     out.attrs["rpss"] = rpss
     out.attrs["rpss_label"] = rpss_label
     out.attrs["context"] = context
+    out.attrs["race_test_profile"] = race_test_profile
     return out.sort_values(["PI", "Finish"], ascending=[False, True], na_position="last").reset_index(drop=True)
 
 
 # ======================= Advanced Models =======================
 if _view_is("Advanced Models"):
-    st.markdown("## 🧠 Race Shape Verdict")
+    st.markdown("## 🧠 Race Intelligence")
     st.caption(
-        "An RPSS-aware interpretation of what each horse's sectional profile revealed beyond the finishing position. "
-        "The verdict uses time-based phase evidence only and does not alter PI."
+        "Combines RPSS, the Race Plane slope and horse-level phase evidence to explain what the race tested, "
+        "which horses were suited by that test and what the performance may mean next time. No rating calculation is altered."
     )
 
-    verdict_view = compute_race_shape_verdict(metrics, RPSS_INFO)
+    intelligence_profile = compute_race_test_profile(metrics, RPSS_INFO, "Grind")
+    verdict_view = compute_race_shape_verdict(metrics, RPSS_INFO, intelligence_profile)
     if verdict_view.empty:
-        st.info("Race Shape Verdict needs usable tsSPI, Accel and Grind metrics and could not be generated for this race.")
+        st.info("Race Intelligence needs usable tsSPI, Accel and Grind metrics and could not be generated for this race.")
     else:
         _rp = verdict_view.attrs.get("rpss", np.nan)
         _ctx = verdict_view.attrs.get("context", "Unknown")
         _rp_txt = f"{float(_rp):.2f}" if np.isfinite(_rp) else "unavailable"
-        st.info(f"Race context: **{_ctx}** • RPSS: **{_rp_txt}**")
+        st.markdown("### Race Test Profile")
+        test_cols = st.columns(4)
+        _tr = intelligence_profile.get("travel_reward_share", np.nan)
+        _ar = intelligence_profile.get("accel_reward_share", np.nan)
+        _r2 = intelligence_profile.get("r2", np.nan)
+        test_cols[0].metric("Race test", intelligence_profile.get("label", "Inconclusive"))
+        test_cols[1].metric("Travel reward", "-" if not np.isfinite(_tr) else f"{_tr*100:.0f}%")
+        test_cols[2].metric("Acceleration reward", "-" if not np.isfinite(_ar) else f"{_ar*100:.0f}%")
+        test_cols[3].metric("Confidence", intelligence_profile.get("confidence", "Low"), "-" if not np.isfinite(_r2) else f"R² {_r2:.2f}")
+        st.info(
+            f"**Race context: {_ctx} • RPSS: {_rp_txt}.**  "
+            f"{intelligence_profile.get('summary', '')}"
+        )
 
+        st.markdown("### Horse Verdicts")
         horse_options = verdict_view["Horse"].astype(str).tolist()
         default_horses = horse_options[:min(6, len(horse_options))]
         selected_horses = st.multiselect(
@@ -3320,7 +3717,7 @@ if _view_is("Advanced Models"):
             st.write(vr["Narrative"])
             st.markdown(f"**Race Edge action:** {vr['Action']}")
 
-        st.markdown("### All-runner verdict table")
+        st.markdown("### All-runner Race Intelligence table")
         table_cols = ["Horse", "Finish", "PI", "Verdict", "Confidence", "Action"]
         verdict_table = verdict_view[table_cols].copy()
         verdict_table = verdict_table.rename(columns={"Finish": "Pos"})
@@ -3334,13 +3731,13 @@ if _view_is("Advanced Models"):
             },
         )
 
-        with st.expander("How Race Shape Verdict works"):
+        with st.expander("How Race Intelligence works"):
             st.markdown(
                 """
-- **Slow RPSS (<94):** looks for hidden true-run/further improvers, tactical specialists and performances flattered by a short sprint.
-- **Even RPSS (94–98):** looks for balanced, versatile profiles and mild distance or tempo projections.
-- **Fast RPSS (≥98):** reinforces horses proven under sustained pressure and flags profiles exposed by a genuine tempo.
-- Evidence comes from **tsSPI, Accel, Grind/Corrected Grind and PI quality**.
+- **RPSS** establishes whether the race was slow, even or fast.
+- **Race Test Profile** uses the fitted plane coefficients and R² to identify an acceleration-led, sustained-pressure, balanced or inconclusive test.
+- Positive reward percentages use only positive coefficients. Negative coefficients remain visible as inverse relationships and are never presented as positive reward.
+- Each horse is then interpreted relative to that race test using **tsSPI, Accel, Grind/Corrected Grind and PI quality**.
 - The module deliberately ignores position, positional gains and draw.
 - The narrative is an interpretation of this single performance, not a permanent statement about the horse.
                 """
@@ -3797,741 +4194,3 @@ if _view_is("Advanced Models"):
             f"shape de-bias via RSI×SCI, trip friction damp, and a race 'temperature' τ={tau:.2f} from field size & dispersion. "
             f"Interpretation: chance to win if this same race were replayed 100 times."
         )
-
-# ======================= Form Study module =======================
-if _view_is("Form Study"):
-    import html as _html
-    from xml.sax.saxutils import escape as _xml_escape
-
-    st.markdown("# Race Edge Analytics")
-    st.caption("Performance-Based Race Analysis")
-    st.markdown("## Form Study Report")
-
-    # ---------- Race information ----------
-    st.markdown("### Race Information")
-    _fs_c1, _fs_c2, _fs_c3, _fs_c4 = st.columns(4)
-    with _fs_c1:
-        fs_date = st.text_input("Date", value=datetime.now().strftime("%Y-%m-%d"), key="fs_date")
-        fs_track = st.text_input("Track", value="", key="fs_track")
-    with _fs_c2:
-        fs_race_no = st.text_input("Race number", value="", key="fs_race_no")
-        fs_surface = st.selectbox("Surface", ["Turf", "Polytrack", "Dirt", "Other"], key="fs_surface")
-    with _fs_c3:
-        fs_going = st.text_input("Going", value=str(GOING_TYPE), key="fs_going")
-        fs_race_class = st.text_input("Race class", value="", key="fs_race_class")
-    with _fs_c4:
-        _fs_rpss_val = RPSS_INFO.get("rpss", np.nan) if isinstance(RPSS_INFO, dict) else np.nan
-        fs_rpss_text = st.text_input(
-            "RPSS",
-            value=(f"{float(_fs_rpss_val):.2f}" if np.isfinite(_fs_rpss_val) else ""),
-            key="fs_rpss",
-        )
-        fs_race_confidence = st.select_slider(
-            "Race confidence",
-            options=[1, 2, 3, 4, 5],
-            value=3,
-            format_func=lambda n: "★" * n + "☆" * (5 - n),
-            key="fs_race_confidence",
-        )
-
-    # ---------- Official result ----------
-    st.markdown("### Official Result")
-    _fs_result_options = ["—"] + [str(h) for h in metrics["Horse"].dropna().astype(str).tolist()]
-    _fs_finish_defaults = {}
-    if "Finish_Pos" in metrics.columns:
-        _fs_result_df = metrics[["Horse", "Finish_Pos"]].copy()
-        _fs_result_df["Finish_Pos"] = pd.to_numeric(_fs_result_df["Finish_Pos"], errors="coerce")
-        _fs_result_df = (
-            _fs_result_df.dropna(subset=["Horse", "Finish_Pos"])
-            .sort_values("Finish_Pos")
-            .drop_duplicates(subset=["Finish_Pos"], keep="first")
-        )
-        for _pos in (1, 2, 3):
-            _match = _fs_result_df.loc[_fs_result_df["Finish_Pos"] == _pos, "Horse"]
-            if not _match.empty:
-                _fs_finish_defaults[_pos] = str(_match.iloc[0])
-
-    def _fs_default_index(position):
-        horse = _fs_finish_defaults.get(position, "—")
-        return _fs_result_options.index(horse) if horse in _fs_result_options else 0
-
-    _fs_r1, _fs_r2, _fs_r3 = st.columns(3)
-    with _fs_r1:
-        fs_result_1st = st.selectbox("1st", _fs_result_options, index=_fs_default_index(1), key="fs_result_1st")
-    with _fs_r2:
-        fs_result_2nd = st.selectbox("2nd", _fs_result_options, index=_fs_default_index(2), key="fs_result_2nd")
-    with _fs_r3:
-        fs_result_3rd = st.selectbox("3rd", _fs_result_options, index=_fs_default_index(3), key="fs_result_3rd")
-
-    # ---------- Reusable PPS calculation (independent of Race Plane page rendering) ----------
-    def _fs_robust_z(series):
-        s = pd.to_numeric(series, errors="coerce").astype(float)
-        valid = s[np.isfinite(s)]
-        if valid.empty:
-            return pd.Series(0.0, index=s.index, dtype=float)
-        med = float(np.nanmedian(valid))
-        mad = float(np.nanmedian(np.abs(valid - med)))
-        if np.isfinite(mad) and mad > 1e-12:
-            z = (s - med) / (1.4826 * mad)
-        else:
-            sd = float(np.nanstd(valid, ddof=0))
-            mu = float(np.nanmean(valid))
-            z = (s - mu) / sd if np.isfinite(sd) and sd > 1e-12 else pd.Series(0.0, index=s.index)
-        return pd.Series(z, index=s.index, dtype=float).clip(-3.5, 3.5)
-
-    fs_grind_col = "Grind"
-    fs_required = ["Horse", "tsSPI", "Accel", fs_grind_col]
-    fs_missing = [c for c in fs_required if c not in metrics.columns]
-
-    if fs_missing:
-        st.warning("Form Study cannot calculate PPS because these columns are missing: " + ", ".join(fs_missing))
-    else:
-        fs_plane = metrics.copy()
-        for c in ["tsSPI", "Accel", fs_grind_col, "PI", "F200_idx", "Finish_Pos"]:
-            if c in fs_plane.columns:
-                fs_plane[c] = pd.to_numeric(fs_plane[c], errors="coerce")
-        fs_plane = fs_plane.dropna(subset=fs_required).copy()
-        fs_plane["Horse"] = fs_plane["Horse"].astype(str).str.strip()
-        fs_plane = fs_plane.drop_duplicates(subset=["Horse"], keep="first").reset_index(drop=True)
-
-        if len(fs_plane) < 3:
-            st.info("At least three valid runners are required for the Form Study module.")
-        else:
-            # PPS ratio: tsSPI : Accel : Grind = 1 : 1.2 : 1.
-            fs_plane["_z_tsSPI"] = _fs_robust_z(fs_plane["tsSPI"])
-            fs_plane["_z_Accel"] = _fs_robust_z(fs_plane["Accel"])
-            fs_plane["_z_Grind"] = _fs_robust_z(fs_plane[fs_grind_col])
-            fs_plane["PPS_Core"] = (
-                0.3125 * fs_plane["_z_tsSPI"]
-                + 0.3750 * fs_plane["_z_Accel"]
-                + 0.3125 * fs_plane["_z_Grind"]
-            )
-            fs_plane["PPS"] = np.clip(5.0 + 2.75 * np.tanh(fs_plane["PPS_Core"] / 1.35), 0.0, 10.0)
-            fs_plane["PPS_Rank"] = fs_plane["PPS"].rank(method="min", ascending=False).astype(int)
-
-            # Fit the same Performance Plane for residual context.
-            X = np.column_stack([
-                np.ones(len(fs_plane)),
-                fs_plane["tsSPI"].to_numpy(dtype=float) - 100.0,
-                fs_plane["Accel"].to_numpy(dtype=float) - 100.0,
-            ])
-            y = fs_plane[fs_grind_col].to_numpy(dtype=float) - 100.0
-            try:
-                coef, *_ = np.linalg.lstsq(X, y, rcond=None)
-                expected = 100.0 + X @ coef
-                fs_plane["Expected_Grind"] = expected
-                fs_plane["Class_Residual"] = fs_plane[fs_grind_col] - expected
-            except Exception:
-                fs_plane["Expected_Grind"] = np.nan
-                fs_plane["Class_Residual"] = np.nan
-
-            fs_plane = fs_plane.sort_values(
-                ["PPS", "PI" if "PI" in fs_plane.columns else "PPS"],
-                ascending=False,
-            ).reset_index(drop=True)
-
-            # ---------- Race Edge Focus Horses ----------
-            st.markdown("### Race Edge Focus Horses")
-            st.caption(
-                "Select up to four horses for the report. Use the PPS autofill for a standard "
-                "race review, or choose any runner for an owner, trainer or individual-horse report."
-            )
-
-            fs_all_horses = fs_plane["Horse"].astype(str).tolist()
-            fs_focus_options = ["— None —"] + fs_all_horses
-            fs_default_focus = fs_all_horses[:4]
-
-            fs_focus_keys = [f"fs_focus_horse_{i}" for i in range(4)]
-
-            # Initialise each selector with the top four PPS horses.
-            for i, key in enumerate(fs_focus_keys):
-                if key not in st.session_state:
-                    st.session_state[key] = (
-                        fs_default_focus[i] if i < len(fs_default_focus) else "— None —"
-                    )
-                elif st.session_state[key] not in fs_focus_options:
-                    st.session_state[key] = "— None —"
-
-            if st.button(
-                "Auto-fill from PPS",
-                key="fs_autofill_focus_horses",
-                help="Select the four highest PPS horses.",
-            ):
-                for i, key in enumerate(fs_focus_keys):
-                    st.session_state[key] = (
-                        fs_default_focus[i] if i < len(fs_default_focus) else "— None —"
-                    )
-                st.rerun()
-
-            fs_sel_cols = st.columns(4)
-            fs_selected_names = []
-            for i, col in enumerate(fs_sel_cols):
-                with col:
-                    selected = st.selectbox(
-                        f"Focus horse {i + 1}",
-                        fs_focus_options,
-                        key=fs_focus_keys[i],
-                    )
-                    if selected != "— None —":
-                        fs_selected_names.append(selected)
-
-            fs_duplicate_names = sorted({
-                horse for horse in fs_selected_names if fs_selected_names.count(horse) > 1
-            })
-            if fs_duplicate_names:
-                st.warning(
-                    "Each focus horse should be selected only once. Duplicate selection"
-                    + ("s: " if len(fs_duplicate_names) > 1 else ": ")
-                    + ", ".join(fs_duplicate_names)
-                )
-
-            # Preserve selector order and ignore duplicate entries in the generated report.
-            fs_unique_selected = list(dict.fromkeys(fs_selected_names))
-            fs_focus_rows = []
-            for horse in fs_unique_selected:
-                match = fs_plane.loc[fs_plane["Horse"].astype(str) == horse]
-                if not match.empty:
-                    fs_focus_rows.append(match.iloc[0])
-
-            fs_focus = (
-                pd.DataFrame(fs_focus_rows).reset_index(drop=True)
-                if fs_focus_rows
-                else fs_plane.head(0).copy()
-            )
-
-            if fs_focus.empty:
-                st.info("Select at least one focus horse to create the horse assessment section.")
-            else:
-                fs_focus_cols = [
-                    "PPS_Rank", "Horse", "Finish_Pos", "PPS", "PI", "F200_idx",
-                    "tsSPI", "Accel", fs_grind_col, "Class_Residual",
-                ]
-                fs_focus_cols = [c for c in fs_focus_cols if c in fs_focus.columns]
-                fs_focus_display = fs_focus[fs_focus_cols].copy()
-                fs_focus_display = fs_focus_display.rename(columns={
-                    "PPS_Rank": "PPS Rank",
-                    "Finish_Pos": "Finish",
-                    "F200_idx": "F200",
-                    "Class_Residual": "Residual",
-                })
-                for c in ["PPS", "PI", "F200", "tsSPI", "Accel", "Grind", "Residual"]:
-                    if c in fs_focus_display.columns:
-                        fs_focus_display[c] = pd.to_numeric(
-                            fs_focus_display[c], errors="coerce"
-                        ).round(2)
-                st.dataframe(fs_focus_display, width="stretch", hide_index=True)
-
-            # ---------- Analyst assessments ----------
-            st.markdown("### Analyst Assessment")
-            fs_surfaces = ["Any", "Turf", "Polytrack", "Dirt", "Other"]
-            fs_paces = ["Any", "Slow/tactical", "Even", "Strong", "Fast/collapse"]
-            fs_follow_rows = []
-
-            for i, row in fs_focus.iterrows():
-                horse = str(row["Horse"])
-                safe_key = re.sub(r"[^A-Za-z0-9]+", "_", horse).strip("_")[:40] or f"horse_{i}"
-                with st.expander(f"#{int(row['PPS_Rank'])} — {horse}", expanded=(i == 0)):
-                    a1, a2, a3 = st.columns([1, 1.4, 1.4])
-                    with a1:
-                        follow = st.checkbox("Follow horse", value=True, key=f"fs_follow_{safe_key}_{i}")
-                        confidence = st.select_slider(
-                            "Confidence", options=[1, 2, 3, 4, 5], value=3,
-                            format_func=lambda n: "★" * n + "☆" * (5 - n),
-                            key=f"fs_conf_{safe_key}_{i}",
-                        )
-                    with a2:
-                        ideal_distance = st.text_input("Ideal distance", value=f"{int(race_distance_input)}m", key=f"fs_dist_{safe_key}_{i}")
-                        ideal_surface = st.selectbox("Ideal surface", fs_surfaces, key=f"fs_surf_{safe_key}_{i}")
-                        preferred_pace = st.selectbox("Preferred pace", fs_paces, key=f"fs_pace_{safe_key}_{i}")
-                    with a3:
-                        note = st.text_area("Analyst assessment", height=150, key=f"fs_note_{safe_key}_{i}")
-
-                    fs_follow_rows.append({
-                        "Follow": bool(follow), "Horse": horse,
-                        "PPS": float(row.get("PPS", np.nan)), "PI": float(row.get("PI", np.nan)),
-                        "Finish": row.get("Finish_Pos", np.nan), "F200": row.get("F200_idx", np.nan),
-                        "tsSPI": row.get("tsSPI", np.nan), "Accel": row.get("Accel", np.nan),
-                        "Grind": row.get(fs_grind_col, np.nan), "Residual": row.get("Class_Residual", np.nan),
-                        "Ideal distance": ideal_distance, "Ideal surface": ideal_surface,
-                        "Preferred pace": preferred_pace, "Confidence": int(confidence), "Note": note,
-                    })
-
-            # ---------- Handicap Review ----------
-            st.markdown("### Handicap Review")
-            st.caption(
-                "Enter the horse's Race MR and the MR achieved in this race. "
-                "Race Edge calculates the difference and generates an editable handicap note."
-            )
-
-            def _fs_beta_base(distance_m):
-                d = float(distance_m)
-                if d <= 1200: return 0.30
-                if d <= 1600: return 0.35
-                if d <= 2000: return 0.40
-                if d <= 2400: return 0.45
-                return 0.50
-
-            def _fs_auto_handicap_note(mr_difference):
-                try:
-                    value = float(mr_difference)
-                except (TypeError, ValueError):
-                    return ""
-                if not np.isfinite(value):
-                    return ""
-                if value >= 8:
-                    return "Significantly ahead of its race mark"
-                if value >= 5:
-                    return "Clearly ahead of its race mark"
-                if value >= 2:
-                    return "Ran above its race mark"
-                if value >= -1:
-                    return "Ran broadly to its race mark"
-                if value >= -4:
-                    return "Ran below its race mark"
-                if value >= -7:
-                    return "Clearly below its race mark"
-                return "Significantly below its race mark"
-
-            fs_weight_candidates = ["Horse Weight", "Horse_Weight", "Wt", "Weight", "Weight (kg)"]
-            fs_weight_col = next((c for c in fs_weight_candidates if c in metrics.columns), None)
-            fs_handicap = metrics[["Horse", "PI"]].copy()
-            fs_handicap["Weight (kg)"] = (
-                pd.to_numeric(metrics[fs_weight_col], errors="coerce").fillna(60.0)
-                if fs_weight_col else 60.0
-            )
-            fs_handicap["PI"] = pd.to_numeric(fs_handicap["PI"], errors="coerce")
-            fs_pi_med = float(np.nanmedian(fs_handicap["PI"])) if fs_handicap["PI"].notna().any() else np.nan
-            fs_beta = float(np.clip(_fs_beta_base(float(race_distance_input)), 0.22, 0.70))
-
-            # Ahead (kg) remains an internal calculation only.
-            fs_handicap["_Ahead_kg"] = (fs_handicap["PI"] - fs_pi_med) / fs_beta
-            fs_handicap["Ahead (MR)"] = fs_handicap["_Ahead_kg"] * 2.0
-            fs_handicap["Race MR"] = np.nan
-            fs_handicap["MR Achieved"] = np.nan
-            fs_handicap = fs_handicap.sort_values("_Ahead_kg", ascending=False).reset_index(drop=True)
-
-            for c in ["Weight (kg)", "PI", "Ahead (MR)"]:
-                fs_handicap[c] = pd.to_numeric(fs_handicap[c], errors="coerce").round(2)
-
-            # First editor: capture the two analyst-entered ratings.
-            fs_rating_input = st.data_editor(
-                fs_handicap[["Horse", "PI", "Weight (kg)", "Ahead (MR)", "Race MR", "MR Achieved"]],
-                width="stretch",
-                hide_index=True,
-                disabled=["Horse", "Weight (kg)", "PI", "Ahead (MR)"],
-                column_config={
-                    "Race MR": st.column_config.NumberColumn("Race MR", step=1, format="%.0f"),
-                    "MR Achieved": st.column_config.NumberColumn("MR Achieved", step=1, format="%.0f"),
-                },
-                key="fs_handicap_rating_editor",
-            )
-
-            fs_edited = fs_rating_input.copy()
-            fs_edited["Race MR"] = pd.to_numeric(fs_edited["Race MR"], errors="coerce")
-            fs_edited["MR Achieved"] = pd.to_numeric(fs_edited["MR Achieved"], errors="coerce")
-            fs_edited["MR Difference"] = fs_edited["MR Achieved"] - fs_edited["Race MR"]
-            fs_edited["Handicap Note"] = fs_edited["MR Difference"].apply(_fs_auto_handicap_note)
-
-            # Second editor: show the completed review and allow note overrides only.
-            fs_edited = st.data_editor(
-                fs_edited[
-                    [
-                        "Horse", "PI", "Weight (kg)", "Ahead (MR)",
-                        "Race MR", "MR Achieved", "Handicap Note", "MR Difference",
-                    ]
-                ],
-                width="stretch",
-                hide_index=True,
-                disabled=[
-                    "Horse", "PI", "Weight (kg)", "Ahead (MR)",
-                    "Race MR", "MR Achieved", "MR Difference",
-                ],
-                column_config={
-                    "Handicap Note": st.column_config.TextColumn(
-                        "Handicap Note",
-                        width="large",
-                        help="Automatically generated from MR Difference; edit where race circumstances require.",
-                    ),
-                    "MR Difference": st.column_config.NumberColumn(
-                        "MR Difference",
-                        format="%.0f",
-                    ),
-                },
-                key="fs_handicap_note_editor",
-            )
-
-            # ---------- Race Edge Verdict ----------
-            st.markdown("### Race Edge Verdict")
-            fs_horses = [str(h) for h in metrics["Horse"].dropna().astype(str).tolist()]
-            fs_options = ["—"] + fs_horses
-            v1, v2, v3, v4 = st.columns(4)
-            with v1:
-                fs_main_follow = st.selectbox("Horse to follow", fs_options, key="fs_main_follow")
-            with v2:
-                fs_improver = st.selectbox("Improver", fs_options, key="fs_improver")
-            with v3:
-                fs_best_handicap = st.selectbox("Best handicapped horse", fs_options, key="fs_best_handicap")
-            with v4:
-                fs_forgive = st.selectbox("Horse to forgive", fs_options, key="fs_forgive")
-            fs_race_summary = st.text_area("Race summary", height=150, key="fs_race_summary")
-
-            # ---------- Premium printable report ----------
-            def _fs_stars(value):
-                try:
-                    n = int(value)
-                except Exception:
-                    n = 0
-                n = max(0, min(5, n))
-                return "★" * n + "☆" * (5 - n)
-
-            def _fs_fmt(v, dp=2):
-                try:
-                    return "" if pd.isna(v) else f"{float(v):.{dp}f}"
-                except Exception:
-                    return _html.escape(str(v))
-
-            def _fs_metric_pct(metric, value):
-                # Presentation-only visual scale; it does not expose methodology.
-                try:
-                    value = float(value)
-                except Exception:
-                    return 0.0
-                if not np.isfinite(value):
-                    return 0.0
-                if metric in ("PPS", "PI"):
-                    return float(np.clip(value * 10.0, 0.0, 100.0))
-                if metric in ("F200", "tsSPI", "Accel", "Grind"):
-                    return float(np.clip((value - 95.0) * 10.0, 0.0, 100.0))
-                return 0.0
-
-            def _fs_html_table(df, diff_col=None):
-                if df is None or df.empty:
-                    return '<div class="empty">None selected.</div>'
-                cols = list(df.columns)
-                head = ''.join(f'<th>{_html.escape(str(c))}</th>' for c in cols)
-                rows = []
-                for ridx, (_, rr) in enumerate(df.iterrows()):
-                    cls = 'alt' if ridx % 2 else ''
-                    if diff_col and diff_col in rr.index:
-                        try:
-                            d = float(rr[diff_col])
-                            if np.isfinite(d):
-                                cls += ' positive' if d > 0 else (' negative' if d < 0 else '')
-                        except Exception:
-                            pass
-                    cells = []
-                    for c in cols:
-                        v = rr[c]
-                        txt = _fs_fmt(v) if isinstance(v, (float, np.floating)) else ('' if pd.isna(v) else _html.escape(str(v)))
-                        cells.append(f'<td>{txt}</td>')
-                    rows.append(f'<tr class="{cls.strip()}">' + ''.join(cells) + '</tr>')
-                return f'<table><thead><tr>{head}</tr></thead><tbody>{"".join(rows)}</tbody></table>'
-
-            def _fs_html_metric(name, value):
-                pct = _fs_metric_pct(name, value)
-                return (
-                    f'<div class="metric"><div class="metric-head"><span>{_html.escape(name)}</span>'
-                    f'<b>{_fs_fmt(value)}</b></div><div class="bar"><span style="width:{pct:.1f}%"></span></div></div>'
-                )
-
-            follow_lookup = {str(r['Horse']): r for r in fs_follow_rows}
-
-            def _fs_html_horse_card(row):
-                horse = str(row.get('Horse', ''))
-                info = follow_lookup.get(horse, {})
-                rank = int(row.get('PPS_Rank', 0)) if pd.notna(row.get('PPS_Rank', np.nan)) else ''
-                metric_html = ''.join([
-                    _fs_html_metric('PPS', row.get('PPS', np.nan)),
-                    _fs_html_metric('PI', row.get('PI', np.nan)),
-                    _fs_html_metric('F200', row.get('F200_idx', np.nan)),
-                    _fs_html_metric('tsSPI', row.get('tsSPI', np.nan)),
-                    _fs_html_metric('Accel', row.get('Accel', np.nan)),
-                    _fs_html_metric('Grind', row.get(fs_grind_col, np.nan)),
-                ])
-                return f'''<section class="horse-card">
-                <div class="horse-title"><div><span class="rank">#{rank}</span> {_html.escape(horse)}</div><span>Finish: {_html.escape(str(row.get('Finish_Pos','')))}</span></div>
-                <div class="metrics-grid">{metric_html}</div>
-                <div class="residual"><b>Residual:</b> {_fs_fmt(row.get('Class_Residual', np.nan))}</div>
-                <div class="assessment">
-                <div><b>Follow:</b> {'Yes' if info.get('Follow') else 'No'}</div>
-                <div><b>Ideal distance:</b> {_html.escape(str(info.get('Ideal distance','')))}</div>
-                <div><b>Ideal surface:</b> {_html.escape(str(info.get('Ideal surface','')))}</div>
-                <div><b>Preferred pace:</b> {_html.escape(str(info.get('Preferred pace','')))}</div>
-                <div><b>Confidence:</b> <span class="stars">{_fs_stars(info.get('Confidence',0))}</span></div>
-                </div><div class="analyst-note"><b>Analyst Assessment</b><br>{_html.escape(str(info.get('Note',''))) or '&nbsp;'}</div></section>'''
-
-            fs_glossary = [
-                ('PI (Performance Index)', 'Measures how complete a horse performance was within the unique environment of that race. PI combines gate speed, sustained speed, acceleration and finishing strength into one race-relative score. It is intended for comparison within the same race rather than as an absolute class rating.', [('7.0+','Outstanding within the race'),('6.0-6.9','Strong performance'),('5.0-5.9','Around the race standard'),('4.0-4.9','Below the race standard'),('Below 4.0','Well below the race standard')]),
-                ('PPS (Performance Plane Score)', 'Measures a horse overall position within the performance plane of that race using sustained speed, acceleration and finishing strength. PPS is race-relative and compares runners within the same race ecosystem rather than measuring absolute class across different races.', [('7.0+','Outstanding plane position'),('6.0-6.9','Strong plane position'),('5.0-5.9','Around the race standard'),('4.0-4.9','Below the race standard'),('Below 4.0','Well below the race standard')]),
-                ('Residual', 'Shows whether a horse closing performance was better or worse than expected from its position in the Performance Plane.', [('+5 or higher','Significantly exceeded expectation'),('+2 to +5','Above expectation'),('-2 to +2','Broadly as expected'),('-5 to -2','Below expectation'),('Below -5','Significantly below expectation')]),
-                ('F200', 'Measures gate speed and early efficiency during the opening 200 metres.', [('102+','Exceptional gate speed'),('101-101.9','Strong gate speed'),('99-100.9','Around the race standard'),('Below 99','Below the race standard')]),
-                ('tsSPI', 'Measures sustained cruising speed through the middle stages of the race.', [('102+','Exceptional sustained speed'),('101-101.9','Strong'),('99-100.9','Around the race standard'),('Below 99','Below the race standard')]),
-                ('Accel', 'Measures how effectively a horse increased speed from the 600m point to the 200m point.', [('102+','Exceptional acceleration'),('101-101.9','Strong'),('99-100.9','Around the race standard'),('Below 99','Below the race standard')]),
-                ('Grind', 'Measures the ability to sustain speed from the 200m point to the finish.', [('102+','Exceptional closing strength'),('101-101.9','Strong'),('99-100.9','Around the race standard'),('Below 99','Below the race standard')]),
-                ('RPSS', 'Race Pace Strength Score indicates how strongly the race was run as a whole.', [('98 or higher','Fast-run race'),('94 to below 98','Evenly run race'),('Below 94','Slow or tactical race')]),
-                ('Ahead of the Handicap (MR)', 'Estimates how far ahead or behind a horse performed relative to its Race MR within this race.', [('+5 MR or more','Significantly ahead of its mark'),('+2 to +4 MR','Ahead of its mark'),('-1 to +1 MR','Broadly ran to its mark'),('-2 MR or less','Below its race mark')]),
-            ]
-
-            def _fs_html_glossary():
-                blocks = []
-                for name, desc, bands in fs_glossary:
-                    rows = ''.join(f'<tr><td>{_html.escape(a)}</td><td>{_html.escape(b)}</td></tr>' for a,b in bands)
-                    blocks.append(f'<div class="glossary-item"><h4>{_html.escape(name)}</h4><p>{_html.escape(desc)}</p><table class="guide">{rows}</table></div>')
-                return ''.join(blocks)
-
-            fs_report_title = f"{fs_date}_{fs_track or 'Track'}_Race{fs_race_no or 'NA'}_FormStudy"
-            fs_report_title = re.sub(r"[^A-Za-z0-9._-]+", "_", fs_report_title)
-            fs_cards_html = ''.join(_fs_html_horse_card(r) for _, r in fs_focus.iterrows())
-
-            fs_print_html = f'''<!doctype html><html><head><meta charset="utf-8"><title>{_html.escape(fs_report_title)}</title>
-<style>
-:root{{--navy:#0a1830;--navy2:#17365f;--gold:#c8a85a;--ink:#152238;--muted:#667386;--line:#d7dee8;--soft:#f4f6f9;}}
-@page{{size:A4 landscape;margin:13mm 12mm 17mm}}*{{box-sizing:border-box}}body{{margin:0;font-family:Arial,sans-serif;color:var(--ink);font-size:10px}}
-.print-button{{margin-bottom:8px;padding:7px 12px;border:0;border-radius:5px;background:var(--navy);color:white}}.brand{{background:linear-gradient(120deg,var(--navy),var(--navy2));color:white;padding:18px 22px 16px;border-bottom:4px solid var(--gold)}}
-.brand h1{{margin:0;font-size:25px;letter-spacing:1.5px}}.brand p{{margin:4px 0 0;color:#dbe4ef}}.section{{margin:13px 0}}.section-title{{font-size:14px;color:var(--navy);text-transform:uppercase;border-bottom:2px solid var(--gold);padding-bottom:4px}}
-.race-grid{{display:grid;grid-template-columns:repeat(5,1fr);gap:7px;background:var(--soft);border:1px solid var(--line);padding:10px}}.race-item{{background:white;border-left:3px solid var(--gold);padding:6px 8px}}.race-item span{{display:block;color:var(--muted);font-size:8px;text-transform:uppercase}}.race-item b{{display:block;margin-top:2px;font-size:10.5px}}
-.result-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}}.result-card{{border:1px solid var(--line);padding:9px 11px;border-top:3px solid var(--gold);background:white}}.result-card span{{display:block;color:var(--muted);font-size:8px;text-transform:uppercase}}.result-card b{{display:block;margin-top:4px;color:var(--navy);font-size:11px}}.verdict-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}}.verdict-card{{border:1px solid var(--line);padding:8px}}.verdict-card span{{color:var(--muted);font-size:8px;text-transform:uppercase}}.verdict-card b{{display:block;margin-top:4px;color:var(--navy);font-size:11px}}.summary{{margin-top:8px;border:1px solid var(--line);border-left:4px solid var(--gold);padding:9px;min-height:55px;white-space:pre-wrap}}
-.cards{{display:grid;grid-template-columns:1fr 1fr;gap:10px}}.horse-card{{border:1px solid #ccd5e0;border-top:4px solid var(--navy);padding:9px;break-inside:avoid}}.horse-title{{display:flex;justify-content:space-between;color:var(--navy);font-size:13px;font-weight:700;margin-bottom:7px}}.horse-title span:last-child{{color:var(--muted);font-size:9px}}.rank{{color:var(--gold)}}
-.metrics-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:5px 8px}}.metric-head{{display:flex;justify-content:space-between;font-size:8.5px}}.metric-head span{{color:var(--muted)}}.bar{{height:5px;background:#e3e7ed;margin-top:2px;border-radius:3px;overflow:hidden}}.bar span{{display:block;height:100%;background:linear-gradient(90deg,var(--navy2),var(--gold))}}.residual{{margin:7px 0;padding:5px 7px;background:var(--soft)}}.assessment{{display:grid;grid-template-columns:repeat(5,1fr);gap:5px 8px;font-size:8.6px}}.stars{{color:var(--gold);letter-spacing:.5px;font-size:10px}}.analyst-note{{margin-top:7px;border-top:1px solid var(--line);padding-top:6px;min-height:33px;white-space:pre-wrap}}
-table{{width:100%;border-collapse:collapse;margin:5px 0 10px;font-size:8.1px}}th{{background:var(--navy);color:white;padding:5px 4px;text-align:left}}td{{border-bottom:1px solid var(--line);padding:4px;vertical-align:top}}tr.alt td{{background:var(--soft)}}tr.positive td{{background:#e8f4ec}}tr.negative td{{background:#f8e9e9}}.empty{{color:var(--muted);font-style:italic;padding:7px}}.page-break{{page-break-before:always}}
-.guide-cover{{min-height:170mm;padding-bottom:8px}}.guide-kicker{{display:inline-block;margin:12px 0 5px;padding:4px 9px;background:var(--gold);color:var(--navy);font-weight:700;text-transform:uppercase;letter-spacing:.8px}}.guide-intro{{font-size:11px;line-height:1.45;max-width:920px;margin:4px 0 12px}}.glossary-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px 10px}}.glossary-item{{border:1px solid var(--line);border-left:4px solid var(--gold);padding:8px;background:white;break-inside:avoid;box-shadow:0 1px 0 rgba(10,24,48,.04)}}.glossary-item h4{{margin:0 0 3px;color:var(--navy);font-size:10px}}.glossary-item p{{margin:0 0 5px;font-size:8.3px;line-height:1.25}}.guide{{margin:0;font-size:7.6px}}.guide td:first-child{{width:34%;font-weight:bold;color:var(--navy)}}.philosophy{{margin-top:10px;padding:12px 14px;background:var(--navy);color:white;border-left:5px solid var(--gold);font-size:9px;line-height:1.45}}.philosophy b{{color:var(--gold);font-size:11px}}.notice{{margin-top:8px;padding:8px;background:var(--soft);border-left:4px solid var(--gold);font-size:8.2px}}
-.footer{{position:fixed;left:0;right:0;bottom:-11mm;text-align:center;color:#6b7280;font-size:7.5px;border-top:1px solid #b8c0cc;padding-top:4px}}@media print{{.print-button{{display:none}}}}
-</style></head><body><button class="print-button" onclick="window.print()">Print report</button>
-<section class="guide-cover">
-<header class="brand"><h1>RACE EDGE ANALYTICS</h1><p>FORM STUDY REPORT | Performance-Based Race Analysis</p></header>
-<div class="guide-kicker">Race Edge Guide</div>
-<p class="guide-intro">Understanding the core metrics used throughout this report. Race Edge evaluates each performance within the unique pace, tactics and conditions of the race that was actually run.</p>
-<section class="section glossary-grid">{_fs_html_glossary()}</section>
-<div class="philosophy"><b>EVERY RACE IS ITS OWN ECOSYSTEM.</b><br>Race Edge measures how completely each horse executed within the environment of that race. PI is race-relative, not an absolute class rating. A PI of 10 represents the theoretical benchmark of a flawless performance within the Race Edge model and is expected to be exceptionally rare.</div>
-<div class="notice"><b>Prepared by Kiran Singh.</b> The Race Edge metrics in this report are proprietary analytical measures. Descriptions are intentionally general and do not disclose underlying calculations.</div>
-</section>
-<div class="page-break"></div>
-<header class="brand"><h1>RACE ANALYSIS</h1><p>Race Overview | Official Result | Race Edge Verdict</p></header>
-<section class="section"><h2 class="section-title">Race Overview</h2><div class="race-grid">
-<div class="race-item"><span>Date</span><b>{_html.escape(fs_date)}</b></div><div class="race-item"><span>Track</span><b>{_html.escape(fs_track)}</b></div><div class="race-item"><span>Race</span><b>{_html.escape(fs_race_no)}</b></div><div class="race-item"><span>Distance</span><b>{int(race_distance_input)}m</b></div><div class="race-item"><span>Surface</span><b>{_html.escape(fs_surface)}</b></div>
-<div class="race-item"><span>Going</span><b>{_html.escape(fs_going)}</b></div><div class="race-item"><span>Class</span><b>{_html.escape(fs_race_class)}</b></div><div class="race-item"><span>RPSS</span><b>{_html.escape(fs_rpss_text)}</b></div><div class="race-item"><span>Race confidence</span><b class="stars">{_fs_stars(fs_race_confidence)}</b></div><div class="race-item"><span>Runners</span><b>{len(metrics)}</b></div></div></section>
-<section class="section"><h2 class="section-title">Official Result</h2><div class="result-grid"><div class="result-card"><span>1st</span><b>{_html.escape(fs_result_1st)}</b></div><div class="result-card"><span>2nd</span><b>{_html.escape(fs_result_2nd)}</b></div><div class="result-card"><span>3rd</span><b>{_html.escape(fs_result_3rd)}</b></div></div></section>
-<section class="section"><h2 class="section-title">Race Edge Verdict</h2><div class="verdict-grid"><div class="verdict-card"><span>Horse to follow</span><b>{_html.escape(fs_main_follow)}</b></div><div class="verdict-card"><span>Improver</span><b>{_html.escape(fs_improver)}</b></div><div class="verdict-card"><span>Best handicapped horse</span><b>{_html.escape(fs_best_handicap)}</b></div><div class="verdict-card"><span>Horse to forgive</span><b>{_html.escape(fs_forgive)}</b></div></div><div class="summary"><b>Analyst summary</b><br>{_html.escape(fs_race_summary)}</div></section>
-<div class="page-break"></div><header class="brand"><h1>RACE EDGE FOCUS HORSES</h1><p>Analyst-selected performance profiles</p></header><section class="section"><div class="cards">{fs_cards_html}</div></section>
-<div class="page-break"></div><header class="brand"><h1>HANDICAP REVIEW</h1><p>Performance against the official assessment</p></header><section class="section">{_fs_html_table(fs_edited,'MR Difference')}</section>
-<div class="footer">Property of Race Edge Analytics | Prepared by Kiran Singh | © Race Edge Analytics. All Rights Reserved.</div></body></html>'''
-
-            # ---------- Premium PDF export ----------
-            def _fs_build_pdf():
-                try:
-                    from reportlab.lib import colors
-                    from reportlab.lib.pagesizes import A4, landscape
-                    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-                    from reportlab.lib.units import mm
-                    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, KeepTogether, HRFlowable
-                except Exception as exc:
-                    raise RuntimeError('ReportLab is required for PDF export.') from exc
-
-                NAVY=colors.HexColor('#0A1830'); NAVY2=colors.HexColor('#17365F'); GOLD=colors.HexColor('#C8A85A')
-                SOFT=colors.HexColor('#F3F5F8'); LINE=colors.HexColor('#D4DAE3'); INK=colors.HexColor('#172238'); MUTED=colors.HexColor('#667386')
-                POS=colors.HexColor('#E8F4EC'); NEG=colors.HexColor('#F8E9E9'); page_w,_=landscape(A4)
-                buf=io.BytesIO(); doc=SimpleDocTemplate(buf,pagesize=landscape(A4),rightMargin=11*mm,leftMargin=11*mm,topMargin=11*mm,bottomMargin=18*mm,title='Race Edge Analytics Form Study Report',author='Kiran Singh')
-                styles=getSampleStyleSheet()
-                brand_style=ParagraphStyle('REBrand',parent=styles['Title'],fontName='Helvetica-Bold',fontSize=20,leading=22,textColor=colors.white)
-                brand_sub=ParagraphStyle('REBrandSub',parent=styles['Normal'],fontSize=8.5,leading=10,textColor=colors.HexColor('#DCE4EF'))
-                section_style=ParagraphStyle('RESection',parent=styles['Heading2'],fontName='Helvetica-Bold',fontSize=12,leading=14,textColor=NAVY,spaceBefore=6,spaceAfter=4)
-                body_style=ParagraphStyle('REBody',parent=styles['BodyText'],fontSize=7.4,leading=9,textColor=INK)
-                small_style=ParagraphStyle('RESmall',parent=body_style,fontSize=6.3,leading=7.5)
-                tiny_style=ParagraphStyle('RETiny',parent=body_style,fontSize=5.5,leading=6.5)
-                white_small=ParagraphStyle('REWhiteSmall',parent=small_style,textColor=colors.white,fontName='Helvetica-Bold')
-                muted_style=ParagraphStyle('REMuted',parent=small_style,textColor=MUTED)
-                star_style=ParagraphStyle('REStars',parent=body_style,fontName='ZapfDingbats',fontSize=8.5,leading=10,textColor=GOLD)
-
-                def pdf_star_rating(value):
-                    try:
-                        n = int(value)
-                    except Exception:
-                        n = 0
-                    n = max(0, min(5, n))
-                    cells = []
-                    for i in range(5):
-                        cell_style = ParagraphStyle(
-                            f'REStarCell{i}',
-                            parent=star_style,
-                            textColor=GOLD if i < n else LINE,
-                            alignment=1,
-                        )
-                        # In ReportLab's built-in ZapfDingbats font, 'H' renders as a star.
-                        cells.append(Paragraph('H', cell_style))
-                    rating = Table([cells], colWidths=[4.2*mm]*5, rowHeights=[5*mm])
-                    rating.setStyle(TableStyle([
-                        ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
-                        ('LEFTPADDING',(0,0),(-1,-1),0),
-                        ('RIGHTPADDING',(0,0),(-1,-1),0),
-                        ('TOPPADDING',(0,0),(-1,-1),0),
-                        ('BOTTOMPADDING',(0,0),(-1,-1),0),
-                    ]))
-                    return rating
-
-                def ptxt(v,style=tiny_style):
-                    if v is None or (isinstance(v,(float,np.floating)) and not np.isfinite(v)): s=''
-                    elif isinstance(v,(float,np.floating)): s=f'{float(v):.2f}'
-                    else: s=str(v)
-                    return Paragraph(_xml_escape(s).replace('\n','<br/>'),style)
-
-                def banner(title,subtitle):
-                    t=Table([[Paragraph(_xml_escape(title),brand_style)],[Paragraph(_xml_escape(subtitle),brand_sub)]],colWidths=[page_w-22*mm])
-                    t.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),NAVY),('LEFTPADDING',(0,0),(-1,-1),12),('RIGHTPADDING',(0,0),(-1,-1),12),('TOPPADDING',(0,0),(0,0),10),('BOTTOMPADDING',(0,0),(0,0),2),('TOPPADDING',(0,1),(0,1),0),('BOTTOMPADDING',(0,1),(0,1),9),('LINEBELOW',(0,-1),(-1,-1),3,GOLD)])); return t
-
-                def heading(title):
-                    return KeepTogether([Paragraph(_xml_escape(title.upper()),section_style),HRFlowable(width='100%',thickness=1.5,color=GOLD,spaceAfter=4)])
-
-                def make_table(df,font=5.8,highlight=False):
-                    if df is None or df.empty: return Paragraph('None selected.',muted_style)
-                    data=[[ptxt(c,white_small) for c in df.columns]]; diffs=[]
-                    for _,rr in df.iterrows():
-                        data.append([ptxt(rr[c]) for c in df.columns])
-                        try: diffs.append(float(rr['MR Difference']))
-                        except Exception: diffs.append(np.nan)
-                    t=Table(data,repeatRows=1,hAlign='LEFT')
-                    cmds=[('BACKGROUND',(0,0),(-1,0),NAVY),('TEXTCOLOR',(0,0),(-1,0),colors.white),('GRID',(0,0),(-1,-1),0.25,LINE),('VALIGN',(0,0),(-1,-1),'TOP'),('FONTSIZE',(0,0),(-1,-1),font),('LEFTPADDING',(0,0),(-1,-1),3),('RIGHTPADDING',(0,0),(-1,-1),3),('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3)]
-                    for r in range(1,len(data)): cmds.append(('BACKGROUND',(0,r),(-1,r),SOFT if r%2==0 else colors.white))
-                    if highlight:
-                        for r,d in enumerate(diffs,start=1):
-                            if np.isfinite(d): cmds.append(('BACKGROUND',(0,r),(-1,r),POS if d>0 else (NEG if d<0 else colors.white)))
-                    t.setStyle(TableStyle(cmds)); return t
-
-                def metric_bar(name,value):
-                    pct=_fs_metric_pct(name,value); total=16; filled=int(round(total*pct/100))
-                    bar=Table([['']*total],colWidths=[2.35*mm]*total,rowHeights=[2.1*mm])
-                    cmds=[('BOX',(0,0),(-1,-1),0.2,LINE),('BACKGROUND',(0,0),(-1,-1),colors.HexColor('#E3E7ED'))]
-                    if filled>0: cmds.append(('BACKGROUND',(0,0),(filled-1,0),NAVY2))
-                    bar.setStyle(TableStyle(cmds)); label=Table([[Paragraph(_xml_escape(name),muted_style),ptxt(value,small_style)]],colWidths=[26*mm,12*mm]); label.setStyle(TableStyle([('ALIGN',(1,0),(1,0),'RIGHT'),('LEFTPADDING',(0,0),(-1,-1),0),('RIGHTPADDING',(0,0),(-1,-1),0),('TOPPADDING',(0,0),(-1,-1),0),('BOTTOMPADDING',(0,0),(-1,-1),1)])); return [label,bar]
-
-                def horse_card(row):
-                    horse=str(row.get('Horse','')); info=follow_lookup.get(horse,{})
-                    rank=int(row.get('PPS_Rank',0)) if pd.notna(row.get('PPS_Rank',np.nan)) else ''
-                    title=Table([[Paragraph(f'<font color="#C8A85A">#{rank}</font> {_xml_escape(horse)}',ParagraphStyle('HorseTitle',parent=body_style,fontName='Helvetica-Bold',fontSize=10.5,leading=12,textColor=NAVY)),Paragraph(f"Finish: {_xml_escape(str(row.get('Finish_Pos','')))}",muted_style)]],colWidths=[92*mm,28*mm]); title.setStyle(TableStyle([('ALIGN',(1,0),(1,0),'RIGHT'),('LEFTPADDING',(0,0),(-1,-1),0),('RIGHTPADDING',(0,0),(-1,-1),0)]))
-                    vals=[('PPS',row.get('PPS',np.nan)),('PI',row.get('PI',np.nan)),('F200',row.get('F200_idx',np.nan)),('tsSPI',row.get('tsSPI',np.nan)),('Accel',row.get('Accel',np.nan)),('Grind',row.get(fs_grind_col,np.nan))]
-                    cells=[metric_bar(a,b) for a,b in vals]; metrics_tbl=Table([[cells[0],cells[1],cells[2]],[cells[3],cells[4],cells[5]]],colWidths=[41*mm]*3); metrics_tbl.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),2),('RIGHTPADDING',(0,0),(-1,-1),2),('TOPPADDING',(0,0),(-1,-1),2),('BOTTOMPADDING',(0,0),(-1,-1),3)]))
-                    assess_data=[
-                        [Paragraph('<b>Follow</b>',small_style),Paragraph('Yes' if info.get('Follow') else 'No',small_style),Paragraph('<b>Ideal distance</b>',small_style),ptxt(info.get('Ideal distance',''),small_style)],
-                        [Paragraph('<b>Ideal surface</b>',small_style),ptxt(info.get('Ideal surface',''),small_style),Paragraph('<b>Preferred pace</b>',small_style),ptxt(info.get('Preferred pace',''),small_style)],
-                        [Paragraph('<b>Confidence</b>',small_style),pdf_star_rating(info.get('Confidence',0)),Paragraph('',small_style),Paragraph('',small_style)],
-                    ]
-                    assess=Table(assess_data,colWidths=[24*mm,37*mm,24*mm,37*mm])
-                    assess.setStyle(TableStyle([('GRID',(0,0),(-1,-1),0.25,LINE),('BACKGROUND',(0,0),(-1,-1),colors.white),('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),3),('RIGHTPADDING',(0,0),(-1,-1),3),('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3)]))
-                    note=Table([[Paragraph('<b>Analyst Assessment</b><br/>'+_xml_escape(str(info.get('Note',''))).replace('\n','<br/>'),small_style)]],colWidths=[122*mm]); note.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),SOFT),('BOX',(0,0),(-1,-1),0.3,LINE),('LEFTPADDING',(0,0),(-1,-1),5),('RIGHTPADDING',(0,0),(-1,-1),5),('TOPPADDING',(0,0),(-1,-1),4),('BOTTOMPADDING',(0,0),(-1,-1),5)]))
-                    residual=Table([[Paragraph(f"<b>Residual:</b> {_fs_fmt(row.get('Class_Residual',np.nan))}",small_style)]],colWidths=[122*mm]); residual.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),SOFT),('LEFTPADDING',(0,0),(-1,-1),4),('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3)]))
-                    card=Table([[title],[metrics_tbl],[residual],[assess],[note]],colWidths=[128*mm]); card.setStyle(TableStyle([('BOX',(0,0),(-1,-1),0.6,LINE),('LINEABOVE',(0,0),(-1,0),3,NAVY),('LEFTPADDING',(0,0),(-1,-1),5),('RIGHTPADDING',(0,0),(-1,-1),5),('TOPPADDING',(0,0),(-1,-1),4),('BOTTOMPADDING',(0,0),(-1,-1),4),('VALIGN',(0,0),(-1,-1),'TOP')])); return card
-
-                def glossary_card(item):
-                    name,desc,bands=item; guide=Table([[Paragraph(_xml_escape(a),small_style),Paragraph(_xml_escape(b),small_style)] for a,b in bands],colWidths=[27*mm,51*mm]); guide.setStyle(TableStyle([('GRID',(0,0),(-1,-1),0.25,LINE),('BACKGROUND',(0,0),(0,-1),SOFT),('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),3),('RIGHTPADDING',(0,0),(-1,-1),3),('TOPPADDING',(0,0),(-1,-1),2),('BOTTOMPADDING',(0,0),(-1,-1),2)]))
-                    block=Table([[Paragraph(_xml_escape(name),ParagraphStyle('Gloss',parent=body_style,fontName='Helvetica-Bold',fontSize=8.3,leading=9.5,textColor=NAVY))],[Paragraph(_xml_escape(desc),small_style)],[guide]],colWidths=[82*mm]); block.setStyle(TableStyle([('BOX',(0,0),(-1,-1),0.4,LINE),('LEFTPADDING',(0,0),(-1,-1),5),('RIGHTPADDING',(0,0),(-1,-1),5),('TOPPADDING',(0,0),(-1,-1),4),('BOTTOMPADDING',(0,0),(-1,-1),4),('VALIGN',(0,0),(-1,-1),'TOP')])); return block
-
-                def footer(canvas,doc_obj):
-                    canvas.saveState(); canvas.setStrokeColor(colors.HexColor('#AEB7C4')); canvas.setLineWidth(.4); canvas.line(11*mm,12*mm,page_w-11*mm,12*mm); canvas.setFillColor(colors.HexColor('#687386')); canvas.setFont('Helvetica',6.6); canvas.drawCentredString(page_w/2,7.5*mm,'Property of Race Edge Analytics | Prepared by Kiran Singh | © Race Edge Analytics. All Rights Reserved.'); canvas.drawRightString(page_w-11*mm,7.5*mm,f'Page {doc_obj.page}'); canvas.restoreState()
-
-                cover_intro=Paragraph('Understanding the core metrics used throughout this report. Race Edge evaluates each performance within the unique pace, tactics and conditions of the race that was actually run.',ParagraphStyle('CoverIntro',parent=body_style,fontSize=8.5,leading=11,textColor=INK,spaceAfter=5))
-                guide_cards=[glossary_card(x) for x in fs_glossary]
-                guide_rows=[]
-                for i in range(0,len(guide_cards),3):
-                    row=guide_cards[i:i+3]
-                    while len(row)<3: row.append(Paragraph('',body_style))
-                    guide_rows.append(row)
-                guide_tbl=Table(guide_rows,colWidths=[86*mm]*3)
-                guide_tbl.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),2),('RIGHTPADDING',(0,0),(-1,-1),2),('TOPPADDING',(0,0),(-1,-1),2),('BOTTOMPADDING',(0,0),(-1,-1),2)]))
-                philosophy=Table([[Paragraph('<font color="#C8A85A"><b>EVERY RACE IS ITS OWN ECOSYSTEM.</b></font><br/>Race Edge measures how completely each horse executed within the environment of that race. PI is race-relative, not an absolute class rating. A PI of 10 represents the theoretical benchmark of a flawless performance within the Race Edge model and is expected to be exceptionally rare.',ParagraphStyle('Philosophy',parent=body_style,fontSize=7.3,leading=9.5,textColor=colors.white))]],colWidths=[258*mm])
-                philosophy.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),NAVY),('LINEBEFORE',(0,0),(0,-1),4,GOLD),('LEFTPADDING',(0,0),(-1,-1),9),('RIGHTPADDING',(0,0),(-1,-1),9),('TOPPADDING',(0,0),(-1,-1),7),('BOTTOMPADDING',(0,0),(-1,-1),7)]))
-                story=[banner('RACE EDGE ANALYTICS','FORM STUDY REPORT | Performance-Based Race Analysis'),Spacer(1,4*mm),heading('Race Edge Guide'),cover_intro,guide_tbl,Spacer(1,3*mm),philosophy,PageBreak(),banner('RACE ANALYSIS','Race Overview | Official Result | Race Edge Verdict'),Spacer(1,4*mm),heading('Race Overview')]
-                meta=[('Date',fs_date),('Track',fs_track),('Race',fs_race_no),('Distance',f'{int(race_distance_input)}m'),('Surface',fs_surface),('Going',fs_going),('Class',fs_race_class),('RPSS',fs_rpss_text),('Race confidence',fs_race_confidence),('Runners',str(len(metrics)))]
-                meta_data=[]
-                for i in range(0,10,5):
-                    row=[]
-                    for label,value in meta[i:i+5]:
-                        value_flowable = pdf_star_rating(value) if label == 'Race confidence' else Paragraph(_xml_escape(str(value)),body_style)
-                        row.append(Table([[Paragraph(label.upper(),muted_style)],[value_flowable]],colWidths=[47*mm],style=[('BACKGROUND',(0,0),(-1,-1),colors.white),('LINEBEFORE',(0,0),(0,-1),2.2,GOLD),('BOX',(0,0),(-1,-1),.3,LINE),('LEFTPADDING',(0,0),(-1,-1),6),('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3)]))
-                    meta_data.append(row)
-                meta_tbl=Table(meta_data,colWidths=[50*mm]*5); meta_tbl.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),2),('RIGHTPADDING',(0,0),(-1,-1),2),('TOPPADDING',(0,0),(-1,-1),2),('BOTTOMPADDING',(0,0),(-1,-1),2)]))
-                result_tbl=Table(
-                    [[Paragraph('1ST',muted_style),Paragraph('2ND',muted_style),Paragraph('3RD',muted_style)],
-                     [ptxt(fs_result_1st,body_style),ptxt(fs_result_2nd,body_style),ptxt(fs_result_3rd,body_style)]],
-                    colWidths=[84*mm]*3
-                )
-                result_tbl.setStyle(TableStyle([
-                    ('BOX',(0,0),(-1,-1),.4,LINE),
-                    ('INNERGRID',(0,0),(-1,-1),.25,LINE),
-                    ('BACKGROUND',(0,0),(-1,0),SOFT),
-                    ('LINEABOVE',(0,0),(-1,0),2,GOLD),
-                    ('LEFTPADDING',(0,0),(-1,-1),6),
-                    ('RIGHTPADDING',(0,0),(-1,-1),6),
-                    ('TOPPADDING',(0,0),(-1,-1),5),
-                    ('BOTTOMPADDING',(0,0),(-1,-1),5),
-                ]))
-                story += [meta_tbl,Spacer(1,3*mm),heading('Official Result'),result_tbl,Spacer(1,3*mm),heading('Race Edge Verdict')]
-                verdict=Table([[Paragraph('HORSE TO FOLLOW',muted_style),Paragraph('IMPROVER',muted_style),Paragraph('BEST HANDICAPPED HORSE',muted_style),Paragraph('HORSE TO FORGIVE',muted_style)],[ptxt(fs_main_follow,body_style),ptxt(fs_improver,body_style),ptxt(fs_best_handicap,body_style),ptxt(fs_forgive,body_style)]],colWidths=[63*mm]*4); verdict.setStyle(TableStyle([('BOX',(0,0),(-1,-1),.4,LINE),('INNERGRID',(0,0),(-1,-1),.25,LINE),('BACKGROUND',(0,0),(-1,0),SOFT),('LEFTPADDING',(0,0),(-1,-1),5),('RIGHTPADDING',(0,0),(-1,-1),5),('TOPPADDING',(0,0),(-1,-1),5),('BOTTOMPADDING',(0,0),(-1,-1),5)]))
-                summary=Table([[Paragraph('<b>Analyst summary</b><br/>'+_xml_escape(fs_race_summary).replace('\n','<br/>'),body_style)]],colWidths=[252*mm]); summary.setStyle(TableStyle([('BOX',(0,0),(-1,-1),.4,LINE),('LINEBEFORE',(0,0),(0,-1),3,GOLD),('LEFTPADDING',(0,0),(-1,-1),7),('RIGHTPADDING',(0,0),(-1,-1),7),('TOPPADDING',(0,0),(-1,-1),6),('BOTTOMPADDING',(0,0),(-1,-1),6)])); story += [verdict,Spacer(1,3*mm),summary]
-                story += [PageBreak(),banner('RACE EDGE FOCUS HORSES','Analyst-selected performance profiles'),Spacer(1,4*mm)]
-                cards=[horse_card(r) for _,r in fs_focus.iterrows()]
-                if cards:
-                    while len(cards)<4:
-                        cards.append(Paragraph('',body_style))
-                    grid=Table(
-                        [[cards[0],cards[1]],[cards[2],cards[3]]],
-                        colWidths=[132*mm]*2,
-                    )
-                    grid.setStyle(TableStyle([
-                        ('VALIGN',(0,0),(-1,-1),'TOP'),
-                        ('LEFTPADDING',(0,0),(-1,-1),3),
-                        ('RIGHTPADDING',(0,0),(-1,-1),3),
-                        ('TOPPADDING',(0,0),(-1,-1),3),
-                        ('BOTTOMPADDING',(0,0),(-1,-1),3),
-                    ]))
-                    story.append(grid)
-                else:
-                    story.append(
-                        Paragraph(
-                            'No focus horses were selected for this report.',
-                            body_style,
-                        )
-                    )
-                story += [PageBreak(),banner('HANDICAP REVIEW','Performance against the official assessment'),Spacer(1,4*mm),make_table(fs_edited,font=5.3,highlight=True)]
-                doc.build(story,onFirstPage=footer,onLaterPages=footer); buf.seek(0); return buf.getvalue()
-
-            st.markdown("### Print & Export")
-            st.caption("Large report assets are prepared only when requested, keeping normal app reruns light.")
-
-            # HTML is already available as a string and is inexpensive to expose.
-            ex1, ex2 = st.columns(2)
-            with ex1:
-                st.download_button(
-                    "Download print-ready HTML",
-                    data=fs_print_html.encode("utf-8"),
-                    file_name=f"{fs_report_title}.html",
-                    mime="text/html",
-                    width="stretch",
-                )
-
-            # Build the ReportLab document only after the analyst explicitly asks
-            # for it. Previously this ran on every widget change and every rerun.
-            pdf_state_key = f"fs_pdf_bytes_{fs_report_title}"
-            with ex2:
-                if st.button("Prepare Form Study PDF", key="fs_prepare_pdf", width="stretch"):
-                    try:
-                        with st.spinner("Preparing PDF…"):
-                            st.session_state[pdf_state_key] = _fs_build_pdf()
-                    except Exception as exc:
-                        st.session_state.pop(pdf_state_key, None)
-                        st.error(f"PDF export unavailable: {exc}")
-
-                if pdf_state_key in st.session_state:
-                    st.download_button(
-                        "Download Form Study PDF",
-                        data=st.session_state[pdf_state_key],
-                        file_name=f"{fs_report_title}.pdf",
-                        mime="application/pdf",
-                        width="stretch",
-                    )
-
-            # Streamlit executes the contents of a collapsed expander. Use a
-            # checkbox so the iframe is genuinely absent until requested.
-            fs_show_preview = st.checkbox("Show print preview", value=False, key="fs_show_print_preview")
-            if fs_show_preview:
-                st.components.v1.html(fs_print_html, height=900, scrolling=True)
-
-# ======================= /Form Study module =======================
