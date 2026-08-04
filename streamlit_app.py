@@ -472,7 +472,9 @@ def build_ratings_pdf(ratings_df: pd.DataFrame, *, race_date, track, course, rac
     story += [Spacer(1, 5 * mm), section_heading("PERFORMANCE RATINGS")]
 
     rows = [["POS", "HORSE", "AGE", "WT", "WFA", "EFF WT", "PI", "OFF MR", "MR ACH", "EDGE"]]
-    ordered = ratings_df.sort_values(["MR Achieved", "Finish"], ascending=[False, True]).copy()
+    ordered = ratings_df.copy()
+    ordered["_FinishSort"] = pd.to_numeric(ordered.get("Finish"), errors="coerce").fillna(1e9)
+    ordered = ordered.sort_values(["_FinishSort", "Horse"], ascending=[True, True]).drop(columns=["_FinishSort"])
     for _, r in ordered.iterrows():
         finish = "-" if pd.isna(r.get("Finish")) else str(int(r.get("Finish")))
         official_mr = pd.to_numeric(pd.Series([r.get("Official MR")]), errors="coerce").iloc[0]
