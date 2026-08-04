@@ -338,102 +338,198 @@ def build_ratings_handicap(metrics_df: pd.DataFrame, distance_m: float) -> pd.Da
 
 def build_ratings_pdf(ratings_df: pd.DataFrame, *, race_date, track, course, race_no,
                       distance_m, line_horse, line_mr, band_label, analyst_note="") -> bytes:
-    """Create a premium navy-and-gold Race Edge ratings report."""
+    """Create a portrait A4 Race Edge ratings report matching the Form Study identity."""
     from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.enums import TA_CENTER, TA_LEFT
     from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, KeepTogether
     from reportlab.lib.units import mm
 
     navy = colors.HexColor("#0B1736")
-    gold = colors.HexColor("#C9A227")
-    pale_gold = colors.HexColor("#F3E8B5")
-    offwhite = colors.HexColor("#F8F6F0")
-    midgrey = colors.HexColor("#D8DCE5")
+    gold = colors.HexColor("#C8A24A")
+    pale_gold = colors.HexColor("#F4E8B4")
+    offwhite = colors.HexColor("#F7F7F5")
+    light_grey = colors.HexColor("#E3E6EC")
+    label_grey = colors.HexColor("#7E8798")
+    white = colors.white
 
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
-        buf, pagesize=landscape(A4), rightMargin=12*mm, leftMargin=12*mm,
-        topMargin=11*mm, bottomMargin=12*mm,
-        title="Race Edge Ratings Report", author="Race Edge Analytics",
+        buf,
+        pagesize=A4,
+        rightMargin=15 * mm,
+        leftMargin=15 * mm,
+        topMargin=14 * mm,
+        bottomMargin=18 * mm,
+        title="Race Edge Ratings Report",
+        author="Race Edge Analytics",
     )
+
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle("RETitle", parent=styles["Title"], fontName="Helvetica-Bold",
-                                 fontSize=22, leading=25, textColor=navy, alignment=TA_CENTER, spaceAfter=4)
-    sub_style = ParagraphStyle("RESub", parent=styles["Normal"], fontName="Helvetica",
-                               fontSize=9.5, leading=12, textColor=navy, alignment=TA_CENTER)
-    body_style = ParagraphStyle("REBody", parent=styles["BodyText"], fontName="Helvetica",
-                                fontSize=9, leading=12, textColor=navy, alignment=TA_LEFT)
-    note_style = ParagraphStyle("RENote", parent=body_style, backColor=offwhite,
-                                borderColor=gold, borderWidth=0.7, borderPadding=7, spaceBefore=7)
+    header_title = ParagraphStyle(
+        "RatingsHeaderTitle", parent=styles["Title"], fontName="Helvetica-Bold",
+        fontSize=19, leading=21, textColor=white, alignment=TA_CENTER,
+    )
+    header_sub = ParagraphStyle(
+        "RatingsHeaderSub", parent=styles["Normal"], fontName="Helvetica",
+        fontSize=7.5, leading=9, textColor=colors.HexColor("#D9DFEA"), alignment=TA_LEFT,
+    )
+    section_style = ParagraphStyle(
+        "RatingsSection", parent=styles["Heading2"], fontName="Helvetica-Bold",
+        fontSize=11.5, leading=14, textColor=navy, alignment=TA_LEFT,
+        spaceBefore=2, spaceAfter=3,
+    )
+    card_label = ParagraphStyle(
+        "RatingsCardLabel", parent=styles["Normal"], fontName="Helvetica-Bold",
+        fontSize=6.4, leading=8, textColor=label_grey, alignment=TA_LEFT,
+    )
+    card_value = ParagraphStyle(
+        "RatingsCardValue", parent=styles["Normal"], fontName="Helvetica",
+        fontSize=8.3, leading=10, textColor=navy, alignment=TA_LEFT,
+    )
+    body_style = ParagraphStyle(
+        "RatingsBody", parent=styles["BodyText"], fontName="Helvetica",
+        fontSize=8.2, leading=11, textColor=navy, alignment=TA_LEFT,
+    )
+    note_style = ParagraphStyle(
+        "RatingsNote", parent=body_style, backColor=offwhite,
+        borderColor=gold, borderWidth=0.8, borderPadding=7, spaceBefore=4,
+    )
 
-    story = [Paragraph("RACE EDGE", title_style),
-             Paragraph("RATINGS REPORT - PERFORMANCE BEYOND POSITION", sub_style), Spacer(1, 5*mm)]
+    def section_heading(text):
+        return KeepTogether([
+            Paragraph(text, section_style),
+            Table([[""]], colWidths=[180 * mm], rowHeights=[0.8 * mm],
+                  style=TableStyle([("BACKGROUND", (0, 0), (-1, -1), gold)])),
+            Spacer(1, 2.5 * mm),
+        ])
 
-    details = [
-        ["Race Date", race_date.strftime("%d %B %Y"), "Track", str(track), "Course", str(course)],
-        ["Race Number", str(int(race_no)), "Distance", f"{int(distance_m)} m", "WFA Band", str(band_label)],
-        ["Line Horse", str(line_horse), "Line MR", str(int(line_mr)), "Method", "1 lb = 0.5 kg; 1 kg = 2 MR"],
+    def info_card(label, value):
+        return Table(
+            [[Paragraph(str(label).upper(), card_label)], [Paragraph(str(value), card_value)]],
+            colWidths=[34 * mm], rowHeights=[7 * mm, 9 * mm],
+            style=TableStyle([
+                ("BOX", (0, 0), (-1, -1), 0.45, light_grey),
+                ("LINEBEFORE", (0, 0), (0, -1), 2.0, gold),
+                ("BACKGROUND", (0, 0), (-1, -1), white),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 2),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ])
+        )
+
+    # Branded top banner
+    banner = Table(
+        [[Paragraph("RACE EDGE ANALYTICS", header_title)],
+         [Paragraph("Performance-Based Race Analysis | Ratings Report", header_sub)]],
+        colWidths=[180 * mm], rowHeights=[13 * mm, 7 * mm],
+        style=TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), navy),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 1),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LINEBELOW", (0, -1), (-1, -1), 2.0, gold),
+        ])
+    )
+
+    story = [banner, Spacer(1, 6 * mm), section_heading("RACE OVERVIEW")]
+
+    overview_cards = [
+        info_card("Date", race_date.strftime("%Y-%m-%d")),
+        info_card("Track", track),
+        info_card("Race", int(race_no)),
+        info_card("Distance", f"{int(distance_m)}m"),
+        info_card("Course", course),
     ]
-    dt = Table(details, colWidths=[25*mm, 48*mm, 24*mm, 43*mm, 24*mm, 64*mm])
-    dt.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), offwhite),
-        ("TEXTCOLOR", (0,0), (-1,-1), navy),
-        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
-        ("FONTNAME", (0,0), (0,-1), "Helvetica-Bold"),
-        ("FONTNAME", (2,0), (2,-1), "Helvetica-Bold"),
-        ("FONTNAME", (4,0), (4,-1), "Helvetica-Bold"),
-        ("FONTSIZE", (0,0), (-1,-1), 8.5),
-        ("GRID", (0,0), (-1,-1), 0.35, midgrey),
-        ("BOX", (0,0), (-1,-1), 0.9, gold),
-        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-        ("LEFTPADDING", (0,0), (-1,-1), 5),
-        ("RIGHTPADDING", (0,0), (-1,-1), 5),
-        ("TOPPADDING", (0,0), (-1,-1), 5),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 5),
-    ]))
-    story += [dt, Spacer(1, 6*mm)]
+    story.append(Table([overview_cards], colWidths=[36 * mm] * 5,
+                       style=TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                        ("LEFTPADDING", (0, 0), (-1, -1), 1),
+                                        ("RIGHTPADDING", (0, 0), (-1, -1), 1)])))
+    story += [Spacer(1, 5 * mm), section_heading("RATING BASIS")]
 
-    cols = ["Finish", "Horse", "Age", "Weight (kg)", "WFA (lb)", "Effective Weight", "PI", "MR Achieved"]
-    rows = [["Pos", "Horse", "Age", "Wt", "WFA", "Eff Wt", "PI", "MR"]]
+    basis_cards = [
+        info_card("Line Horse", line_horse),
+        info_card("Line MR", int(line_mr)),
+        info_card("WFA Band", band_label),
+        info_card("Method", "1 lb = 0.5 kg"),
+        info_card("Weight Scale", "1 kg = 2 MR"),
+    ]
+    story.append(Table([basis_cards], colWidths=[36 * mm] * 5,
+                       style=TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                        ("LEFTPADDING", (0, 0), (-1, -1), 1),
+                                        ("RIGHTPADDING", (0, 0), (-1, -1), 1)])))
+    story += [Spacer(1, 5 * mm), section_heading("PERFORMANCE RATINGS")]
+
+    rows = [["POS", "HORSE", "AGE", "WT", "WFA", "EFF WT", "PI", "MR"]]
     ordered = ratings_df.sort_values(["MR Achieved", "Finish"], ascending=[False, True]).copy()
     for _, r in ordered.iterrows():
         finish = "-" if pd.isna(r.get("Finish")) else str(int(r.get("Finish")))
         rows.append([
-            finish, str(r.get("Horse", "")), str(int(r.get("Age"))),
-            f"{float(r.get('Weight (kg)')):.1f}", f"{float(r.get('WFA (lb)')):.0f}",
-            f"{float(r.get('Effective Weight')):.1f}", f"{float(r.get('PI')):.2f}",
+            finish,
+            str(r.get("Horse", "")),
+            str(int(r.get("Age"))),
+            f"{float(r.get('Weight (kg)')):.1f}",
+            f"{float(r.get('WFA (lb)')):.0f}",
+            f"{float(r.get('Effective Weight')):.1f}",
+            f"{float(r.get('PI')):.2f}",
             str(int(r.get("MR Achieved"))),
         ])
-    table = Table(rows, repeatRows=1, colWidths=[14*mm, 65*mm, 15*mm, 18*mm, 17*mm, 23*mm, 18*mm, 20*mm])
-    table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), navy),
-        ("TEXTCOLOR", (0,0), (-1,0), gold),
-        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-        ("FONTSIZE", (0,0), (-1,0), 9),
-        ("ALIGN", (0,0), (0,-1), "CENTER"),
-        ("ALIGN", (2,1), (-1,-1), "CENTER"),
-        ("FONTNAME", (1,1), (1,-1), "Helvetica-Bold"),
-        ("FONTNAME", (-1,1), (-1,-1), "Helvetica-Bold"),
-        ("TEXTCOLOR", (-1,1), (-1,-1), navy),
-        ("BACKGROUND", (-1,1), (-1,-1), pale_gold),
-        ("ROWBACKGROUNDS", (0,1), (-2,-1), [colors.white, offwhite]),
-        ("GRID", (0,0), (-1,-1), 0.35, midgrey),
-        ("BOX", (0,0), (-1,-1), 0.9, navy),
-        ("FONTSIZE", (0,1), (-1,-1), 8.5),
-        ("TOPPADDING", (0,0), (-1,-1), 5),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 5),
-        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-    ]))
-    story.append(table)
-    if str(analyst_note).strip():
-        safe_note = str(analyst_note).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br/>")
-        story += [Spacer(1, 5*mm), Paragraph("<b>Analyst Note</b><br/>" + safe_note, note_style)]
 
-    footer = Paragraph("Property of Race Edge Analytics, Kiran Singh", sub_style)
-    story += [Spacer(1, 5*mm), footer]
-    doc.build(story)
+    ratings_table = Table(
+        rows,
+        repeatRows=1,
+        colWidths=[12 * mm, 69 * mm, 13 * mm, 16 * mm, 15 * mm, 20 * mm, 16 * mm, 17 * mm],
+    )
+    ratings_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), navy),
+        ("TEXTCOLOR", (0, 0), (-1, 0), white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, 0), 7.4),
+        ("ALIGN", (0, 0), (0, -1), "CENTER"),
+        ("ALIGN", (2, 1), (-1, -1), "CENTER"),
+        ("FONTNAME", (1, 1), (1, -1), "Helvetica-Bold"),
+        ("FONTNAME", (-1, 1), (-1, -1), "Helvetica-Bold"),
+        ("BACKGROUND", (-1, 1), (-1, -1), pale_gold),
+        ("ROWBACKGROUNDS", (0, 1), (-2, -1), [white, offwhite]),
+        ("GRID", (0, 0), (-1, -1), 0.35, light_grey),
+        ("BOX", (0, 0), (-1, -1), 0.75, navy),
+        ("TEXTCOLOR", (0, 1), (-1, -1), navy),
+        ("FONTSIZE", (0, 1), (-1, -1), 7.4),
+        ("TOPPADDING", (0, 0), (-1, -1), 4.2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4.2),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(ratings_table)
+
+    if str(analyst_note).strip():
+        safe_note = (str(analyst_note).replace("&", "&amp;")
+                     .replace("<", "&lt;").replace(">", "&gt;")
+                     .replace("\n", "<br/>"))
+        story += [Spacer(1, 5 * mm), section_heading("ANALYST NOTE"),
+                  Paragraph(safe_note, note_style)]
+
+    def draw_footer(canvas, document):
+        canvas.saveState()
+        width, _ = A4
+        y = 10 * mm
+        canvas.setStrokeColor(light_grey)
+        canvas.setLineWidth(0.45)
+        canvas.line(15 * mm, y + 5 * mm, width - 15 * mm, y + 5 * mm)
+        canvas.setFillColor(label_grey)
+        canvas.setFont("Helvetica", 6.5)
+        canvas.drawCentredString(width / 2, y,
+                                 "Property of Race Edge Analytics | Prepared by Kiran Singh | © Race Edge Analytics. All Rights Reserved.")
+        canvas.drawRightString(width - 15 * mm, y, f"Page {document.page}")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=draw_footer, onLaterPages=draw_footer)
     return buf.getvalue()
 
 def color_cycle(n):
