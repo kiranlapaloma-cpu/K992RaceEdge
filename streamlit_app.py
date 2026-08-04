@@ -178,13 +178,13 @@ def label_points_neatly(ax, x, y, labels):
 
 # ----------------------- Page config -----------------------
 st.set_page_config(
-    page_title="Race Edge — PI v3.2 + Hidden v2 + Ability v2 + CG + Race Shape + DB",
+    page_title="Race Edge — PI v3.2 + Ratings + Hidden v2 + Ability v2 + CG + Race Shape",
     layout="wide"
 )
 
 # ----------------------- Globals ---------------------------
 DB_DEFAULT_PATH = "race_edge.db"
-APP_VERSION = "3.3"
+APP_VERSION = "3.4"
 
 # ----------------------- Small helpers ---------------------
 def as_num(x):
@@ -217,6 +217,224 @@ def canon_horse(name: str) -> str:
     s = re.sub(r"[^\w\s]", " ", s)
     s = re.sub(r"\s+", " ", s)
     return s
+
+
+# ----------------------- South African WFA scale -----------------------
+# Official chart values are in pounds. Race Edge intentionally uses the
+# analyst's simplified conversion: 1 lb = 0.5 kg. Since 1 kg = 2 MR points,
+# 1 lb of WFA is exactly 1 MR point.
+_WFA_MONTHS = [
+    "August", "September", "October", "November", "December", "January",
+    "February", "March", "April", "May", "June", "July",
+]
+
+_WFA_LB = {
+    "LE1200": {
+        2: [0, 0, 0, 0, 0, 0, 0, 0, 21, 19, 17, 15],
+        3: [14, 13, 11, 10, 8, 7, 6, 5, 4, 3, 2, 1],
+        4: [0] * 12,
+    },
+    "1201_1400": {
+        2: [0, 0, 0, 0, 0, 0, 0, 0, 24, 22, 20, 18],
+        3: [17, 16, 14, 12, 10, 9, 7, 6, 5, 4, 3, 2],
+        4: [1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    },
+    "1401_1600": {
+        2: [0, 0, 0, 0, 0, 0, 0, 0, 25, 23, 21, 19],
+        3: [18, 17, 16, 14, 12, 10, 8, 6, 5, 4, 3, 2],
+        4: [1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    },
+    "1601_2000": {
+        2: [0, 0, 0, 0, 0, 0, 0, 0, 27, 25, 23, 21],
+        3: [20, 19, 18, 16, 14, 12, 10, 9, 7, 5, 4, 3],
+        4: [2, 2, 2, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+    },
+    "2001_2400": {
+        2: [0] * 12,
+        3: [21, 20, 19, 17, 16, 14, 12, 10, 9, 7, 6, 4],
+        4: [3, 3, 3, 2, 2, 2, 1, 1, 1, 0, 0, 0],
+    },
+    "2401_3600": {
+        2: [0] * 12,
+        3: [23, 22, 21, 19, 18, 16, 14, 12, 11, 9, 8, 7],
+        4: [4, 4, 4, 3, 3, 3, 2, 2, 2, 1, 1, 1],
+    },
+}
+
+_WFA_BAND_LABELS = {
+    "LE1200": "<=1200 m",
+    "1201_1400": "1201-1400 m",
+    "1401_1600": "1401-1600 m",
+    "1601_2000": "1601-2000 m",
+    "2001_2400": "2001-2400 m",
+    "2401_3600": "2401-3600 m",
+}
+
+def wfa_distance_band(distance_m: float) -> str:
+    d = float(distance_m)
+    if d <= 1200: return "LE1200"
+    if d <= 1400: return "1201_1400"
+    if d <= 1600: return "1401_1600"
+    if d <= 2000: return "1601_2000"
+    if d <= 2400: return "2001_2400"
+    if d <= 3600: return "2401_3600"
+    raise ValueError("The built-in WFA chart covers races up to 3600 m.")
+
+def get_wfa_lb(race_date, distance_m: float, age: int) -> float:
+    band = wfa_distance_band(distance_m)
+    month_idx = _WFA_MONTHS.index(race_date.strftime("%B"))
+    age = int(age)
+    if age >= 5:
+        return 0.0
+    if age not in (2, 3, 4):
+        raise ValueError(f"Unsupported horse age: {age}")
+    return float(_WFA_LB[band][age][month_idx])
+
+def round_mr(value):
+    try:
+        v = float(value)
+        if not np.isfinite(v):
+            return None
+        return int(math.floor(v + 0.5))
+    except Exception:
+        return None
+
+def build_ratings_handicap(metrics_df: pd.DataFrame, distance_m: float) -> pd.DataFrame:
+    """Build the line-horse frame using the existing PI-to-MR conversion."""
+    if metrics_df is None or "Horse" not in metrics_df.columns or "PI" not in metrics_df.columns:
+        return pd.DataFrame()
+    weight_candidates = ["Horse Weight", "Horse_Weight", "Wt", "Weight", "Weight (kg)"]
+    weight_col = next((c for c in weight_candidates if c in metrics_df.columns), None)
+    out = metrics_df[["Horse", "PI"]].copy()
+    out["Weight (kg)"] = pd.to_numeric(metrics_df[weight_col], errors="coerce") if weight_col else 60.0
+    out["Weight (kg)"] = pd.to_numeric(out["Weight (kg)"], errors="coerce").fillna(60.0)
+    out["PI"] = pd.to_numeric(out["PI"], errors="coerce")
+    if "Finish_Pos" in metrics_df.columns:
+        out["Finish"] = pd.to_numeric(metrics_df["Finish_Pos"], errors="coerce").astype("Int64")
+    else:
+        out["Finish"] = pd.Series([pd.NA] * len(out), dtype="Int64")
+    out = out.dropna(subset=["Horse", "PI"]).reset_index(drop=True)
+    if out.empty:
+        return out
+
+    d = float(distance_m)
+    beta0 = 0.30 if d <= 1200 else 0.35 if d <= 1600 else 0.40 if d <= 2000 else 0.45 if d <= 2400 else 0.50
+    corr_df = out[["Weight (kg)", "PI"]].dropna()
+    corr = corr_df["Weight (kg)"].corr(corr_df["PI"]) if len(corr_df) >= 6 else np.nan
+    n = int(out["PI"].notna().sum())
+    tiny_dampen = 0.0 if n < 6 else min(1.0, (n - 5) / 7.0)
+    corr_mag = 0.0 if not np.isfinite(corr) else abs(float(corr))
+    beta_eff = beta0 * (1.0 + 0.40 * corr_mag * tiny_dampen)
+    rsi = float(metrics_df.attrs.get("RSI", np.nan))
+    sci = float(metrics_df.attrs.get("SCI", np.nan))
+    if np.isfinite(rsi) and np.isfinite(sci) and sci >= 0.5:
+        beta_eff *= 1.10 if rsi < -0.6 else 0.90 if rsi > 0.6 else 1.0
+    beta_eff = float(np.clip(beta_eff, 0.22, 0.70))
+    conversion = {7: 0.68, 8: 0.76, 9: 0.84, 10: 0.90, 11: 0.95}.get(n, 1.0 if n >= 12 else 0.60)
+    pi_median = float(np.nanmedian(out["PI"]))
+    out["Performance MR"] = ((out["PI"] - pi_median) / beta_eff) * conversion * 2.0
+    out["Horse"] = out["Horse"].astype(str)
+    return out[["Horse", "Finish", "Weight (kg)", "PI", "Performance MR"]]
+
+def build_ratings_pdf(ratings_df: pd.DataFrame, *, race_date, track, course, race_no,
+                      distance_m, line_horse, line_mr, band_label, analyst_note="") -> bytes:
+    """Create a premium navy-and-gold Race Edge ratings report."""
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, KeepTogether
+    from reportlab.lib.units import mm
+
+    navy = colors.HexColor("#0B1736")
+    gold = colors.HexColor("#C9A227")
+    pale_gold = colors.HexColor("#F3E8B5")
+    offwhite = colors.HexColor("#F8F6F0")
+    midgrey = colors.HexColor("#D8DCE5")
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=landscape(A4), rightMargin=12*mm, leftMargin=12*mm,
+        topMargin=11*mm, bottomMargin=12*mm,
+        title="Race Edge Ratings Report", author="Race Edge Analytics",
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("RETitle", parent=styles["Title"], fontName="Helvetica-Bold",
+                                 fontSize=22, leading=25, textColor=navy, alignment=TA_CENTER, spaceAfter=4)
+    sub_style = ParagraphStyle("RESub", parent=styles["Normal"], fontName="Helvetica",
+                               fontSize=9.5, leading=12, textColor=navy, alignment=TA_CENTER)
+    body_style = ParagraphStyle("REBody", parent=styles["BodyText"], fontName="Helvetica",
+                                fontSize=9, leading=12, textColor=navy, alignment=TA_LEFT)
+    note_style = ParagraphStyle("RENote", parent=body_style, backColor=offwhite,
+                                borderColor=gold, borderWidth=0.7, borderPadding=7, spaceBefore=7)
+
+    story = [Paragraph("RACE EDGE", title_style),
+             Paragraph("RATINGS REPORT - PERFORMANCE BEYOND POSITION", sub_style), Spacer(1, 5*mm)]
+
+    details = [
+        ["Race Date", race_date.strftime("%d %B %Y"), "Track", str(track), "Course", str(course)],
+        ["Race Number", str(int(race_no)), "Distance", f"{int(distance_m)} m", "WFA Band", str(band_label)],
+        ["Line Horse", str(line_horse), "Line MR", str(int(line_mr)), "Method", "1 lb = 0.5 kg; 1 kg = 2 MR"],
+    ]
+    dt = Table(details, colWidths=[25*mm, 48*mm, 24*mm, 43*mm, 24*mm, 64*mm])
+    dt.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), offwhite),
+        ("TEXTCOLOR", (0,0), (-1,-1), navy),
+        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
+        ("FONTNAME", (0,0), (0,-1), "Helvetica-Bold"),
+        ("FONTNAME", (2,0), (2,-1), "Helvetica-Bold"),
+        ("FONTNAME", (4,0), (4,-1), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,-1), 8.5),
+        ("GRID", (0,0), (-1,-1), 0.35, midgrey),
+        ("BOX", (0,0), (-1,-1), 0.9, gold),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("LEFTPADDING", (0,0), (-1,-1), 5),
+        ("RIGHTPADDING", (0,0), (-1,-1), 5),
+        ("TOPPADDING", (0,0), (-1,-1), 5),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+    ]))
+    story += [dt, Spacer(1, 6*mm)]
+
+    cols = ["Finish", "Horse", "Age", "Weight (kg)", "WFA (lb)", "Effective Weight", "PI", "MR Achieved"]
+    rows = [["Pos", "Horse", "Age", "Wt", "WFA", "Eff Wt", "PI", "MR"]]
+    ordered = ratings_df.sort_values(["MR Achieved", "Finish"], ascending=[False, True]).copy()
+    for _, r in ordered.iterrows():
+        finish = "-" if pd.isna(r.get("Finish")) else str(int(r.get("Finish")))
+        rows.append([
+            finish, str(r.get("Horse", "")), str(int(r.get("Age"))),
+            f"{float(r.get('Weight (kg)')):.1f}", f"{float(r.get('WFA (lb)')):.0f}",
+            f"{float(r.get('Effective Weight')):.1f}", f"{float(r.get('PI')):.2f}",
+            str(int(r.get("MR Achieved"))),
+        ])
+    table = Table(rows, repeatRows=1, colWidths=[14*mm, 65*mm, 15*mm, 18*mm, 17*mm, 23*mm, 18*mm, 20*mm])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), navy),
+        ("TEXTCOLOR", (0,0), (-1,0), gold),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,0), 9),
+        ("ALIGN", (0,0), (0,-1), "CENTER"),
+        ("ALIGN", (2,1), (-1,-1), "CENTER"),
+        ("FONTNAME", (1,1), (1,-1), "Helvetica-Bold"),
+        ("FONTNAME", (-1,1), (-1,-1), "Helvetica-Bold"),
+        ("TEXTCOLOR", (-1,1), (-1,-1), navy),
+        ("BACKGROUND", (-1,1), (-1,-1), pale_gold),
+        ("ROWBACKGROUNDS", (0,1), (-2,-1), [colors.white, offwhite]),
+        ("GRID", (0,0), (-1,-1), 0.35, midgrey),
+        ("BOX", (0,0), (-1,-1), 0.9, navy),
+        ("FONTSIZE", (0,1), (-1,-1), 8.5),
+        ("TOPPADDING", (0,0), (-1,-1), 5),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+    ]))
+    story.append(table)
+    if str(analyst_note).strip():
+        safe_note = str(analyst_note).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br/>")
+        story += [Spacer(1, 5*mm), Paragraph("<b>Analyst Note</b><br/>" + safe_note, note_style)]
+
+    footer = Paragraph("Property of Race Edge Analytics, Kiran Singh", sub_style)
+    story += [Spacer(1, 5*mm), footer]
+    doc.build(story)
+    return buf.getvalue()
 
 def color_cycle(n):
     base = plt.rcParams['axes.prop_cycle'].by_key().get('color', ['C0','C1','C2','C3','C4','C5','C6','C7','C8','C9'])
@@ -607,7 +825,7 @@ with st.sidebar:
 
     APP_VIEW = st.radio(
         "App View",
-        ["Core Metrics", "Pressure Retention", "Pace Curve", "Ability Radar", "Race Plane Analysis", "Advanced Models"],
+        ["Core Metrics", "Ratings Calculator", "Pressure Retention", "Pace Curve", "Ability Radar", "Race Plane Analysis", "Advanced Models"],
         index=0,
     )
 
@@ -1751,6 +1969,103 @@ if SHOW_WARNINGS and (missing_cols or any(v>0 for v in invalid_counts.values()))
     if warn: st.markdown(f"*(⚠ {' • '.join(warn)})*")
 if split_step == 200:
     st.caption("First panel & F-window adapt to odd 200m distances (e.g., 1160→F160, 1450→F250, 1100→F100). Finish is the 200→0 split.")
+
+if _view_is("Ratings Calculator"):
+    st.markdown("## Ratings Calculator")
+    st.caption(
+        "Select a line horse and enter its MR. Race Edge applies the South African WFA scale, "
+        "carried weights and the existing one-run performance conversion automatically."
+    )
+
+    ratings_base = build_ratings_handicap(metrics, race_distance_input)
+    if ratings_base.empty:
+        st.info("Horse, PI and weight data are required before ratings can be calculated.")
+    else:
+        st.markdown("### Race Details")
+        r1, r2, r3, r4 = st.columns(4)
+        with r1:
+            ratings_date = st.date_input("Race Date", value=datetime.now().date(), key="ratings_date")
+        with r2:
+            ratings_track = st.selectbox(
+                "Track", ["Greyville", "Scottsville", "Turffontein", "Vaal", "Fairview", "Kenilworth", "Durbanville"],
+                key="ratings_track"
+            )
+        with r3:
+            ratings_course = st.selectbox(
+                "Course", ["Poly", "Turf", "Inside", "Standside", "Main", "Classic"], index=1,
+                key="ratings_course"
+            )
+        with r4:
+            ratings_race_no = st.number_input("Race Number", min_value=1, max_value=20, value=1, step=1, key="ratings_race_no")
+
+        st.markdown("### Horse Ages")
+        age_frame = ratings_base[["Horse"]].copy()
+        age_frame["Age"] = pd.Series([pd.NA] * len(age_frame), dtype="Int64")
+        age_key = f"ratings_ages_{ratings_date.isoformat()}_{int(ratings_race_no)}_{int(race_distance_input)}"
+        ages = st.data_editor(
+            age_frame, use_container_width=True, hide_index=True, disabled=["Horse"], key=age_key,
+            column_config={"Age": st.column_config.NumberColumn("Age", min_value=2, max_value=15, step=1, required=True)}
+        )
+        ages["Age"] = pd.to_numeric(ages["Age"], errors="coerce")
+        missing_ages = ages.loc[ages["Age"].isna(), "Horse"].astype(str).tolist()
+
+        c1, c2 = st.columns(2)
+        with c1:
+            ratings_line_horse = st.selectbox("Line Horse", ratings_base["Horse"].astype(str).tolist(), key="ratings_line_horse")
+        with c2:
+            ratings_line_mr = st.number_input("Line Horse MR", min_value=0, max_value=200, value=100, step=1, key="ratings_line_mr")
+
+        if missing_ages:
+            preview = ", ".join(missing_ages[:5]) + ("..." if len(missing_ages) > 5 else "")
+            st.warning(f"Enter an age for every horse: {preview}")
+        else:
+            ratings = ratings_base.merge(ages, on="Horse", how="left")
+            ratings["Age"] = ratings["Age"].astype(int)
+            ratings["WFA (lb)"] = ratings["Age"].map(lambda a: get_wfa_lb(ratings_date, race_distance_input, int(a)))
+            ratings["WFA (kg)"] = ratings["WFA (lb)"] * 0.5
+            ratings["Effective Weight"] = ratings["Weight (kg)"] + ratings["WFA (kg)"]
+
+            line = ratings.loc[ratings["Horse"].astype(str) == str(ratings_line_horse)].iloc[0]
+            ratings["Performance Difference"] = ratings["Performance MR"] - float(line["Performance MR"])
+            ratings["Weight + WFA Adjustment"] = 2.0 * (ratings["Effective Weight"] - float(line["Effective Weight"]))
+            ratings["MR Achieved Raw"] = float(ratings_line_mr) + ratings["Performance Difference"] + ratings["Weight + WFA Adjustment"]
+            ratings["MR Achieved"] = ratings["MR Achieved Raw"].map(round_mr).astype("Int64")
+
+            band = wfa_distance_band(race_distance_input)
+            st.info(
+                f"WFA applied: **{ratings_date.strftime('%B')} - {_WFA_BAND_LABELS[band]}**. "
+                f"Line horse: **{ratings_line_horse}**, age **{int(line['Age'])}**, "
+                f"WFA **{float(line['WFA (lb)']):.0f} lb**, line MR **{int(ratings_line_mr)}**."
+            )
+
+            display = ratings[[
+                "Finish", "Horse", "Age", "Weight (kg)", "WFA (lb)", "Effective Weight",
+                "PI", "Performance Difference", "Weight + WFA Adjustment", "MR Achieved"
+            ]].copy()
+            display = display.sort_values(["MR Achieved", "Finish"], ascending=[False, True])
+            for col in ["Weight (kg)", "WFA (lb)", "Effective Weight", "PI", "Performance Difference", "Weight + WFA Adjustment"]:
+                display[col] = pd.to_numeric(display[col], errors="coerce").round(2)
+            display["MR Achieved"] = pd.to_numeric(display["MR Achieved"], errors="coerce").astype("Int64")
+            st.dataframe(display, use_container_width=True, hide_index=True)
+
+            ratings_note = st.text_area(
+                "Analyst Note for PDF (optional)",
+                placeholder="Example: True-run race. Ratings considered reliable.",
+                key="ratings_pdf_note"
+            )
+            pdf_bytes = build_ratings_pdf(
+                ratings,
+                race_date=ratings_date, track=ratings_track, course=ratings_course,
+                race_no=ratings_race_no, distance_m=race_distance_input,
+                line_horse=ratings_line_horse, line_mr=ratings_line_mr,
+                band_label=_WFA_BAND_LABELS[band], analyst_note=ratings_note,
+            )
+            safe_track = re.sub(r"[^A-Za-z0-9_-]+", "_", str(ratings_track)).strip("_") or "Track"
+            pdf_name = f"Race_Edge_Ratings_{ratings_date.isoformat()}_{safe_track}_R{int(ratings_race_no)}.pdf"
+            st.download_button(
+                "Download Ratings PDF", data=pdf_bytes, file_name=pdf_name,
+                mime="application/pdf", use_container_width=True, type="primary"
+            )
 
 if _view_is("Core Metrics"):
     st.markdown("## Sectional Metrics (PI + Core Sectionals + SRI + TOF)")
