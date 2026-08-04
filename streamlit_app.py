@@ -306,6 +306,12 @@ def build_ratings_handicap(metrics_df: pd.DataFrame, distance_m: float) -> pd.Da
     weight_candidates = ["Horse Weight", "Horse_Weight", "Wt", "Weight", "Weight (kg)"]
     weight_col = next((c for c in weight_candidates if c in metrics_df.columns), None)
     out = metrics_df[["Horse", "PI"]].copy()
+    official_mr_candidates = ["Official MR", "Official_MR", "OfficialMR", "MR", "Merit Rating", "Merit_Rating"]
+    official_mr_col = next((c for c in official_mr_candidates if c in metrics_df.columns), None)
+    out["Official MR"] = (
+        pd.to_numeric(metrics_df[official_mr_col], errors="coerce")
+        if official_mr_col else np.nan
+    )
     out["Weight (kg)"] = pd.to_numeric(metrics_df[weight_col], errors="coerce") if weight_col else 60.0
     out["Weight (kg)"] = pd.to_numeric(out["Weight (kg)"], errors="coerce").fillna(60.0)
     out["PI"] = pd.to_numeric(out["PI"], errors="coerce")
@@ -334,7 +340,7 @@ def build_ratings_handicap(metrics_df: pd.DataFrame, distance_m: float) -> pd.Da
     pi_median = float(np.nanmedian(out["PI"]))
     out["Performance MR"] = ((out["PI"] - pi_median) / beta_eff) * conversion * 2.0
     out["Horse"] = out["Horse"].astype(str)
-    return out[["Horse", "Finish", "Weight (kg)", "PI", "Performance MR"]]
+    return out[["Horse", "Finish", "Weight (kg)", "Official MR", "PI", "Performance MR"]]
 
 def build_ratings_pdf(ratings_df: pd.DataFrame, *, race_date, track, course, race_no,
                       distance_m, line_horse, line_mr, band_label, analyst_note="") -> bytes:
@@ -465,10 +471,12 @@ def build_ratings_pdf(ratings_df: pd.DataFrame, *, race_date, track, course, rac
                                         ("RIGHTPADDING", (0, 0), (-1, -1), 1)])))
     story += [Spacer(1, 5 * mm), section_heading("PERFORMANCE RATINGS")]
 
-    rows = [["POS", "HORSE", "AGE", "WT", "WFA", "EFF WT", "PI", "MR"]]
+    rows = [["POS", "HORSE", "AGE", "WT", "WFA", "EFF WT", "PI", "OFF MR", "MR ACH", "EDGE"]]
     ordered = ratings_df.sort_values(["MR Achieved", "Finish"], ascending=[False, True]).copy()
     for _, r in ordered.iterrows():
         finish = "-" if pd.isna(r.get("Finish")) else str(int(r.get("Finish")))
+        official_mr = pd.to_numeric(pd.Series([r.get("Official MR")]), errors="coerce").iloc[0]
+        edge = pd.to_numeric(pd.Series([r.get("Rating Improvement")]), errors="coerce").iloc[0]
         rows.append([
             finish,
             str(r.get("Horse", "")),
@@ -477,36 +485,59 @@ def build_ratings_pdf(ratings_df: pd.DataFrame, *, race_date, track, course, rac
             f"{float(r.get('WFA (lb)')):.0f}",
             f"{float(r.get('Effective Weight')):.1f}",
             f"{float(r.get('PI')):.2f}",
+            "-" if pd.isna(official_mr) else str(int(round_mr(official_mr))),
             str(int(r.get("MR Achieved"))),
+            "-" if pd.isna(edge) else f"{int(edge):+d}",
         ])
 
     ratings_table = Table(
         rows,
         repeatRows=1,
-        colWidths=[12 * mm, 69 * mm, 13 * mm, 16 * mm, 15 * mm, 20 * mm, 16 * mm, 17 * mm],
+        colWidths=[10 * mm, 48 * mm, 11 * mm, 14 * mm, 12 * mm, 17 * mm, 13 * mm, 16 * mm, 17 * mm, 12 * mm],
     )
-    ratings_table.setStyle(TableStyle([
+    table_commands = [
         ("BACKGROUND", (0, 0), (-1, 0), navy),
         ("TEXTCOLOR", (0, 0), (-1, 0), white),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, 0), 7.4),
+        ("FONTSIZE", (0, 0), (-1, 0), 6.8),
         ("ALIGN", (0, 0), (0, -1), "CENTER"),
         ("ALIGN", (2, 1), (-1, -1), "CENTER"),
         ("FONTNAME", (1, 1), (1, -1), "Helvetica-Bold"),
-        ("FONTNAME", (-1, 1), (-1, -1), "Helvetica-Bold"),
-        ("BACKGROUND", (-1, 1), (-1, -1), pale_gold),
-        ("ROWBACKGROUNDS", (0, 1), (-2, -1), [white, offwhite]),
+        ("FONTNAME", (8, 1), (9, -1), "Helvetica-Bold"),
+        ("BACKGROUND", (8, 1), (8, -1), pale_gold),
+        ("ROWBACKGROUNDS", (0, 1), (7, -1), [white, offwhite]),
         ("GRID", (0, 0), (-1, -1), 0.35, light_grey),
         ("BOX", (0, 0), (-1, -1), 0.75, navy),
         ("TEXTCOLOR", (0, 1), (-1, -1), navy),
-        ("FONTSIZE", (0, 1), (-1, -1), 7.4),
-        ("TOPPADDING", (0, 0), (-1, -1), 4.2),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4.2),
-        ("LEFTPADDING", (0, 0), (-1, -1), 3),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+        ("FONTSIZE", (0, 1), (-1, -1), 6.9),
+        ("TOPPADDING", (0, 0), (-1, -1), 4.0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4.0),
+        ("LEFTPADDING", (0, 0), (-1, -1), 2),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 2),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-    ]))
+    ]
+    for pdf_row, (_, r) in enumerate(ordered.iterrows(), start=1):
+        edge = pd.to_numeric(pd.Series([r.get("Rating Improvement")]), errors="coerce").iloc[0]
+        if pd.notna(edge) and float(edge) >= 4.0:
+            table_commands.extend([
+                ("BACKGROUND", (0, pdf_row), (-1, pdf_row), colors.HexColor("#F4E8B4")),
+                ("BOX", (0, pdf_row), (-1, pdf_row), 0.8, gold),
+                ("FONTNAME", (1, pdf_row), (-1, pdf_row), "Helvetica-Bold"),
+            ])
+    ratings_table.setStyle(TableStyle(table_commands))
     story.append(ratings_table)
+
+    ahead = ordered[pd.to_numeric(ordered.get("Rating Improvement"), errors="coerce") >= 4].copy()
+    if not ahead.empty:
+        story += [Spacer(1, 4 * mm), section_heading("AHEAD OF THE HANDICAP")]
+        ahead_lines = []
+        for _, r in ahead.sort_values("Rating Improvement", ascending=False).iterrows():
+            edge = int(r["Rating Improvement"])
+            ahead_lines.append(
+                f"<b>{str(r['Horse'])}</b> achieved MR {int(r['MR Achieved'])}, "
+                f"which is {edge} point{'s' if edge != 1 else ''} above its official MR {int(round_mr(r['Official MR']))}."
+            )
+        story.append(Paragraph("<br/>".join(ahead_lines), note_style))
 
     if str(analyst_note).strip():
         safe_note = (str(analyst_note).replace("&", "&amp;")
@@ -1110,64 +1141,10 @@ except Exception as e:
     st.exception(e)
     st.stop()
 
-def _first_present_value(df: pd.DataFrame, candidates, default=None):
-    """Return the first non-empty value found in any candidate column."""
-    for col in candidates:
-        if col in df.columns:
-            vals = df[col].dropna()
-            for value in vals.tolist():
-                if str(value).strip() not in ("", "nan", "None"):
-                    return value
-    return default
-
-
-def _parse_race_date(value, default):
-    if value is None:
-        return default
-    parsed = pd.to_datetime(value, errors="coerce", dayfirst=False)
-    return parsed.date() if pd.notna(parsed) else default
-
-
-# Enriched CSV metadata is optional. Legacy files continue to use manual fallbacks.
-_csv_race_date = _parse_race_date(
-    _first_present_value(work, ["Race Date", "Race_Date", "Date"]),
-    datetime.now().date(),
-)
-_csv_track = str(_first_present_value(work, ["Track", "Racecourse", "Venue"], "")).strip()
-_csv_course = str(_first_present_value(work, ["Course"], "")).strip()
-_csv_surface = str(_first_present_value(work, ["Surface"], "")).strip()
-_csv_going = str(_first_present_value(work, ["Going", "Condition"], "")).strip()
-_csv_race_no_raw = pd.to_numeric(
-    pd.Series([_first_present_value(work, ["Race Number", "Race_Number", "Race No", "Race_No"])]),
-    errors="coerce",
-).iloc[0]
-_csv_race_no = int(_csv_race_no_raw) if pd.notna(_csv_race_no_raw) else 1
-_csv_distance_raw = pd.to_numeric(
-    pd.Series([_first_present_value(work, ["Distance", "Distance (m)", "Race Distance"])]),
-    errors="coerce",
-).iloc[0]
-if pd.notna(_csv_distance_raw) and float(_csv_distance_raw) > 0:
-    race_distance_input = int(round(float(_csv_distance_raw)))
-
 split_step = detect_step(work)
 st.markdown(f"**Detected split step:** {split_step} m")
-if pd.notna(_csv_distance_raw):
-    st.caption(f"Race distance imported from CSV: {int(race_distance_input)} m")
-
 if alias_notes and SHOW_WARNINGS:
     st.info("Header aliases applied: " + "; ".join(alias_notes))
-
-_imported_bits = []
-if _csv_track: _imported_bits.append(_csv_track)
-if _csv_course: _imported_bits.append(_csv_course)
-if _csv_surface and _csv_surface != _csv_course: _imported_bits.append(_csv_surface)
-if _csv_going: _imported_bits.append(_csv_going)
-if _csv_race_no: _imported_bits.append(f"Race {_csv_race_no}")
-if pd.notna(_csv_distance_raw): _imported_bits.append(f"{int(race_distance_input)}m")
-if _first_present_value(work, ["Race Date", "Race_Date", "Date"]) is not None:
-    _imported_bits.append(_csv_race_date.strftime("%d %b %Y"))
-if _imported_bits:
-    st.success("CSV metadata detected: " + " | ".join(_imported_bits))
 
 # ----------------------- Integrity helpers (odds-aware) -------------------
 def expected_segments_from_df(df: pd.DataFrame) -> list[str]:
@@ -2134,30 +2111,23 @@ if _view_is("Ratings Calculator"):
         st.markdown("### Race Details")
         r1, r2, r3, r4 = st.columns(4)
         with r1:
-            ratings_date = st.date_input("Race Date", value=_csv_race_date, key="ratings_date")
+            ratings_date = st.date_input("Race Date", value=datetime.now().date(), key="ratings_date")
         with r2:
-            _track_options = ["Greyville", "Scottsville", "Turffontein", "Vaal", "Fairview", "Kenilworth", "Durbanville"]
-            _track_index = _track_options.index(_csv_track) if _csv_track in _track_options else 0
-            ratings_track = st.selectbox("Track", _track_options, index=_track_index, key="ratings_track")
+            ratings_track = st.selectbox(
+                "Track", ["Greyville", "Scottsville", "Turffontein", "Vaal", "Fairview", "Kenilworth", "Durbanville"],
+                key="ratings_track"
+            )
         with r3:
-            _course_options = ["Poly", "Turf", "Inside", "Standside", "Main", "Classic"]
-            _course_hint = _csv_course or _csv_surface
-            _course_index = _course_options.index(_course_hint) if _course_hint in _course_options else 1
-            ratings_course = st.selectbox("Course", _course_options, index=_course_index, key="ratings_course")
+            ratings_course = st.selectbox(
+                "Course", ["Poly", "Turf", "Inside", "Standside", "Main", "Classic"], index=1,
+                key="ratings_course"
+            )
         with r4:
-            ratings_race_no = st.number_input("Race Number", min_value=1, max_value=20, value=int(_csv_race_no), step=1, key="ratings_race_no")
+            ratings_race_no = st.number_input("Race Number", min_value=1, max_value=20, value=1, step=1, key="ratings_race_no")
 
         st.markdown("### Horse Ages")
         age_frame = ratings_base[["Horse"]].copy()
-        if "Age" in work.columns and "Horse" in work.columns:
-            _age_lookup = work[["Horse", "Age"]].copy()
-            _age_lookup["Horse Key"] = _age_lookup["Horse"].astype(str).map(canon_horse)
-            _age_lookup["Age"] = pd.to_numeric(_age_lookup["Age"], errors="coerce")
-            _age_map = _age_lookup.drop_duplicates("Horse Key").set_index("Horse Key")["Age"].to_dict()
-            age_frame["Age"] = age_frame["Horse"].astype(str).map(lambda h: _age_map.get(canon_horse(h), pd.NA))
-            age_frame["Age"] = pd.Series(age_frame["Age"], dtype="Int64")
-        else:
-            age_frame["Age"] = pd.Series([pd.NA] * len(age_frame), dtype="Int64")
+        age_frame["Age"] = pd.Series([pd.NA] * len(age_frame), dtype="Int64")
         age_key = f"ratings_ages_{ratings_date.isoformat()}_{int(ratings_race_no)}_{int(race_distance_input)}"
         ages = st.data_editor(
             age_frame, use_container_width=True, hide_index=True, disabled=["Horse"], key=age_key,
@@ -2169,19 +2139,8 @@ if _view_is("Ratings Calculator"):
         c1, c2 = st.columns(2)
         with c1:
             ratings_line_horse = st.selectbox("Line Horse", ratings_base["Horse"].astype(str).tolist(), key="ratings_line_horse")
-        _official_mr_default = 100
-        if "Official MR" in work.columns and "Horse" in work.columns:
-            _mr_lookup = work[["Horse", "Official MR"]].copy()
-            _mr_lookup["Horse Key"] = _mr_lookup["Horse"].astype(str).map(canon_horse)
-            _mr_lookup["Official MR"] = pd.to_numeric(_mr_lookup["Official MR"], errors="coerce")
-            _mr_match = _mr_lookup.loc[_mr_lookup["Horse Key"] == canon_horse(ratings_line_horse), "Official MR"].dropna()
-            if len(_mr_match):
-                _official_mr_default = int(round(float(_mr_match.iloc[0])))
         with c2:
-            ratings_line_mr = st.number_input(
-                "Line Horse MR", min_value=0, max_value=200, value=int(_official_mr_default), step=1,
-                key=f"ratings_line_mr_{canon_horse(ratings_line_horse)}"
-            )
+            ratings_line_mr = st.number_input("Line Horse MR", min_value=0, max_value=200, value=100, step=1, key="ratings_line_mr")
 
         if missing_ages:
             preview = ", ".join(missing_ages[:5]) + ("..." if len(missing_ages) > 5 else "")
@@ -2198,6 +2157,13 @@ if _view_is("Ratings Calculator"):
             ratings["Weight + WFA Adjustment"] = 2.0 * (ratings["Effective Weight"] - float(line["Effective Weight"]))
             ratings["MR Achieved Raw"] = float(ratings_line_mr) + ratings["Performance Difference"] + ratings["Weight + WFA Adjustment"]
             ratings["MR Achieved"] = ratings["MR Achieved Raw"].map(round_mr).astype("Int64")
+            ratings["Official MR"] = pd.to_numeric(ratings.get("Official MR"), errors="coerce").map(
+                lambda x: round_mr(x) if pd.notna(x) else pd.NA
+            ).astype("Int64")
+            ratings["Rating Improvement"] = (
+                pd.to_numeric(ratings["MR Achieved"], errors="coerce")
+                - pd.to_numeric(ratings["Official MR"], errors="coerce")
+            ).astype("Int64")
 
             band = wfa_distance_band(race_distance_input)
             st.info(
@@ -2208,13 +2174,29 @@ if _view_is("Ratings Calculator"):
 
             display = ratings[[
                 "Finish", "Horse", "Age", "Weight (kg)", "WFA (lb)", "Effective Weight",
-                "PI", "Performance Difference", "Weight + WFA Adjustment", "MR Achieved"
+                "PI", "Performance Difference", "Weight + WFA Adjustment",
+                "Official MR", "MR Achieved", "Rating Improvement"
             ]].copy()
             display = display.sort_values(["MR Achieved", "Finish"], ascending=[False, True])
             for col in ["Weight (kg)", "WFA (lb)", "Effective Weight", "PI", "Performance Difference", "Weight + WFA Adjustment"]:
                 display[col] = pd.to_numeric(display[col], errors="coerce").round(2)
+            display["Official MR"] = pd.to_numeric(display["Official MR"], errors="coerce").astype("Int64")
             display["MR Achieved"] = pd.to_numeric(display["MR Achieved"], errors="coerce").astype("Int64")
-            st.dataframe(display, use_container_width=True, hide_index=True)
+            display["Rating Improvement"] = pd.to_numeric(display["Rating Improvement"], errors="coerce").astype("Int64")
+
+            def _highlight_rating_edge(row):
+                edge = pd.to_numeric(pd.Series([row.get("Rating Improvement")]), errors="coerce").iloc[0]
+                if pd.notna(edge) and float(edge) >= 4.0:
+                    return ["background-color: #F4E8B4; color: #0B1736; font-weight: 700"] * len(row)
+                return [""] * len(row)
+
+            styled_display = (
+                display.style
+                .apply(_highlight_rating_edge, axis=1)
+                .format({"Rating Improvement": lambda x: "-" if pd.isna(x) else f"{int(x):+d}"})
+            )
+            st.dataframe(styled_display, use_container_width=True, hide_index=True)
+            st.caption("Gold rows indicate horses that achieved at least 4 MR points above their official merit rating.")
 
             ratings_note = st.text_area(
                 "Analyst Note for PDF (optional)",
