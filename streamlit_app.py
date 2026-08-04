@@ -1141,10 +1141,64 @@ except Exception as e:
     st.exception(e)
     st.stop()
 
+def _first_present_value(df: pd.DataFrame, candidates, default=None):
+    """Return the first non-empty value found in any candidate column."""
+    for col in candidates:
+        if col in df.columns:
+            vals = df[col].dropna()
+            for value in vals.tolist():
+                if str(value).strip() not in ("", "nan", "None"):
+                    return value
+    return default
+
+
+def _parse_race_date(value, default):
+    if value is None:
+        return default
+    parsed = pd.to_datetime(value, errors="coerce", dayfirst=False)
+    return parsed.date() if pd.notna(parsed) else default
+
+
+# Enriched CSV metadata is optional. Legacy files continue to use manual fallbacks.
+_csv_race_date = _parse_race_date(
+    _first_present_value(work, ["Race Date", "Race_Date", "Date"]),
+    datetime.now().date(),
+)
+_csv_track = str(_first_present_value(work, ["Track", "Racecourse", "Venue"], "")).strip()
+_csv_course = str(_first_present_value(work, ["Course"], "")).strip()
+_csv_surface = str(_first_present_value(work, ["Surface"], "")).strip()
+_csv_going = str(_first_present_value(work, ["Going", "Condition"], "")).strip()
+_csv_race_no_raw = pd.to_numeric(
+    pd.Series([_first_present_value(work, ["Race Number", "Race_Number", "Race No", "Race_No"])]),
+    errors="coerce",
+).iloc[0]
+_csv_race_no = int(_csv_race_no_raw) if pd.notna(_csv_race_no_raw) else 1
+_csv_distance_raw = pd.to_numeric(
+    pd.Series([_first_present_value(work, ["Distance", "Distance (m)", "Race Distance"])]),
+    errors="coerce",
+).iloc[0]
+if pd.notna(_csv_distance_raw) and float(_csv_distance_raw) > 0:
+    race_distance_input = int(round(float(_csv_distance_raw)))
+
 split_step = detect_step(work)
 st.markdown(f"**Detected split step:** {split_step} m")
+if pd.notna(_csv_distance_raw):
+    st.caption(f"Race distance imported from CSV: {int(race_distance_input)} m")
+
 if alias_notes and SHOW_WARNINGS:
     st.info("Header aliases applied: " + "; ".join(alias_notes))
+
+_imported_bits = []
+if _csv_track: _imported_bits.append(_csv_track)
+if _csv_course: _imported_bits.append(_csv_course)
+if _csv_surface and _csv_surface != _csv_course: _imported_bits.append(_csv_surface)
+if _csv_going: _imported_bits.append(_csv_going)
+if _csv_race_no: _imported_bits.append(f"Race {_csv_race_no}")
+if pd.notna(_csv_distance_raw): _imported_bits.append(f"{int(race_distance_input)}m")
+if _first_present_value(work, ["Race Date", "Race_Date", "Date"]) is not None:
+    _imported_bits.append(_csv_race_date.strftime("%d %b %Y"))
+if _imported_bits:
+    st.success("CSV metadata detected: " + " | ".join(_imported_bits))
 
 # ----------------------- Integrity helpers (odds-aware) -------------------
 def expected_segments_from_df(df: pd.DataFrame) -> list[str]:
@@ -2111,23 +2165,30 @@ if _view_is("Ratings Calculator"):
         st.markdown("### Race Details")
         r1, r2, r3, r4 = st.columns(4)
         with r1:
-            ratings_date = st.date_input("Race Date", value=datetime.now().date(), key="ratings_date")
+            ratings_date = st.date_input("Race Date", value=_csv_race_date, key="ratings_date")
         with r2:
-            ratings_track = st.selectbox(
-                "Track", ["Greyville", "Scottsville", "Turffontein", "Vaal", "Fairview", "Kenilworth", "Durbanville"],
-                key="ratings_track"
-            )
+            _track_options = ["Greyville", "Scottsville", "Turffontein", "Vaal", "Fairview", "Kenilworth", "Durbanville"]
+            _track_index = _track_options.index(_csv_track) if _csv_track in _track_options else 0
+            ratings_track = st.selectbox("Track", _track_options, index=_track_index, key="ratings_track")
         with r3:
-            ratings_course = st.selectbox(
-                "Course", ["Poly", "Turf", "Inside", "Standside", "Main", "Classic"], index=1,
-                key="ratings_course"
-            )
+            _course_options = ["Poly", "Turf", "Inside", "Standside", "Main", "Classic"]
+            _course_hint = _csv_course or _csv_surface
+            _course_index = _course_options.index(_course_hint) if _course_hint in _course_options else 1
+            ratings_course = st.selectbox("Course", _course_options, index=_course_index, key="ratings_course")
         with r4:
-            ratings_race_no = st.number_input("Race Number", min_value=1, max_value=20, value=1, step=1, key="ratings_race_no")
+            ratings_race_no = st.number_input("Race Number", min_value=1, max_value=20, value=int(_csv_race_no), step=1, key="ratings_race_no")
 
         st.markdown("### Horse Ages")
         age_frame = ratings_base[["Horse"]].copy()
-        age_frame["Age"] = pd.Series([pd.NA] * len(age_frame), dtype="Int64")
+        if "Age" in work.columns and "Horse" in work.columns:
+            _age_lookup = work[["Horse", "Age"]].copy()
+            _age_lookup["Horse Key"] = _age_lookup["Horse"].astype(str).map(canon_horse)
+            _age_lookup["Age"] = pd.to_numeric(_age_lookup["Age"], errors="coerce")
+            _age_map = _age_lookup.drop_duplicates("Horse Key").set_index("Horse Key")["Age"].to_dict()
+            age_frame["Age"] = age_frame["Horse"].astype(str).map(lambda h: _age_map.get(canon_horse(h), pd.NA))
+            age_frame["Age"] = pd.Series(age_frame["Age"], dtype="Int64")
+        else:
+            age_frame["Age"] = pd.Series([pd.NA] * len(age_frame), dtype="Int64")
         age_key = f"ratings_ages_{ratings_date.isoformat()}_{int(ratings_race_no)}_{int(race_distance_input)}"
         ages = st.data_editor(
             age_frame, use_container_width=True, hide_index=True, disabled=["Horse"], key=age_key,
@@ -2139,8 +2200,19 @@ if _view_is("Ratings Calculator"):
         c1, c2 = st.columns(2)
         with c1:
             ratings_line_horse = st.selectbox("Line Horse", ratings_base["Horse"].astype(str).tolist(), key="ratings_line_horse")
+        _official_mr_default = 100
+        if "Official MR" in work.columns and "Horse" in work.columns:
+            _mr_lookup = work[["Horse", "Official MR"]].copy()
+            _mr_lookup["Horse Key"] = _mr_lookup["Horse"].astype(str).map(canon_horse)
+            _mr_lookup["Official MR"] = pd.to_numeric(_mr_lookup["Official MR"], errors="coerce")
+            _mr_match = _mr_lookup.loc[_mr_lookup["Horse Key"] == canon_horse(ratings_line_horse), "Official MR"].dropna()
+            if len(_mr_match):
+                _official_mr_default = int(round(float(_mr_match.iloc[0])))
         with c2:
-            ratings_line_mr = st.number_input("Line Horse MR", min_value=0, max_value=200, value=100, step=1, key="ratings_line_mr")
+            ratings_line_mr = st.number_input(
+                "Line Horse MR", min_value=0, max_value=200, value=int(_official_mr_default), step=1,
+                key=f"ratings_line_mr_{canon_horse(ratings_line_horse)}"
+            )
 
         if missing_ages:
             preview = ", ".join(missing_ages[:5]) + ("..." if len(missing_ages) > 5 else "")
