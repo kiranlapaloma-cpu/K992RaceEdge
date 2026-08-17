@@ -13,15 +13,15 @@ import matplotlib.patheffects as pe
 
 
 # ======================= Modular Race Edge components =======================
-from race_edge.common import canon_horse
-from race_edge.wfa import _WFA_BAND_LABELS, get_wfa_lb, wfa_distance_band
-from race_edge.database import (
+from common import canon_horse
+from wfa import _WFA_BAND_LABELS, get_wfa_lb, wfa_distance_band
+from database import (
     _supabase_configured, get_supabase_client, _db_num, _db_round_mr,
     database_sustain_verdict, load_saved_horses, load_horse_history,
     save_horse_runs, load_rating_improver_runs, render_rating_improvers,
     render_horse_search, render_horse_compare,
 )
-from race_edge.race_card import render_race_card
+from race_card import render_race_card
 
 # ======================= Global NaN/Inf → None guard (JSON-safe, index-safe) =======================
 
