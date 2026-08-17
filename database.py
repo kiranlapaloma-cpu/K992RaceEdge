@@ -9,6 +9,8 @@ except Exception:
     create_client = None
     Client = object
 from common import canon_horse
+from performance import compute_race_test_profile
+from data_tools import _horse_metadata_frame
 
 def _supabase_configured() -> bool:
     try:
@@ -723,3 +725,123 @@ def render_horse_compare():
         st.dataframe(head_rows, width="stretch", hide_index=True)
 
 
+
+
+# ---------------- Database calculation helpers ----------------
+
+def build_database_plane(metrics_df: pd.DataFrame, rpss_info=None):
+    """Reproduce the default centred Race Plane solely for database capture."""
+    required = ["Horse", "tsSPI", "Accel", "Grind"]
+    if metrics_df is None or any(c not in metrics_df.columns for c in required):
+        return pd.DataFrame(), {"label": "Inconclusive race test"}
+    df = metrics_df[required].copy()
+    for c in ["tsSPI", "Accel", "Grind"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["Horse", "tsSPI", "Accel", "Grind"]).reset_index(drop=True)
+    if len(df) < 4:
+        return pd.DataFrame(), {"label": "Inconclusive race test"}
+    x = (df["tsSPI"] - 100.0).to_numpy(float)
+    y = (df["Accel"] - 100.0).to_numpy(float)
+    z = (df["Grind"] - 100.0).to_numpy(float)
+    X = np.column_stack([np.ones(len(df)), x, y])
+    coef, *_ = np.linalg.lstsq(X, z, rcond=None)
+    expected = X @ coef
+    df["Expected_Grind"] = 100.0 + expected
+    df["Sustain_Residual"] = df["Grind"] - df["Expected_Grind"]
+    df["Sustain_Verdict"] = df["Sustain_Residual"].map(database_sustain_verdict)
+    try:
+        profile = compute_race_test_profile(metrics_df, rpss_info, "Grind")
+    except Exception:
+        profile = {"label": "Inconclusive race test"}
+    return df, profile
+
+def build_database_phase_notes(metrics_df: pd.DataFrame) -> pd.DataFrame:
+    """Build the compact, editable F | T | A | CG note prefix for each horse."""
+    if metrics_df is None or "Horse" not in metrics_df.columns:
+        return pd.DataFrame(columns=["Horse", "Phase Note"])
+
+    front_candidates = ["F200_idx", "F200", "F200_Index", "F200 index"]
+    cg_candidates = ["Grind_CG", "Corrected_Grind", "Corrected Grind"]
+    front_col = next((c for c in front_candidates if c in metrics_df.columns), None)
+    cg_col = next((c for c in cg_candidates if c in metrics_df.columns), None)
+
+    needed = ["Horse"] + [c for c in [front_col, "tsSPI", "Accel", cg_col] if c is not None]
+    out = metrics_df[needed].copy()
+
+    def fmt(v):
+        v = _db_num(v)
+        return "—" if v is None else f"{v:.1f}"
+
+    out["Phase Note"] = out.apply(
+        lambda r: (
+            f"F {fmt(r.get(front_col))} | "
+            f"T {fmt(r.get('tsSPI'))} | "
+            f"A {fmt(r.get('Accel'))} | "
+            f"CG {fmt(r.get(cg_col))}"
+        ),
+        axis=1,
+    )
+    return out[["Horse", "Phase Note"]]
+
+def build_database_handicap(metrics_df: pd.DataFrame, distance_m: float, source_df: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Create the line-horse rating frame using the existing PI conversion and 1 kg = 2 MR points."""
+    if metrics_df is None or "Horse" not in metrics_df.columns or "PI" not in metrics_df.columns:
+        return pd.DataFrame()
+
+    weight_candidates = ["Horse Weight", "Horse_Weight", "Wt", "Weight", "Weight (kg)"]
+    weight_col = next((c for c in weight_candidates if c in metrics_df.columns), None)
+
+    out = metrics_df[["Horse", "PI"]].copy()
+    if weight_col is not None:
+        out["Weight (kg)"] = pd.to_numeric(metrics_df[weight_col], errors="coerce")
+    elif source_df is not None and isinstance(source_df, pd.DataFrame) and "Horse" in source_df.columns:
+        _source_meta = _horse_metadata_frame(source_df)
+        _weights = _source_meta[["Horse Key", "Horse Weight"]].drop_duplicates("Horse Key")
+        out["Horse Key"] = out["Horse"].map(canon_horse)
+        out = out.merge(_weights, on="Horse Key", how="left")
+        out["Weight (kg)"] = pd.to_numeric(out["Horse Weight"], errors="coerce")
+        out = out.drop(columns=[c for c in ["Horse Key", "Horse Weight"] if c in out.columns])
+    else:
+        out["Weight (kg)"] = 60.0
+    out["Weight (kg)"] = pd.to_numeric(out["Weight (kg)"], errors="coerce").fillna(60.0)
+    out["PI"] = pd.to_numeric(out["PI"], errors="coerce")
+    out = out.dropna(subset=["Horse", "PI"]).reset_index(drop=True)
+    if out.empty:
+        return out
+
+    d = float(distance_m)
+    if d <= 1200:
+        beta0 = 0.30
+    elif d <= 1600:
+        beta0 = 0.35
+    elif d <= 2000:
+        beta0 = 0.40
+    elif d <= 2400:
+        beta0 = 0.45
+    else:
+        beta0 = 0.50
+
+    corr_df = out[["Weight (kg)", "PI"]].dropna()
+    corr = corr_df["Weight (kg)"].corr(corr_df["PI"]) if len(corr_df) >= 6 else np.nan
+    field_size = int(out["PI"].notna().sum())
+    tiny_dampen = 0.0 if field_size < 6 else min(1.0, (field_size - 5) / 7.0)
+    corr_mag = 0.0 if not np.isfinite(corr) else abs(float(corr))
+    beta_eff = beta0 * (1.0 + 0.40 * corr_mag * tiny_dampen)
+
+    rsi = float(metrics_df.attrs.get("RSI", np.nan))
+    sci = float(metrics_df.attrs.get("SCI", np.nan))
+    if np.isfinite(rsi) and np.isfinite(sci) and sci >= 0.5:
+        if rsi < -0.6:
+            beta_eff *= 1.10
+        elif rsi > 0.6:
+            beta_eff *= 0.90
+    beta_eff = float(np.clip(beta_eff, 0.22, 0.70))
+
+    conversion_factor = {
+        7: 0.68, 8: 0.76, 9: 0.84, 10: 0.90, 11: 0.95,
+    }.get(field_size, 1.00 if field_size >= 12 else 0.60)
+
+    pi_median = float(np.nanmedian(out["PI"]))
+    out["Performance MR"] = ((out["PI"] - pi_median) / beta_eff) * conversion_factor * 2.0
+    out["Horse"] = out["Horse"].astype(str)
+    return out[["Horse", "Weight (kg)", "PI", "Performance MR"]]
