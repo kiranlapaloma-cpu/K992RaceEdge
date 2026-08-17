@@ -260,7 +260,13 @@ def build_metrics_and_shape(df_in: pd.DataFrame,
                             use_cg: bool,
                             dampen_cg: bool,
                             use_race_shape: bool,
-                            debug: bool):
+                            debug: bool,
+                            going_type: str = "Good"):
+    """Build Race Edge metrics and race-shape outputs.
+
+    ``going_type`` is passed explicitly by the Streamlit controller so the
+    modular engine no longer relies on a global variable from streamlit_app.py.
+    """
     w = df_in.copy()
     seg_markers = _collect_markers(w)
     D = float(D_actual_m); step = int(step)
