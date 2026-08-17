@@ -4,7 +4,6 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm
-from metrics_engine import _adaptive_tssp_start, _make_range_cols
 
 DISTANCE_STD_100M = {
     1000: 5.13,
@@ -27,6 +26,33 @@ DISTANCE_STD_100M = {
     3200: 6.50,
 }
 
+
+
+
+def _make_range_cols(D, start_incl, end_incl, step):
+    """Return sectional time-column names from start marker down to end marker."""
+    if start_incl < end_incl:
+        return []
+    want = list(range(int(start_incl), int(end_incl) - 1, -int(step)))
+    return [f"{m}_Time" for m in want]
+
+
+def _adaptive_tssp_start(D, step, markers):
+    """Return the first sectional marker after the opening block.
+
+    Mirrors the metrics engine logic, including odd-distance 200 m races such as
+    1160 m where the actual uploaded markers must be used.
+    """
+    D = float(D)
+    step = int(step)
+    if step == 100:
+        return int(D - (150 if int(D) % 100 == 50 else 300))
+    if not markers:
+        return int(D - 400)
+    ordered = sorted({int(m) for m in markers}, reverse=True)
+    if len(ordered) >= 2:
+        return ordered[1]
+    return ordered[0]
 
 def mad_std(x):
     x = np.asarray(x, dtype=float)
