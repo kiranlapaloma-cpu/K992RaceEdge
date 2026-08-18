@@ -44,172 +44,172 @@ def render_core_metrics(ctx):
             n = int(pi_meta.get("field_n", len(display_df)))
             mult = pi_meta.get("multipliers", {})
             # Compact summary (only show components that actually moved)
-            moved = [f"{k}×{mult[k]:.3f}" for k in ["Accel","F200_idx","tsSPI","Grind"] if abs(mult.get(k,1.0)-1.0) >= 0.005]
+            moved = [f"{k}Ã{mult[k]:.3f}" for k in ["Accel","F200_idx","tsSPI","Grind"] if abs(mult.get(k,1.0)-1.0) >= 0.005]
             if moved:
-                st.caption(f"Going: {g} — PI weight multipliers: " + ", ".join(moved) + f" (field={n}).")
+                st.caption(f"Going: {g} â PI weight multipliers: " + ", ".join(moved) + f" (field={n}).")
 
         render_rpss_section(RPSS_INFO)
 
         # GCI-based Race Class Summary removed.
 
-        # ======================= Ahead of the Handicap — One-Run Weight Intelligence =======================
-        st.markdown("## Ahead of the Handicap — One-Run (Race-local)")
+        # ======================= Ahead of the Handicap â WFA Adjusted =======================
+        st.markdown("## Ahead of the Handicap â WFA Adjusted")
+        st.caption(
+            "Select a line horse and assign its achieved MR. Race Edge uses each horse's age, "
+            "the race date and distance, and the South African WFA scale to calculate the rest of the field. "
+            "**1 lb = 0.5 kg** and **1 kg = 2 MR points**."
+        )
 
-        # ---- Safe helpers (local, conflict-free) ----
-        def _as_num(s):
-            return pd.to_numeric(s, errors="coerce")
-
-        def _field_corr(x, y):
-            x = _as_num(x); y = _as_num(y)
-            df = pd.DataFrame({"x": x, "y": y}).dropna()
-            if len(df) < 6:  # tiny fields → correlation not reliable
-                return np.nan
-            c = df["x"].corr(df["y"])
-            try:
-                return float(c) if np.isfinite(c) else np.nan
-            except Exception:
-                return np.nan
-
-        def _beta_base(distance_m: float) -> float:
-            """Baseline PI-per-kg by trip; conservative, race-agnostic."""
-            d = float(distance_m)
-            if d <= 1200: return 0.30
-            if d <= 1600: return 0.35
-            if d <= 2000: return 0.40
-            if d <= 2400: return 0.45
-            return 0.50
-
-        def _shape_adjust(beta: float, rsi: float, sci: float) -> float:
-            """Light-touch modulation by race shape (one-run safe)."""
-            if np.isfinite(rsi) and np.isfinite(sci) and sci >= 0.5:
-                if rsi < -0.6:  # fast-early
-                    beta *= 1.10
-                elif rsi > 0.6: # slow-early
-                    beta *= 0.90
-            return beta
-
-        # ---- Inputs / guards ----
-        # ---------------- Safe Horse Weight Resolver ----------------
-        weight_col_candidates = ["Horse Weight", "Horse_Weight", "Wt", "Weight", "Weight (kg)"]
-        weight_col = next((c for c in weight_col_candidates if c in metrics.columns), None)
-
-        # if still missing, create it directly before loc[]
-        if weight_col is None:
-            st.warning("No weight column found — assigning 60 kg baseline for all horses.")
-            metrics["Horse Weight"] = 60.0
-            weight_col = "Horse Weight"
+        handicap_df = build_database_handicap(metrics, race_distance_input, work)
+        if handicap_df.empty:
+            st.info("Horse, PI and weight data are required before ratings can be calculated.")
         else:
-            metrics["Horse Weight"] = pd.to_numeric(metrics[weight_col], errors="coerce").fillna(60.0)
-            weight_col = "Horse Weight"  # standardize name
-        # ------------------------------------------------------------
+            # Race date is read from the CSV metadata so the correct monthly WFA scale is used.
+            _race_meta_source = work if isinstance(work, pd.DataFrame) else metrics
+            _csv_date_raw = _first_present_value(_race_meta_source, ["Race Date", "Date", "Race_Date"])
+            _race_date = _parse_race_date_value(_csv_date_raw, datetime.now().date())
 
-        # now this will never KeyError
-        df = metrics.loc[:, ["Horse", "PI", weight_col]].copy()
-
-        need_cols = {"Horse", "PI"}
-        if weight_col: need_cols.add(weight_col)
-        missing = [c for c in need_cols if c not in metrics.columns]
-
-        if missing:
-            st.warning("Ahead of the Handicap: missing columns → " + ", ".join(missing))
-        else:
-            df = metrics.loc[:, ["Horse", "PI", weight_col]].copy()
-            df["PI"] = _as_num(df["PI"])
-            df[weight_col] = _as_num(df[weight_col])
-            df = df.dropna(subset=["PI", weight_col])
-            if df.empty:
-                st.info("No valid PI/weight rows to evaluate.")
+            # Horse ages and Official MRs are auto-filled from the loaded CSV where available.
+            _horse_meta = _horse_metadata_frame(work)
+            age_input = handicap_df[["Horse"]].copy()
+            age_input["Horse Key"] = age_input["Horse"].map(canon_horse)
+            if not _horse_meta.empty:
+                age_input = age_input.merge(
+                    _horse_meta[["Horse Key", "Age"]].drop_duplicates("Horse Key"),
+                    on="Horse Key", how="left",
+                )
             else:
-                # Distance & shape inputs (safe defaults)
-                D_m  = float(race_distance_input)
-                RSI  = float(metrics.attrs.get("RSI", np.nan))
-                SCI  = float(metrics.attrs.get("SCI", np.nan))
+                age_input["Age"] = pd.NA
+            age_input["Age"] = pd.to_numeric(age_input["Age"], errors="coerce").astype("Int64")
+            age_input = age_input[["Horse", "Age"]]
 
-                # 1) Baseline slope (PI per kg)
-                beta0 = _beta_base(D_m)
+            edited_ages = st.data_editor(
+                age_input,
+                width="stretch",
+                hide_index=True,
+                disabled=["Horse"],
+                column_config={
+                    "Age": st.column_config.NumberColumn(
+                        "Age", min_value=2, max_value=15, step=1, required=True
+                    ),
+                },
+                key=f"core_aoh_age_editor_{_race_date.isoformat()}_{int(race_distance_input)}",
+            )
+            edited_ages["Age"] = pd.to_numeric(edited_ages["Age"], errors="coerce")
+            missing_age_horses = edited_ages.loc[
+                edited_ages["Age"].isna(), "Horse"
+            ].astype(str).tolist()
 
-                # 2) Race-local realism: how much did weight correlate with performance here?
-                #    Use magnitude of correlation as a realism knob, damped for tiny fields.
-                corr_w_pi = _field_corr(df[weight_col], df["PI"])
-                n = df["PI"].notna().sum()
-                tiny_dampen = 0.0 if n < 6 else min(1.0, (n - 5) / 7.0)  # ramps in from n=6 to ~n=12
-                corr_mag = 0.0 if not np.isfinite(corr_w_pi) else abs(corr_w_pi)
-
-                # Blend: mostly baseline, plus up to +40% from race-local signal (scaled by field size)
-                beta_local = beta0 * (1.0 + 0.40 * corr_mag * tiny_dampen)
-
-                # 3) Shape modulation (light touch)
-                beta_eff = _shape_adjust(beta_local, RSI, SCI)
-
-                # 4) Safety rails (avoid crazy kg if β too tiny or huge)
-                beta_eff = float(np.clip(beta_eff, 0.22, 0.70))  # keep within realistic PI/kg bounds
-
-                # 5) Convert each horse’s PI to ΔPI vs field median, then to kg and MR.
-                #    PI itself remains unchanged. Only the PI-to-weight/MR conversion is
-                #    confidence-adjusted in fields with fewer than 12 valid runners.
-                PI_med = float(np.nanmedian(df["PI"]))
-                df["ΔPI_vs_med"] = df["PI"] - PI_med
-
-                field_size = int(df["PI"].notna().sum())
-                field_conversion_factor = {
-                    7: 0.68,
-                    8: 0.76,
-                    9: 0.84,
-                    10: 0.90,
-                    11: 0.95,
-                }.get(field_size, 1.00 if field_size >= 12 else 0.60)
-
-                raw_ran_above_kg = df["ΔPI_vs_med"] / beta_eff
-                df["RanAbove_kg"] = raw_ran_above_kg * field_conversion_factor
-                df["RanAbove_MR"] = df["RanAbove_kg"] * 2
-        
-                # 6) Friendly view
-                view = df.copy()
-                view = view.rename(columns={
-                    weight_col: "Wt (kg)"
-                })
-                view["β_eff (PI/kg)"] = beta_eff
-                view = view[["Horse", "Wt (kg)", "PI", "ΔPI_vs_med", "RanAbove_kg", "RanAbove_MR", "β_eff (PI/kg)"]]
-                view = view.sort_values("RanAbove_kg", ascending=False)
-
-                # Round for display only (keep raw in df if you need later)
-                for c in ["Wt (kg)", "PI", "ΔPI_vs_med", "RanAbove_kg", "RanAbove_MR", "β_eff (PI/kg)"]:
-                    view[c] = pd.to_numeric(view[c], errors="coerce").round(2)
-
-                st.dataframe(view, use_container_width=True)
-
-                # Key readout + tiny legend
-                colA, colB, colC = st.columns([1,1,1])
-                with colA:
-                    st.metric("Field median PI", f"{PI_med:.2f}")
-                with colB:
-                    corr_str = "n/a" if not np.isfinite(corr_w_pi) else f"{corr_w_pi:+.2f}"
-                    st.metric("Weight↔PI correlation (|r| used)", corr_str)
-                with colC:
-                    st.metric("β_eff (this race)", f"{beta_eff:.2f} PI per kg")
-
-                if field_size < 12:
-                    st.caption(
-                        f"Small-field conversion adjustment: {field_size} valid runners → "
-                        f"{field_conversion_factor:.0%} of the raw PI-to-kg/MR conversion. PI scores are unchanged."
-                    )
-
-                st.caption(
-                    "Interpretation: **RanAbove (kg)** estimates how many kilograms a horse effectively ran above/below the "
-                    "field median, *within this single race*. Positive = ran as if it could carry more and still match median. "
-                    "Slope (β_eff) is distance-based, gently adjusted by (i) how weight correlated with PI in this field and "
-                    "(ii) race shape. For fields below 12 valid runners, only the kg/MR conversion is reduced to reflect the "
-                    "smaller dataset; the underlying PI scores and rankings remain unchanged."
+            line_options = handicap_df["Horse"].astype(str).tolist()
+            h1, h2 = st.columns(2)
+            with h1:
+                line_horse = st.selectbox(
+                    "Line Horse",
+                    line_options,
+                    key=f"core_aoh_line_horse_{_race_date.isoformat()}_{int(race_distance_input)}",
                 )
 
-                # Optional CSV download (small footprint)
-                csv_bytes = view.to_csv(index=False).encode("utf-8")
-                st.download_button("Download Ahead-of-Handicap table (CSV)", csv_bytes,
-                                   file_name="ahead_of_handicap_one_run.csv", mime="text/csv", use_container_width=True)
+            _official_mr_lookup = {}
+            if not _horse_meta.empty:
+                for _, _r in _horse_meta.drop_duplicates("Horse Key").iterrows():
+                    _mr = _db_num(_r.get("Official MR"))
+                    if _mr is not None:
+                        _official_mr_lookup[str(_r.get("Horse Key"))] = _db_round_mr(_mr)
+
+            _line_mr_default = _official_mr_lookup.get(canon_horse(line_horse), 100)
+            with h2:
+                line_mr = st.number_input(
+                    "Line Horse MR Achieved",
+                    min_value=0,
+                    max_value=200,
+                    value=int(_line_mr_default),
+                    step=1,
+                    key=f"core_aoh_line_mr_{_race_date.isoformat()}_{int(race_distance_input)}_{canon_horse(line_horse)}",
+                    help="Auto-filled from Official MR when available; otherwise enter the line rating manually.",
+                )
+
+            if missing_age_horses:
+                preview = ", ".join(missing_age_horses[:5])
+                more = "..." if len(missing_age_horses) > 5 else ""
+                st.warning(
+                    f"Enter an age for every horse before ratings can be calculated: {preview}{more}"
+                )
+            else:
+                rating_df = handicap_df.merge(edited_ages, on="Horse", how="left")
+                rating_df["Age"] = rating_df["Age"].astype(int)
+                rating_df["WFA (lb)"] = rating_df["Age"].map(
+                    lambda age: get_wfa_lb(_race_date, race_distance_input, int(age))
+                )
+                rating_df["WFA (kg)"] = rating_df["WFA (lb)"] * 0.5
+                rating_df["Effective Weight"] = rating_df["Weight (kg)"] + rating_df["WFA (kg)"]
+
+                line_row = rating_df.loc[
+                    rating_df["Horse"].astype(str) == str(line_horse)
+                ].iloc[0]
+                line_perf_mr = float(line_row["Performance MR"])
+                line_effective_weight = float(line_row["Effective Weight"])
+
+                rating_df["Performance Difference"] = rating_df["Performance MR"] - line_perf_mr
+                rating_df["Weight + WFA Adjustment"] = 2.0 * (
+                    rating_df["Effective Weight"] - line_effective_weight
+                )
+                rating_df["MR Achieved Raw"] = (
+                    float(line_mr)
+                    + rating_df["Performance Difference"]
+                    + rating_df["Weight + WFA Adjustment"]
+                )
+                rating_df["MR Achieved"] = rating_df["MR Achieved Raw"].map(_db_round_mr).astype("Int64")
+
+                # Show Official MR alongside achieved MR so improvement is immediately visible.
+                rating_df["Official MR"] = rating_df["Horse"].map(
+                    lambda horse: _official_mr_lookup.get(canon_horse(horse))
+                )
+                rating_df["MR +/-"] = (
+                    pd.to_numeric(rating_df["MR Achieved"], errors="coerce")
+                    - pd.to_numeric(rating_df["Official MR"], errors="coerce")
+                )
+
+                band = wfa_distance_band(race_distance_input)
+                st.info(
+                    f"WFA scale applied: **{_race_date.strftime('%B')} | "
+                    f"{_WFA_BAND_LABELS[band]}**. "
+                    f"Line horse: **{line_horse}**, age **{int(line_row['Age'])}**, "
+                    f"WFA **{line_row['WFA (lb)']:.0f} lb**."
+                )
+
+                rating_display = rating_df[[
+                    "Horse", "Age", "Weight (kg)", "WFA (lb)", "WFA (kg)",
+                    "Effective Weight", "PI", "Performance Difference",
+                    "Weight + WFA Adjustment", "Official MR", "MR Achieved", "MR +/-",
+                ]].copy()
+                for col in [
+                    "Weight (kg)", "WFA (lb)", "WFA (kg)", "Effective Weight",
+                    "PI", "Performance Difference", "Weight + WFA Adjustment", "MR +/-",
+                ]:
+                    rating_display[col] = pd.to_numeric(rating_display[col], errors="coerce").round(2)
+                for col in ["Official MR", "MR Achieved"]:
+                    rating_display[col] = pd.to_numeric(
+                        rating_display[col], errors="coerce"
+                    ).astype("Int64")
+
+                # Keep the line-horse view easy to compare by ranking achieved MR highest first.
+                rating_display = rating_display.sort_values(
+                    ["MR Achieved", "PI"], ascending=[False, False], na_position="last"
+                )
+                st.dataframe(rating_display, width="stretch", hide_index=True)
+
+                csv_bytes = rating_display.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "Download WFA-adjusted handicap table (CSV)",
+                    csv_bytes,
+                    file_name="ahead_of_handicap_wfa_adjusted.csv",
+                    mime="text/csv",
+                    width="stretch",
+                )
         # ======================= /Ahead of the Handicap =======================
         # ======================= End of Batch 2 =======================
 
-        # ======================= Batch 3 — Visuals + Hidden v2 + Ability v2 =======================
+        # ======================= Batch 3 â Visuals + Hidden v2 + Ability v2 =======================
         from matplotlib.patches import Rectangle
         from matplotlib.colors import TwoSlopeNorm
         from matplotlib.lines import Line2D
