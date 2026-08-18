@@ -64,6 +64,42 @@ def _racecard_db_counts() -> dict[str, int]:
     return counts
 
 
+
+def _racecard_mr_achieved_stats(horse: str) -> tuple[int | None, int | None]:
+    """Return (latest MR Achieved, highest MR Achieved) from saved Race Edge history."""
+    if not horse or not _supabase_configured():
+        return None, None
+    try:
+        hist = load_horse_history(horse)
+    except Exception:
+        return None, None
+    if hist is None or hist.empty or "mr_achieved" not in hist.columns:
+        return None, None
+
+    h = hist.copy()
+    h["mr_achieved"] = pd.to_numeric(h["mr_achieved"], errors="coerce")
+    if "race_date" in h.columns:
+        h["race_date"] = pd.to_datetime(h["race_date"], errors="coerce")
+    else:
+        h["race_date"] = pd.NaT
+    if "race_number" in h.columns:
+        h["race_number"] = pd.to_numeric(h["race_number"], errors="coerce")
+    else:
+        h["race_number"] = np.nan
+
+    h = h.sort_values(
+        ["race_date", "race_number"],
+        ascending=[False, False],
+        na_position="last",
+    )
+    achieved = h["mr_achieved"].dropna()
+    if achieved.empty:
+        return None, None
+
+    latest = int(round(float(achieved.iloc[0])))
+    highest = int(round(float(achieved.max())))
+    return latest, highest
+
 def _racecard_runner_frame(card: dict, db_counts: dict[str, int] | None = None) -> pd.DataFrame:
     db_counts = db_counts or {}
     rows = []
@@ -77,6 +113,7 @@ def _racecard_runner_frame(card: dict, db_counts: dict[str, int] | None = None) 
         horse_weight = _racecard_int(runner.get("horseWeight"))
         weight_delta = _racecard_int(runner.get("horseWeightDelta"))
         official_mr = _racecard_official_mr(runner.get("MR"))
+        latest_mr_achieved, highest_mr_achieved = _racecard_mr_achieved_stats(horse)
         draw = _racecard_int(runner.get("draw"))
         if is_reserve and (draw is None or draw <= 0):
             draw = None
@@ -90,7 +127,7 @@ def _racecard_runner_frame(card: dict, db_counts: dict[str, int] | None = None) 
             "Weight": _racecard_float(runner.get("weight")),
             "Official MR": official_mr,
             "Horse Wgt": horse_weight,
-            "Wgt Î": weight_delta,
+            "Wgt Change": weight_delta,
             "Jockey": str(runner.get("jockeyName") or "").strip(),
             "Trainer": str(runner.get("trainerName") or "").strip(),
             "Odds": str(runner.get("odds") or "").strip(),
@@ -98,6 +135,8 @@ def _racecard_runner_frame(card: dict, db_counts: dict[str, int] | None = None) 
             "Equipment": str(runner.get("equipment") or "").strip(),
             "Days Since Run": _racecard_int(runner.get("restDays")),
             "Race Edge Runs": int(db_counts.get(canon_horse(horse), 0)),
+            "Latest MR Achieved": latest_mr_achieved,
+            "Highest MR Achieved": highest_mr_achieved,
             "Status": "Reserve" if is_reserve else "Runner",
         })
 
@@ -105,7 +144,10 @@ def _racecard_runner_frame(card: dict, db_counts: dict[str, int] | None = None) 
     if df.empty:
         return df
 
-    for c in ["No.", "Draw", "Age", "Official MR", "Horse Wgt", "Wgt Î", "Days Since Run", "Race Edge Runs"]:
+    for c in [
+        "No.", "Draw", "Age", "Official MR", "Horse Wgt", "Wgt Change",
+        "Days Since Run", "Race Edge Runs", "Latest MR Achieved", "Highest MR Achieved"
+    ]:
         df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
     df["Weight"] = pd.to_numeric(df["Weight"], errors="coerce")
     return df.sort_values(["Status", "No."], ascending=[True, True], na_position="last").reset_index(drop=True)
@@ -223,18 +265,18 @@ def _render_racecard_runner_profiles(active: pd.DataFrame):
         try:
             hist = load_horse_history(horse)
         except Exception as exc:
-            with st.expander(f"{horse} â profile unavailable", expanded=False):
+            with st.expander(f"{horse} | profile unavailable", expanded=False):
                 st.warning(f"Could not load saved history: {exc}")
             continue
 
         if hist.empty:
-            label = f"{horse} â No Race Edge history"
+            label = f"{horse} | No Race Edge history"
             with st.expander(label, expanded=False):
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Current Official MR", "â" if pd.isna(current_official) else f"{int(round(float(current_official)))}")
-                c2.metric("Age", "â" if pd.isna(current_age) else str(int(current_age)))
-                c3.metric("Weight", "â" if pd.isna(current_weight) else f"{float(current_weight):.1f} kg")
-                c4.metric("Draw", "â" if pd.isna(current_draw) else str(int(current_draw)))
+                c1.metric("Current Official MR", "-" if pd.isna(current_official) else f"{int(round(float(current_official)))}")
+                c2.metric("Age", "-" if pd.isna(current_age) else str(int(current_age)))
+                c3.metric("Weight", "-" if pd.isna(current_weight) else f"{float(current_weight):.1f} kg")
+                c4.metric("Draw", "-" if pd.isna(current_draw) else str(int(current_draw)))
                 st.caption("No saved Race Edge runs for this horse yet.")
             continue
 
@@ -261,19 +303,16 @@ def _render_racecard_runner_profiles(active: pd.DataFrame):
         best_edge = edge_vals.max() if not edge_vals.empty else float("nan")
 
         label_bits = [horse, f"{len(h)} saved run{'s' if len(h) != 1 else ''}"]
-        if pd.notna(best_edge):
-            edge_int = int(round(float(best_edge)))
-            label_bits.append(f"Best edge {'+' if edge_int > 0 else ''}{edge_int}")
 
-        with st.expander(" â ".join(label_bits), expanded=False):
+        with st.expander(" | ".join(label_bits), expanded=False):
             c1, c2 = st.columns(2)
             c1.metric(
                 "Current Official MR",
-                "â" if pd.isna(current_official) else f"{int(round(float(current_official)))}",
+                "-" if pd.isna(current_official) else f"{int(round(float(current_official)))}",
             )
             c2.metric(
                 "Best MR Edge",
-                "â" if pd.isna(best_edge)
+                "-" if pd.isna(best_edge)
                 else f"{'+' if int(round(float(best_edge))) > 0 else ''}{int(round(float(best_edge)))}",
             )
 
@@ -287,7 +326,7 @@ def _render_racecard_runner_profiles(active: pd.DataFrame):
             if pd.notna(current_draw):
                 current_bits.append(f"Draw {int(current_draw)}")
             if current_bits:
-                st.caption("Current race: " + " Â· ".join(current_bits))
+                st.caption("Current race: " + " | ".join(current_bits))
 
             display = h.rename(columns={
                 "race_date": "Date",
@@ -340,12 +379,12 @@ def _render_racecard_runner_profiles(active: pd.DataFrame):
 def _render_loaded_race_card(card: dict):
     """Render a loaded Race Edge card regardless of whether it came from SAHR or pasted JSON."""
     # Race header.
-    date_label = str(card.get("dateFormat") or card.get("date") or "â")
-    track = str(card.get("clubName") or "â")
+    date_label = str(card.get("dateFormat") or card.get("date") or "-")
+    track = str(card.get("clubName") or "-")
     race_no = _racecard_int(card.get("race"))
-    time_label = str(card.get("time") or "â")
+    time_label = str(card.get("time") or "-")
     distance = _racecard_int(card.get("distance"))
-    surface = str(card.get("surfaceDescr") or "â")
+    surface = str(card.get("surfaceDescr") or "-")
     direction = str(card.get("direction") or "").strip()
     name = str(card.get("name") or "").strip()
     description = str(card.get("description") or "").strip()
@@ -355,9 +394,9 @@ def _render_loaded_race_card(card: dict):
 
     st.markdown(f"### {track}")
     st.markdown(
-        f"**{date_label} Â· Race {race_no if race_no is not None else 'â'} Â· {time_label} Â· "
-        f"{distance if distance is not None else 'â'}m Â· {surface}"
-        + (f" Â· {direction}" if direction else "")
+        f"**{date_label} | Race {race_no if race_no is not None else '-'} | {time_label} | "
+        f"{distance if distance is not None else '-'}m | {surface}"
+        + (f" | {direction}" if direction else "")
         + "**"
     )
     if name:
@@ -379,8 +418,8 @@ def _render_loaded_race_card(card: dict):
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Runners", active_count)
     m2.metric("Reserves", reserve_count)
-    m3.metric("Distance", "â" if distance is None else f"{distance}m")
-    stake_label = "â"
+    m3.metric("Distance", "-" if distance is None else f"{distance}m")
+    stake_label = "-"
     if stake:
         try:
             stake_label = f"{currency}{int(float(str(stake).replace(',', ''))):,}"
@@ -413,6 +452,7 @@ def _render_loaded_race_card(card: dict):
     display_cols = [
         "No.", "Horse", "Draw", "Age", "Weight", "Official MR",
         "Jockey", "Trainer", "Race Edge Runs",
+        "Latest MR Achieved", "Highest MR Achieved",
     ]
 
     st.markdown("### Runners")
