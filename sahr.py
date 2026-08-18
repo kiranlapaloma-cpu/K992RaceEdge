@@ -1,8 +1,11 @@
 """SAHorseracing public race-card feed integration for Race Edge.
 
-Observed endpoint:
+Observed fields endpoint:
     https://www.sahorseracing.co.za/sahr-php/public.php
         ?feed=fields&date=YYYYMMDD&club=CLUB_ID
+
+Meeting discovery uses the companion public fixtures feed when available:
+    ?feed=fixtures&country=ALL
 
 The endpoint can return either a JSON object or a JSON-encoded string containing
 that object, so decoding handles both forms.
@@ -105,6 +108,146 @@ def get_fields_meeting(
         raise SAHRError(msg)
     return payload
 
+
+
+def _decode_any_payload(response: requests.Response) -> Any:
+    """Decode SAHR responses that may be plain JSON or JSON encoded as a string."""
+    try:
+        payload: Any = response.json()
+    except Exception:
+        text = response.text.strip()
+        try:
+            payload = json.loads(text)
+        except Exception as exc:
+            preview = " ".join(text[:220].split())
+            raise SAHRError(
+                "SAHorseracing did not return JSON. "
+                f"Response started with: {preview or '<empty response>'}"
+            ) from exc
+    for _ in range(2):
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception as exc:
+                raise SAHRError("SAHorseracing returned invalid encoded JSON.") from exc
+        else:
+            break
+    return payload
+
+
+def _request_public(params: dict[str, Any], *, timeout: float = 20.0) -> Any:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Race Edge private form study)",
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": SAHR_PUBLIC_PAGE,
+    }
+    try:
+        response = requests.get(
+            SAHR_FIELDS_URL,
+            params=params,
+            headers=headers,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise SAHRError(f"Could not connect to SAHorseracing: {exc}") from exc
+    return _decode_any_payload(response)
+
+
+def _fixture_records(payload: Any) -> list[dict[str, Any]]:
+    """Normalise likely fixtures-feed shapes into a flat list of meeting records."""
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if not isinstance(payload, dict):
+        return []
+
+    # Common API wrapper keys.
+    for key in ("fixtures", "meetings", "results", "data", "items"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [x for x in value if isinstance(x, dict)]
+        if isinstance(value, dict):
+            rows = [x for x in value.values() if isinstance(x, dict)]
+            if rows:
+                return rows
+
+    # Some feeds use numeric/object keys directly.
+    rows = [x for x in payload.values() if isinstance(x, dict)]
+    return rows
+
+
+def _fixture_date(record: dict[str, Any]) -> str:
+    for key in ("date", "raceDate", "race_date", "meetingDate", "meeting_date"):
+        value = record.get(key)
+        if value in (None, ""):
+            continue
+        digits = re.sub(r"\D", "", str(value))
+        if len(digits) >= 8:
+            return digits[:8]
+    return ""
+
+
+def _fixture_club(record: dict[str, Any]) -> int | None:
+    for key in ("club", "clubId", "club_id", "venueId", "venue_id"):
+        value = record.get(key)
+        try:
+            return int(float(value))
+        except Exception:
+            pass
+    return None
+
+
+def _fixture_name(record: dict[str, Any]) -> str:
+    for key in ("clubName", "club_name", "meeting", "meetingName", "meeting_name", "venue", "venueName", "venue_name", "name"):
+        text = str(record.get(key) or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def get_meetings_for_date(
+    race_date: date | datetime | str,
+    *,
+    timeout: float = 20.0,
+) -> list[dict[str, Any]]:
+    """Discover available SA meetings for a selected date.
+
+    The SAHR public interface shares the fixtures-style feed naming used by the
+    public racing pages.  We normalise the response defensively because the
+    payload shape can vary.  Each returned item has date, club and name.
+    """
+    target = _date_key(race_date)
+    payload = _request_public(
+        {"feed": "fixtures", "country": "ALL"},
+        timeout=timeout,
+    )
+    records = _fixture_records(payload)
+    meetings: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    for record in records:
+        d = _fixture_date(record)
+        club = _fixture_club(record)
+        if d != target or club is None:
+            continue
+        name = _fixture_name(record) or f"Club {club}"
+        key = (d, club)
+        if key in seen:
+            continue
+        seen.add(key)
+        meetings.append({
+            "date": d,
+            "club": club,
+            "name": name,
+            "raw": record,
+        })
+
+    meetings.sort(key=lambda x: (str(x.get("name") or ""), int(x.get("club") or 0)))
+    return meetings
+
+
+def meeting_display_label(item: dict[str, Any]) -> str:
+    name = str(item.get("name") or "").strip() or f"Club {item.get('club')}"
+    return name
 
 def meeting_race_options(meeting: dict[str, Any]) -> list[tuple[str, str]]:
     """Return [(race_key, display_label), ...] in race-number order."""

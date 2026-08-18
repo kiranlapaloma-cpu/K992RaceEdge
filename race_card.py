@@ -5,7 +5,10 @@ import pandas as pd
 import streamlit as st
 from common import canon_horse
 from database import _supabase_configured, load_horse_history, _fetch_all_horse_rows
-from sahr import get_fields_meeting, meeting_race_options, race_to_race_edge_card, SAHRError
+from sahr import (
+    get_fields_meeting, get_meetings_for_date, meeting_display_label,
+    meeting_race_options, race_to_race_edge_card, SAHRError,
+)
 
 def _racecard_official_mr(value):
     """Race-card feeds use MR=0 for unrated horses. Display/store that as missing."""
@@ -449,29 +452,56 @@ def render_race_card():
     tab_live, tab_json = st.tabs(["SAHorseracing", "Paste JSON"])
 
     with tab_live:
-        st.markdown("### Load Meeting")
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            race_date = st.date_input("Race Date", value=datetime.now().date(), key="sahr_race_date")
-        with c2:
-            club_id = st.number_input(
-                "Club ID",
-                min_value=1,
-                step=1,
-                value=44,
-                key="sahr_club_id",
-                help="Gallop/SAHR club number. Greyville Polytrack = 44.",
-            )
+        st.markdown("### Select Meeting")
+        race_date = st.date_input("Race Date", value=datetime.now().date(), key="sahr_race_date")
 
-        if st.button("Load Meeting", type="primary", width="stretch", key="sahr_load_meeting"):
+        # Clear stale selections when the user changes date.
+        date_key = race_date.strftime("%Y%m%d")
+        if st.session_state.get("sahr_meeting_date_key") != date_key:
+            st.session_state["sahr_meeting_date_key"] = date_key
+            st.session_state["sahr_available_meetings"] = None
+            st.session_state["sahr_meeting"] = None
+            st.session_state["race_card_payload"] = None
+
+        if st.button("Find Meetings", type="primary", width="stretch", key="sahr_find_meetings"):
             try:
-                meeting = get_fields_meeting(race_date, int(club_id))
-                st.session_state["sahr_meeting"] = meeting
-                st.session_state["race_card_payload"] = None
-                st.success(str(meeting.get("heading") or "Meeting loaded."))
-            except Exception as exc:
+                found = get_meetings_for_date(race_date)
+                st.session_state["sahr_available_meetings"] = found
                 st.session_state["sahr_meeting"] = None
-                st.error(f"Could not load SAHorseracing meeting: {exc}")
+                st.session_state["race_card_payload"] = None
+                if found:
+                    st.success(f"Found {len(found)} meeting{'s' if len(found) != 1 else ''}.")
+                else:
+                    st.warning("No South African meetings were returned for that date.")
+            except Exception as exc:
+                st.session_state["sahr_available_meetings"] = None
+                st.error(f"Could not discover meetings: {exc}")
+
+        available = st.session_state.get("sahr_available_meetings")
+        if available:
+            labels = []
+            label_to_item = {}
+            for item in available:
+                base = meeting_display_label(item)
+                label = base
+                # Ensure labels remain unique even if a venue has two course IDs.
+                if label in label_to_item:
+                    label = f"{base} (Club {item.get('club')})"
+                labels.append(label)
+                label_to_item[label] = item
+
+            selected_meeting_label = st.selectbox("Meeting", labels, key="sahr_meeting_select")
+            selected_meeting = label_to_item[selected_meeting_label]
+
+            if st.button("Load Meeting", width="stretch", key="sahr_load_meeting"):
+                try:
+                    meeting = get_fields_meeting(race_date, int(selected_meeting["club"]))
+                    st.session_state["sahr_meeting"] = meeting
+                    st.session_state["race_card_payload"] = None
+                    st.success(str(meeting.get("heading") or "Meeting loaded."))
+                except Exception as exc:
+                    st.session_state["sahr_meeting"] = None
+                    st.error(f"Could not load SAHorseracing meeting: {exc}")
 
         meeting = st.session_state.get("sahr_meeting")
         if meeting:
@@ -490,7 +520,6 @@ def render_race_card():
                     except Exception as exc:
                         st.error(f"Could not load selected race: {exc}")
 
-            # Preserve the source restriction prominently but unobtrusively.
             st.caption(
                 "Source: SAHorseracing / National Horse Racing Bureau data feed. "
                 "The feed states that use/display is restricted to private use and commercial use requires a licence."
