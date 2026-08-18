@@ -261,27 +261,17 @@ def _render_racecard_runner_profiles(active: pd.DataFrame):
         best_edge = edge_vals.max() if not edge_vals.empty else float("nan")
 
         label_bits = [horse, f"{len(h)} saved run{'s' if len(h) != 1 else ''}"]
-        if pd.notna(latest_mr):
-            label_bits.append(f"Latest MR {int(round(float(latest_mr)))}")
         if pd.notna(best_edge):
             edge_int = int(round(float(best_edge)))
             label_bits.append(f"Best edge {'+' if edge_int > 0 else ''}{edge_int}")
 
         with st.expander(" â ".join(label_bits), expanded=False):
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2 = st.columns(2)
             c1.metric(
                 "Current Official MR",
                 "â" if pd.isna(current_official) else f"{int(round(float(current_official)))}",
             )
             c2.metric(
-                "Latest MR Achieved",
-                "â" if pd.isna(latest_mr) else f"{int(round(float(latest_mr)))}",
-            )
-            c3.metric(
-                "Highest MR Achieved",
-                "â" if pd.isna(highest_mr) else f"{int(round(float(highest_mr)))}",
-            )
-            c4.metric(
                 "Best MR Edge",
                 "â" if pd.isna(best_edge)
                 else f"{'+' if int(round(float(best_edge))) > 0 else ''}{int(round(float(best_edge)))}",
