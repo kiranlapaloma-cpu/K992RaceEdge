@@ -4,8 +4,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from common import canon_horse
-from database import _supabase_configured, load_horse_history
-from gallop import GallopFeedError, fetch_meeting, fetch_event, meeting_races, race_option_label
+from database import _supabase_configured, load_horse_history, _fetch_all_horse_rows
+from sahr import get_fields_meeting, meeting_race_options, race_to_race_edge_card, SAHRError
 
 def _racecard_official_mr(value):
     """Race-card feeds use MR=0 for unrated horses. Display/store that as missing."""
@@ -345,7 +345,7 @@ def _render_racecard_runner_profiles(active: pd.DataFrame):
 
 
 def _render_loaded_race_card(card: dict):
-    """Render a parsed card regardless of whether it came from Gallop or pasted JSON."""
+    """Render a loaded Race Edge card regardless of whether it came from SAHR or pasted JSON."""
     # Race header.
     date_label = str(card.get("dateFormat") or card.get("date") or "—")
     track = str(card.get("clubName") or "—")
@@ -356,6 +356,7 @@ def _render_loaded_race_card(card: dict):
     direction = str(card.get("direction") or "").strip()
     name = str(card.get("name") or "").strip()
     description = str(card.get("description") or "").strip()
+    wfa_text = str(card.get("WFA") or "").strip()
     stake = str(card.get("stake") or "").strip()
     currency = str(card.get("currency") or "").strip()
 
@@ -370,6 +371,8 @@ def _render_loaded_race_card(card: dict):
         st.write(name)
     if description:
         st.caption(description)
+    if wfa_text:
+        st.caption(wfa_text)
 
     active_count = sum(
         1 for r in card.get("runners", [])
@@ -384,7 +387,13 @@ def _render_loaded_race_card(card: dict):
     m1.metric("Runners", active_count)
     m2.metric("Reserves", reserve_count)
     m3.metric("Distance", "—" if distance is None else f"{distance}m")
-    m4.metric("Stake", "—" if not stake else f"{currency}{stake}")
+    stake_label = "—"
+    if stake:
+        try:
+            stake_label = f"{currency}{int(float(str(stake).replace(',', ''))):,}"
+        except Exception:
+            stake_label = f"{currency}{stake}"
+    m4.metric("Stake", stake_label)
 
     db_counts = {}
     db_error = None
@@ -426,96 +435,68 @@ def _render_loaded_race_card(card: dict):
 def render_race_card():
     st.title("Race Card")
     st.caption(
-        "Load a meeting directly from Gallop, then select a race. "
-        "The existing paste-JSON loader remains available as a fallback."
+        "Load a meeting directly from SAHorseracing, or paste a race-card JSON object manually. "
+        "The Race Card remains independent of sectional CSV analysis."
     )
 
     if "race_card_payload" not in st.session_state:
         st.session_state["race_card_payload"] = None
     if "race_card_input_version" not in st.session_state:
         st.session_state["race_card_input_version"] = 0
-    if "gallop_meeting_payload" not in st.session_state:
-        st.session_state["gallop_meeting_payload"] = None
-    if "gallop_meeting_races" not in st.session_state:
-        st.session_state["gallop_meeting_races"] = []
+    if "sahr_meeting" not in st.session_state:
+        st.session_state["sahr_meeting"] = None
 
-    gallop_tab, json_tab = st.tabs(["Gallop", "Paste JSON"])
+    tab_live, tab_json = st.tabs(["SAHorseracing", "Paste JSON"])
 
-    with gallop_tab:
-        st.markdown("### Load from Gallop")
-        st.caption(
-            "Choose the race date and enter Gallop's club ID. Race Edge will load "
-            "the meeting, then fetch the selected race card directly from Gallop."
-        )
-
+    with tab_live:
+        st.markdown("### Load Meeting")
         c1, c2 = st.columns([2, 1])
         with c1:
-            gallop_date = st.date_input(
-                "Race Date",
-                value=datetime.now().date(),
-                key="gallop_race_date",
-            )
+            race_date = st.date_input("Race Date", value=datetime.now().date(), key="sahr_race_date")
         with c2:
-            gallop_club = st.number_input(
-                "Gallop Club ID",
+            club_id = st.number_input(
+                "Club ID",
                 min_value=1,
                 step=1,
-                value=int(st.session_state.get("gallop_club_id", 44)),
-                key="gallop_club_id_input",
-                help="Greyville Polytrack is club 44. Other club IDs can be entered as needed.",
+                value=44,
+                key="sahr_club_id",
+                help="Gallop/SAHR club number. Greyville Polytrack = 44.",
             )
 
-        if st.button("Load Meeting", type="primary", width="stretch", key="gallop_load_meeting"):
+        if st.button("Load Meeting", type="primary", width="stretch", key="sahr_load_meeting"):
             try:
-                meeting_payload = fetch_meeting(int(gallop_club), gallop_date)
-                races = meeting_races(meeting_payload)
-                if not races:
-                    raise GallopFeedError("Gallop returned the meeting, but no races could be identified.")
-                st.session_state["gallop_meeting_payload"] = meeting_payload
-                st.session_state["gallop_meeting_races"] = races
-                st.session_state["gallop_club_id"] = int(gallop_club)
+                meeting = get_fields_meeting(race_date, int(club_id))
+                st.session_state["sahr_meeting"] = meeting
                 st.session_state["race_card_payload"] = None
-                st.success(f"Meeting loaded — {len(races)} race{'s' if len(races) != 1 else ''} found.")
+                st.success(str(meeting.get("heading") or "Meeting loaded."))
             except Exception as exc:
-                st.session_state["gallop_meeting_payload"] = None
-                st.session_state["gallop_meeting_races"] = []
-                st.error(f"Could not load Gallop meeting: {exc}")
+                st.session_state["sahr_meeting"] = None
+                st.error(f"Could not load SAHorseracing meeting: {exc}")
 
-        races = st.session_state.get("gallop_meeting_races") or []
-        if races:
-            first_with_name = next((r for r in races if r.get("clubName")), None)
-            if first_with_name:
-                st.markdown(f"**{first_with_name.get('clubName')}**")
+        meeting = st.session_state.get("sahr_meeting")
+        if meeting:
+            heading = str(meeting.get("heading") or "").strip()
+            if heading:
+                st.markdown(f"**{heading}**")
+            options = meeting_race_options(meeting)
+            if options:
+                option_map = {label: key for key, label in options}
+                selected_label = st.selectbox("Race", list(option_map.keys()), key="sahr_race_select")
+                if st.button("Load Selected Race", width="stretch", key="sahr_load_race"):
+                    try:
+                        card = race_to_race_edge_card(meeting, option_map[selected_label])
+                        st.session_state["race_card_payload"] = card
+                        st.success(f"Race {card.get('race')} loaded into Race Edge.")
+                    except Exception as exc:
+                        st.error(f"Could not load selected race: {exc}")
 
-            selected_idx = st.selectbox(
-                "Race",
-                options=list(range(len(races))),
-                format_func=lambda i: race_option_label(races[i]),
-                key="gallop_selected_race_idx",
+            # Preserve the source restriction prominently but unobtrusively.
+            st.caption(
+                "Source: SAHorseracing / National Horse Racing Bureau data feed. "
+                "The feed states that use/display is restricted to private use and commercial use requires a licence."
             )
-            selected_race = races[int(selected_idx)]
 
-            if st.button("Load Selected Race", type="primary", width="stretch", key="gallop_load_event"):
-                try:
-                    card = fetch_event(
-                        int(st.session_state.get("gallop_club_id", gallop_club)),
-                        gallop_date,
-                        int(selected_race["event"]),
-                    )
-                    st.session_state["race_card_payload"] = card
-                    st.success("Race card loaded directly from Gallop.")
-                except Exception as exc:
-                    st.error(f"Could not load Gallop race card: {exc}")
-
-            with st.expander("Gallop feed details", expanded=False):
-                date_param = gallop_date.strftime("%Y%m%d")
-                club_param = int(st.session_state.get("gallop_club_id", gallop_club))
-                st.code(
-                    f"Meeting: https://www.gallop.co.za/php/gallop.php?feed=meeting&club={club_param}&date={date_param}\n"
-                    f"Event:   https://www.gallop.co.za/php/gallop.php?feed=event&date={date_param}&club={club_param}&event={selected_race['event']}"
-                )
-
-    with json_tab:
+    with tab_json:
         raw = st.text_area(
             "Race-card JSON",
             height=220,
@@ -525,9 +506,9 @@ def render_race_card():
 
         b1, b2 = st.columns([1, 1])
         with b1:
-            load_clicked = st.button("Load Pasted Race Card", type="primary", width="stretch")
+            load_clicked = st.button("Load Race Card", type="primary", width="stretch", key="json_load_card")
         with b2:
-            clear_clicked = st.button("Clear Race Card", width="stretch")
+            clear_clicked = st.button("Clear Race Card", width="stretch", key="json_clear_card")
 
         if clear_clicked:
             st.session_state["race_card_payload"] = None

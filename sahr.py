@@ -1,0 +1,252 @@
+"""SAHorseracing public race-card feed integration for Race Edge.
+
+Observed endpoint:
+    https://www.sahorseracing.co.za/sahr-php/public.php
+        ?feed=fields&date=YYYYMMDD&club=CLUB_ID
+
+The endpoint can return either a JSON object or a JSON-encoded string containing
+that object, so decoding handles both forms.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from datetime import date, datetime
+from typing import Any
+
+import requests
+
+SAHR_FIELDS_URL = "https://www.sahorseracing.co.za/sahr-php/public.php"
+SAHR_PUBLIC_PAGE = "https://www.sahorseracing.co.za/sahr/public.html"
+
+
+class SAHRError(RuntimeError):
+    """Raised when the SAHorseracing feed cannot be loaded or parsed."""
+
+
+def _date_key(value: date | datetime | str) -> str:
+    if isinstance(value, datetime):
+        return value.strftime("%Y%m%d")
+    if isinstance(value, date):
+        return value.strftime("%Y%m%d")
+    text = str(value or "").strip()
+    digits = re.sub(r"\D", "", text)
+    if len(digits) == 8:
+        return digits
+    raise ValueError("Race date must resolve to YYYYMMDD.")
+
+
+def _decode_payload(response: requests.Response) -> dict[str, Any]:
+    try:
+        payload: Any = response.json()
+    except Exception:
+        text = response.text.strip()
+        try:
+            payload = json.loads(text)
+        except Exception as exc:
+            preview = " ".join(text[:220].split())
+            raise SAHRError(
+                "SAHorseracing did not return JSON. "
+                f"Response started with: {preview or '<empty response>'}"
+            ) from exc
+
+    # The observed feed is sometimes a JSON string whose contents are another
+    # JSON object: "{\"date\":...}".
+    for _ in range(2):
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception as exc:
+                raise SAHRError("SAHorseracing returned an invalid encoded JSON payload.") from exc
+        else:
+            break
+
+    if not isinstance(payload, dict):
+        raise SAHRError("SAHorseracing returned an unexpected payload type.")
+    return payload
+
+
+def get_fields_meeting(
+    race_date: date | datetime | str,
+    club: int,
+    *,
+    timeout: float = 20.0,
+) -> dict[str, Any]:
+    """Fetch the complete meeting (all races and runners) for a date + club."""
+    params = {
+        "feed": "fields",
+        "date": _date_key(race_date),
+        "club": int(club),
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Race Edge private form study)",
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": SAHR_PUBLIC_PAGE,
+    }
+    try:
+        response = requests.get(
+            SAHR_FIELDS_URL,
+            params=params,
+            headers=headers,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise SAHRError(f"Could not connect to SAHorseracing: {exc}") from exc
+
+    payload = _decode_payload(response)
+    races = payload.get("races")
+    if not isinstance(races, dict) or not races:
+        heading = str(payload.get("heading") or "").strip()
+        msg = "No races were returned for that date and club."
+        if heading:
+            msg += f" Meeting response: {heading}"
+        raise SAHRError(msg)
+    return payload
+
+
+def meeting_race_options(meeting: dict[str, Any]) -> list[tuple[str, str]]:
+    """Return [(race_key, display_label), ...] in race-number order."""
+    races = meeting.get("races") or {}
+    options: list[tuple[str, str]] = []
+    for key, race in races.items():
+        if not isinstance(race, dict):
+            continue
+        summary = str(race.get("summary") or "").strip()
+        label = summary or f"Race {str(key).lstrip('0') or key}"
+        options.append((str(key), label))
+
+    def sort_key(item: tuple[str, str]):
+        try:
+            return int(item[0])
+        except Exception:
+            return 999
+
+    return sorted(options, key=sort_key)
+
+
+def _summary_meta(summary: str) -> dict[str, Any]:
+    """Extract surface, stake, distance and time from a SAHR race summary."""
+    text = str(summary or "").strip()
+    out: dict[str, Any] = {}
+
+    m_surface = re.search(r"\(([^)]+)\)", text)
+    if m_surface:
+        out["surfaceDescr"] = m_surface.group(1).strip()
+
+    m_stake = re.search(r"\bR\s*([\d\s,]+)\s+(\d{3,4})m\s+(\d{1,2}:\d{2})\b", text, re.I)
+    if m_stake:
+        out["currency"] = "R"
+        out["stake"] = re.sub(r"\s+", "", m_stake.group(1)).replace(",", "")
+        out["distance"] = int(m_stake.group(2))
+        out["time"] = m_stake.group(3)
+    else:
+        m_dist = re.search(r"\b(\d{3,4})m\b", text, re.I)
+        if m_dist:
+            out["distance"] = int(m_dist.group(1))
+        m_time = re.search(r"\b(\d{1,2}:\d{2})\b", text)
+        if m_time:
+            out["time"] = m_time.group(1)
+    return out
+
+
+def _format_date(date_key: str) -> str:
+    try:
+        return datetime.strptime(str(date_key), "%Y%m%d").strftime("%d %B %Y")
+    except Exception:
+        return str(date_key or "")
+
+
+def _meeting_name(heading: str) -> str:
+    text = str(heading or "").strip()
+    # e.g. "Hollywoodbets Greyville Polytrack - Tuesday 18 August 2026"
+    if " - " in text:
+        return text.split(" - ", 1)[0].strip()
+    return text
+
+
+def race_to_race_edge_card(meeting: dict[str, Any], race_key: str) -> dict[str, Any]:
+    """Convert one SAHR race into the existing Race Edge race-card schema."""
+    races = meeting.get("races") or {}
+    race = races.get(str(race_key))
+    if not isinstance(race, dict):
+        # Tolerate numeric race keys supplied without zero padding.
+        try:
+            race = races.get(f"{int(race_key):02d}")
+        except Exception:
+            race = None
+    if not isinstance(race, dict):
+        raise SAHRError(f"Race {race_key} was not found in the loaded meeting.")
+
+    try:
+        race_no = int(str(race_key))
+    except Exception:
+        race_no = None
+
+    meta = _summary_meta(race.get("summary"))
+    date_key = str(meeting.get("date") or "")
+    heading = str(meeting.get("heading") or "")
+
+    card: dict[str, Any] = {
+        "date": date_key,
+        "dateFormat": _format_date(date_key),
+        "club": meeting.get("club"),
+        "itw": meeting.get("itw"),
+        "clubName": _meeting_name(heading),
+        "race": race_no,
+        "event": race.get("ref"),
+        "name": race.get("name") or "",
+        "description": race.get("description") or "",
+        "WFA": race.get("WFA") or "",
+        "currency": race.get("currency") or meta.get("currency") or "R",
+        "stake": meta.get("stake") or "",
+        "distance": meta.get("distance"),
+        "time": meta.get("time") or "",
+        "surfaceDescr": meta.get("surfaceDescr") or "",
+        "meetingStatus": meeting.get("meetingStatus"),
+        "source": "SAHorseracing",
+        "sourceFooter": meeting.get("footer") or "",
+        "runners": [],
+    }
+
+    for r in race.get("runners") or []:
+        if not isinstance(r, dict):
+            continue
+        card["runners"].append({
+            "saddleNo": r.get("sno"),
+            "horseSeq": r.get("seq"),
+            "horseName": r.get("horse") or "",
+            "status": r.get("status") or "F",
+            "draw": r.get("draw"),
+            "officialDraw": r.get("odraw"),
+            "age": r.get("age"),
+            "colour": r.get("colour"),
+            "sex": r.get("sex"),
+            "weight": r.get("weight"),
+            "MR": r.get("MR"),
+            "jockeyName": r.get("jockey") or "",
+            "jockeyFull": r.get("jockeyFull") or "",
+            "trainerName": r.get("trainer") or "",
+            "trainerEst": r.get("trainerEst") or "",
+            "owner": r.get("ownerName") or "",
+            "equipment": "".join([
+                "A" if str(r.get("alumites") or "").strip() else "",
+                "B" if str(r.get("blinkers") or "").strip() else "",
+                "T" if str(r.get("tongueties") or "").strip() else "",
+                "E" if str(r.get("earmuffs") or "").strip() else "",
+            ]),
+            "runs": r.get("runs"),
+            "wins": r.get("wins"),
+            "places": r.get("places"),
+            "stakes": r.get("stakes"),
+            "trainerComments": r.get("tcmts") or "",
+            # Not provided by this feed; keep existing Race Edge schema stable.
+            "horseWeight": "",
+            "horseWeightDelta": None,
+            "restDays": None,
+            "odds": "",
+            "openBet": "",
+        })
+
+    return card
