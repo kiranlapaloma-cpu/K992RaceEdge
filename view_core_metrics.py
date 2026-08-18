@@ -44,16 +44,16 @@ def render_core_metrics(ctx):
             n = int(pi_meta.get("field_n", len(display_df)))
             mult = pi_meta.get("multipliers", {})
             # Compact summary (only show components that actually moved)
-            moved = [f"{k}Ã{mult[k]:.3f}" for k in ["Accel","F200_idx","tsSPI","Grind"] if abs(mult.get(k,1.0)-1.0) >= 0.005]
+            moved = [f"{k}x{mult[k]:.3f}" for k in ["Accel","F200_idx","tsSPI","Grind"] if abs(mult.get(k,1.0)-1.0) >= 0.005]
             if moved:
-                st.caption(f"Going: {g} â PI weight multipliers: " + ", ".join(moved) + f" (field={n}).")
+                st.caption(f"Going: {g} - PI weight multipliers: " + ", ".join(moved) + f" (field={n}).")
 
         render_rpss_section(RPSS_INFO)
 
         # GCI-based Race Class Summary removed.
 
-        # ======================= Ahead of the Handicap â WFA Adjusted =======================
-        st.markdown("## Ahead of the Handicap â WFA Adjusted")
+        # ======================= Ahead of the Handicap - WFA Adjusted =======================
+        st.markdown("## Ahead of the Handicap - WFA Adjusted")
         st.caption(
             "Select a line horse and assign its achieved MR. Race Edge uses each horse's age, "
             "the race date and distance, and the South African WFA scale to calculate the rest of the field. "
@@ -209,7 +209,7 @@ def render_core_metrics(ctx):
         # ======================= /Ahead of the Handicap =======================
         # ======================= End of Batch 2 =======================
 
-        # ======================= Batch 3 â Visuals + Hidden v2 + Ability v2 =======================
+        # ======================= Batch 3 - Visuals + Hidden v2 + Ability v2 =======================
         from matplotlib.patches import Rectangle
         from matplotlib.colors import TwoSlopeNorm
         from matplotlib.lines import Line2D
