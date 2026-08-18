@@ -18,7 +18,7 @@ from typing import Any
 
 import requests
 
-BASE_URL = "https://www.gallop.co.za/php/gallop.php"
+BASE_URL = "https://www.gallop.co.za/fixtures/php/gallop.php"
 DEFAULT_TIMEOUT = 15
 
 
