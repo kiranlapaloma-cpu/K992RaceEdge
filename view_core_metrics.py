@@ -178,14 +178,9 @@ def render_core_metrics(ctx):
                 )
 
                 rating_display = rating_df[[
-                    "Horse", "Age", "Weight (kg)", "WFA (lb)", "WFA (kg)",
-                    "Effective Weight", "PI", "Performance Difference",
-                    "Weight + WFA Adjustment", "Official MR", "MR Achieved", "MR +/-",
+                    "Horse", "Age", "PI", "Official MR", "MR Achieved", "MR +/-",
                 ]].copy()
-                for col in [
-                    "Weight (kg)", "WFA (lb)", "WFA (kg)", "Effective Weight",
-                    "PI", "Performance Difference", "Weight + WFA Adjustment", "MR +/-",
-                ]:
+                for col in ["PI", "MR +/-"]:
                     rating_display[col] = pd.to_numeric(rating_display[col], errors="coerce").round(2)
                 for col in ["Official MR", "MR Achieved"]:
                     rating_display[col] = pd.to_numeric(
