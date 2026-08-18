@@ -10,6 +10,11 @@ from matplotlib.patches import Rectangle
 from matplotlib.colors import TwoSlopeNorm
 from matplotlib.lines import Line2D
 import matplotlib.patheffects as pe
+from metrics_engine import (
+    build_metrics_and_shape,
+    pi_weights_distance_and_context,
+    _collect_markers,
+)
 
 
 # ======================= Modular Race Edge components =======================
