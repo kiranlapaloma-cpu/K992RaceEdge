@@ -6,6 +6,7 @@ import streamlit as st
 from common import canon_horse
 from database import _supabase_configured, load_horse_history, _fetch_all_horse_rows
 from performance_profile import build_performance_profile, render_performance_profile
+from race_prediction import build_race_predictions, prediction_display_table
 from sahr import (
     get_fields_meeting, get_meetings_for_date, meeting_display_label,
     meeting_race_options, race_to_race_edge_card, SAHRError,
@@ -378,6 +379,104 @@ def _render_racecard_runner_profiles(active: pd.DataFrame):
             st.dataframe(profile, width="stretch", hide_index=True)
 
 
+
+def _render_race_prediction(active: pd.DataFrame, card: dict):
+    if active is None or active.empty or not _supabase_configured():
+        return
+
+    distance = _racecard_float(card.get("distance"))
+    if distance is None:
+        return
+
+    prediction = build_race_predictions(
+        active,
+        race_date=card.get("date") or card.get("dateFormat"),
+        distance_m=distance,
+        history_loader=load_horse_history,
+    )
+
+    rows = prediction.get("rows")
+    st.markdown("### Race Edge Prediction")
+    if rows is None or rows.empty:
+        st.caption("No runners have enough saved Race Edge history to build a prediction yet.")
+        return
+
+    st.caption(
+        "Three independent views of today's race. Latest, Established and Peak ratings are "
+        "adjusted for today's carded weight and WFA. Consensus uses finishing ranks across "
+        "the three scenarios; the ratings themselves are not blended."
+    )
+
+    scenarios = prediction.get("scenarios", {})
+    scenario_order = ["Latest Form", "Established Ability", "Peak Ability"]
+    projection_cols = {
+        "Latest Form": "Latest Projection",
+        "Established Ability": "Established Projection",
+        "Peak Ability": "Peak Projection",
+    }
+
+    display_columns = st.columns(3)
+    for display_col, scenario_name in zip(display_columns, scenario_order):
+        with display_col:
+            st.markdown(f"#### {scenario_name}")
+            scenario = scenarios.get(scenario_name)
+            if scenario is None or scenario.empty:
+                st.caption("No valid ratings.")
+                continue
+
+            projection_col = projection_cols[scenario_name]
+            for _, row in scenario.head(4).iterrows():
+                projected = _racecard_float(row.get(projection_col))
+                current_mr = _racecard_float(row.get("Current MR"))
+
+                projected_text = "-" if projected is None else f"{projected:.1f}"
+                edge_text = ""
+                if projected is not None and current_mr is not None:
+                    edge_text = f" | vs MR {projected - current_mr:+.1f}"
+
+                st.markdown(
+                    f"**{int(row['Rank'])}. {row['Horse']}**  \n"
+                    f"Projected {projected_text}{edge_text}"
+                )
+
+    st.markdown("#### Race Edge Consensus Top 4")
+    consensus = prediction.get("consensus", [])
+    if not consensus:
+        st.caption("Not enough comparable Race Edge history for a consensus.")
+    else:
+        consensus_rows = []
+        for item in consensus:
+            ranks = [
+                item.get("latest_rank"),
+                item.get("established_rank"),
+                item.get("peak_rank"),
+            ]
+            consensus_rows.append({
+                "Predicted": item["position"],
+                "Horse": item["horse"],
+                "Latest / Established / Peak": " / ".join(
+                    "-" if rank is None else str(rank) for rank in ranks
+                ),
+                "Evidence": item.get("evidence"),
+            })
+        st.dataframe(
+            pd.DataFrame(consensus_rows),
+            width="stretch",
+            hide_index=True,
+        )
+
+    with st.expander("Prediction Detail", expanded=False):
+        st.dataframe(
+            prediction_display_table(prediction),
+            width="stretch",
+            hide_index=True,
+        )
+        st.caption(
+            "Each projection is normalised to the lightest effective weight in today's field. "
+            "Effective Weight = carded weight + WFA allowance converted to kg. "
+            "Race Edge uses 1 kg = 2 MR points."
+        )
+
 def _render_loaded_race_card(card: dict):
     """Render a loaded Race Edge card regardless of whether it came from SAHR or pasted JSON."""
     # Race header.
@@ -464,6 +563,7 @@ def _render_loaded_race_card(card: dict):
         with st.expander(f"Reserves ({len(reserves)})", expanded=False):
             st.dataframe(reserves[display_cols], width="stretch", hide_index=True)
 
+    _render_race_prediction(active, card)
     _render_racecard_runner_profiles(active)
 
 
