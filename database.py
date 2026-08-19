@@ -11,6 +11,7 @@ except Exception:
 from common import canon_horse
 from performance import compute_race_test_profile
 from data_tools import _horse_metadata_frame
+from performance_profile import build_performance_profile, render_performance_profile
 
 def _supabase_configured() -> bool:
     try:
@@ -456,13 +457,12 @@ def render_horse_search():
         na_position="last",
     ).reset_index(drop=True)
 
-    valid_mr = history.loc[history["mr_achieved"].notna(), "mr_achieved"]
-    latest_mr = valid_mr.iloc[0] if not valid_mr.empty else np.nan
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Saved Runs", len(history))
-    c2.metric("Latest MR", "—" if not np.isfinite(latest_mr) else f"{latest_mr:.0f}")
-    c3.metric("Highest MR", "—" if valid_mr.empty else f"{valid_mr.max():.0f}")
+    profile = build_performance_profile(history)
+    render_performance_profile(
+        profile,
+        show_current_official=False,
+        compact=False,
+    )
 
     display = history.rename(columns={
         "race_date": "Date",

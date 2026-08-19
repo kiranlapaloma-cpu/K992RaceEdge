@@ -5,6 +5,7 @@ import pandas as pd
 import streamlit as st
 from common import canon_horse
 from database import _supabase_configured, load_horse_history, _fetch_all_horse_rows
+from performance_profile import build_performance_profile, render_performance_profile
 from sahr import (
     get_fields_meeting, get_meetings_for_date, meeting_display_label,
     meeting_race_options, race_to_race_edge_card, SAHRError,
@@ -179,6 +180,11 @@ def _render_racecard_history_snapshot(selected_horses: list[str]):
             })
             continue
 
+        performance_profile = build_performance_profile(
+            hist,
+            current_official_mr=current_official,
+        )
+
         h = hist.copy()
         h["race_date"] = pd.to_datetime(h.get("race_date"), errors="coerce")
         for c in ["official_mr", "mr_achieved", "sustain_residual", "rpss", "distance", "race_number"]:
@@ -295,25 +301,13 @@ def _render_racecard_runner_profiles(active: pd.DataFrame):
             na_position="last",
         ).reset_index(drop=True)
 
-        mr_vals = h["mr_achieved"].dropna()
-        edge_vals = h["MR +/-"].dropna()
-
-        latest_mr = mr_vals.iloc[0] if not mr_vals.empty else float("nan")
-        highest_mr = mr_vals.max() if not mr_vals.empty else float("nan")
-        best_edge = edge_vals.max() if not edge_vals.empty else float("nan")
-
         label_bits = [horse, f"{len(h)} saved run{'s' if len(h) != 1 else ''}"]
 
         with st.expander(" | ".join(label_bits), expanded=False):
-            c1, c2 = st.columns(2)
-            c1.metric(
-                "Current Official MR",
-                "-" if pd.isna(current_official) else f"{int(round(float(current_official)))}",
-            )
-            c2.metric(
-                "Best MR Edge",
-                "-" if pd.isna(best_edge)
-                else f"{'+' if int(round(float(best_edge))) > 0 else ''}{int(round(float(best_edge)))}",
+            render_performance_profile(
+                performance_profile,
+                show_current_official=True,
+                compact=True,
             )
 
             current_bits = []
