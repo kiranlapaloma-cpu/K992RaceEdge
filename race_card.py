@@ -303,6 +303,14 @@ def _render_racecard_runner_profiles(active: pd.DataFrame):
 
         label_bits = [horse, f"{len(h)} saved run{'s' if len(h) != 1 else ''}"]
 
+        # Build the shared Performance Profile from this horse's historical runs.
+        # The live Race Card Official MR is passed separately as the current mark;
+        # historical MR +/- values continue to use each saved run's own Official MR.
+        performance_profile = build_performance_profile(
+            h,
+            current_official_mr=None if pd.isna(current_official) else float(current_official),
+        )
+
         with st.expander(" | ".join(label_bits), expanded=False):
             render_performance_profile(
                 performance_profile,
