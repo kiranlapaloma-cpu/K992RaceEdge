@@ -403,8 +403,9 @@ def _render_race_prediction(active: pd.DataFrame, card: dict):
 
     st.caption(
         "Three independent views of today's race. Latest, Established and Peak ratings are "
-        "adjusted for today's carded weight and WFA. Consensus uses finishing ranks across "
-        "the three scenarios; the ratings themselves are not blended."
+        "adjusted for today's carded weight and WFA. Margins are sequential: each horse is "
+        "shown behind the horse immediately above it, using 1 rating point = 0.5L. "
+        "Consensus uses finishing ranks only; the ratings themselves are not blended."
     )
 
     scenarios = prediction.get("scenarios", {})
@@ -426,18 +427,27 @@ def _render_race_prediction(active: pd.DataFrame, card: dict):
 
             projection_col = projection_cols[scenario_name]
             for _, row in scenario.head(4).iterrows():
-                projected = _racecard_float(row.get(projection_col))
-                current_mr = _racecard_float(row.get("Current MR"))
+                rank = int(row["Rank"])
+                margin = _racecard_float(row.get("Margin Behind Previous (L)"))
+                if margin is None:
+                    margin = 0.0
 
-                projected_text = "-" if projected is None else f"{projected:.1f}"
-                edge_text = ""
-                if projected is not None and current_mr is not None:
-                    edge_text = f" | vs MR {projected - current_mr:+.1f}"
+                # Keep zero explicitly as 0.0L. Quarter-length margins retain
+                # their precision (e.g. 0.25L, 0.5L, 0.75L).
+                if abs(margin) < 1e-9:
+                    margin_text = "0.0L"
+                elif abs(margin * 4 - round(margin * 4)) < 1e-9:
+                    if abs(margin * 2 - round(margin * 2)) < 1e-9:
+                        margin_text = f"{margin:.1f}L"
+                    else:
+                        margin_text = f"{margin:.2f}L"
+                else:
+                    margin_text = f"{margin:.2f}L"
 
-                st.markdown(
-                    f"**{int(row['Rank'])}. {row['Horse']}**  \n"
-                    f"Projected {projected_text}{edge_text}"
-                )
+                if rank == 1:
+                    st.markdown(f"**1. {row['Horse']}**")
+                else:
+                    st.markdown(f"**{rank}. {row['Horse']}** - {margin_text}")
 
     st.markdown("#### Race Edge Consensus Top 4")
     consensus = prediction.get("consensus", [])
@@ -472,9 +482,10 @@ def _render_race_prediction(active: pd.DataFrame, card: dict):
             hide_index=True,
         )
         st.caption(
-            "Each projection is normalised to the lightest effective weight in today's field. "
-            "Effective Weight = carded weight + WFA allowance converted to kg. "
-            "Race Edge uses 1 kg = 2 MR points."
+            "Raw projected ratings are shown here for reference. Each projection is normalised "
+            "to the lightest effective weight in today's field. Effective Weight = carded weight "
+            "+ WFA allowance converted to kg. Race Edge uses 1 kg = 2 MR points and "
+            "1 rating point = 0.5L for the sequential margins shown above."
         )
 
 def _render_loaded_race_card(card: dict):

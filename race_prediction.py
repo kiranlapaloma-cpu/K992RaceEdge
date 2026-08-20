@@ -142,8 +142,26 @@ def build_race_predictions(
         ).reset_index(drop=True)
         valid["Rank"] = np.arange(1, len(valid) + 1)
 
+        # Sequential predicted margin:
+        # each horse is measured only against the horse immediately above it.
+        # Race Edge convention: 1 rating point = 0.5 lengths.
+        valid["Margin Behind Previous (L)"] = 0.0
+        if len(valid) > 1:
+            previous_rating = pd.to_numeric(valid[projection_col], errors="coerce").shift(1)
+            current_rating = pd.to_numeric(valid[projection_col], errors="coerce")
+            margins = (previous_rating - current_rating) * 0.5
+            valid.loc[1:, "Margin Behind Previous (L)"] = margins.loc[1:].clip(lower=0.0)
+        valid["Margin Behind Previous (L)"] = (
+            pd.to_numeric(valid["Margin Behind Previous (L)"], errors="coerce")
+            .fillna(0.0)
+            .round(2)
+        )
+
         scenarios[scenario_name] = valid[
-            ["Rank", "Horse", projection_col, "Current MR", "Evidence"]
+            [
+                "Rank", "Horse", projection_col, "Margin Behind Previous (L)",
+                "Current MR", "Evidence"
+            ]
         ].copy()
 
         df[f"{scenario_name} Rank"] = df["Horse"].map(
