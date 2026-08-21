@@ -482,10 +482,11 @@ def _render_race_prediction(active: pd.DataFrame, card: dict):
             hide_index=True,
         )
         st.caption(
-            "Raw projected ratings are shown here for reference. Each projection is normalised "
-            "to the lightest effective weight in today's field. Effective Weight = carded weight "
-            "+ WFA allowance converted to kg. Race Edge uses 1 kg = 2 MR points and "
-            "1 rating point = 0.5L for the sequential margins shown above."
+            "Raw projected ratings are shown here for reference. Latest, Established and Peak "
+            "are grouped independently into Group A, B, C and so on. A new group starts when a "
+            "horse is 5 or more rating points below the leader of the current group. "
+            "Each projection is normalised to the lightest effective weight in today's field. "
+            "Race Edge uses 1 kg = 2 MR points and 1 rating point = 0.5L."
         )
 
 def _render_loaded_race_card(card: dict):

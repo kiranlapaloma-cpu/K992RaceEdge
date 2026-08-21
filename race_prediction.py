@@ -41,6 +41,55 @@ def _evidence_score(label: str) -> int:
     }.get(str(label or ""), 0)
 
 
+def _group_label(index: int) -> str:
+    """Return A, B, ... Z, AA, AB ... for zero-based group indices."""
+    index = int(index)
+    label = ""
+    while True:
+        index, rem = divmod(index, 26)
+        label = chr(65 + rem) + label
+        if index == 0:
+            return label
+        index -= 1
+
+
+def assign_rating_groups(
+    ratings: pd.Series,
+    *,
+    threshold_points: float = 5.0,
+) -> pd.Series:
+    """
+    Assign Group A, B, C... using a fixed leader anchor for each group.
+
+    A horse stays in the current group while it is LESS THAN threshold_points
+    below that group's leader. A gap of threshold_points or more starts a
+    new group.
+
+    Example with threshold 5:
+        58, 57, 55 -> Group A
+        53, 52, 51 -> Group B
+    because 53 is exactly 5 points below the Group A leader (58).
+    """
+    numeric = pd.to_numeric(ratings, errors="coerce")
+    result = pd.Series(index=ratings.index, dtype="object")
+
+    valid = numeric.dropna().sort_values(ascending=False, kind="stable")
+    if valid.empty:
+        return result
+
+    group_index = 0
+    group_leader = float(valid.iloc[0])
+
+    for idx, rating in valid.items():
+        rating = float(rating)
+        if group_leader - rating >= float(threshold_points):
+            group_index += 1
+            group_leader = rating
+        result.loc[idx] = f"Group {_group_label(group_index)}"
+
+    return result
+
+
 def build_race_predictions(
     active: pd.DataFrame,
     *,
@@ -210,19 +259,44 @@ def build_race_predictions(
 
 
 def prediction_display_table(prediction: dict) -> pd.DataFrame:
+    """
+    Detailed prediction table with independent 5-point rating groups.
+
+    Group A/B/C... is calculated separately for Latest, Established and Peak.
+    A new group begins when a horse is 5 or more rating points below the
+    leader of the current group.
+    """
     df = prediction.get("rows")
     if df is None or df.empty:
         return pd.DataFrame()
+
+    work = df.copy()
+
+    scenario_columns = [
+        ("Latest Projection", "Latest Group"),
+        ("Established Projection", "Established Group"),
+        ("Peak Projection", "Peak Group"),
+    ]
+
+    for projection_col, group_col in scenario_columns:
+        if projection_col in work.columns:
+            work[group_col] = assign_rating_groups(
+                work[projection_col],
+                threshold_points=5.0,
+            )
 
     cols = [
         "Horse",
         "Current MR",
         "Latest Projection",
+        "Latest Group",
         "Established Projection",
+        "Established Group",
         "Peak Projection",
+        "Peak Group",
         "Evidence",
     ]
-    out = df[[c for c in cols if c in df.columns]].copy()
+    out = work[[c for c in cols if c in work.columns]].copy()
 
     for col in [
         "Current MR",
@@ -233,7 +307,7 @@ def prediction_display_table(prediction: dict) -> pd.DataFrame:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce").round(1)
 
-    helper = df[
+    helper = work[
         ["Horse", "Latest Form Rank", "Established Ability Rank", "Peak Ability Rank"]
     ].copy()
     rank_cols = ["Latest Form Rank", "Established Ability Rank", "Peak Ability Rank"]
