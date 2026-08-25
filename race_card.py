@@ -241,7 +241,121 @@ def _render_racecard_history_snapshot(selected_horses: list[str]):
         st.dataframe(runs, width="stretch", hide_index=True)
 
 
-def _render_racecard_runner_profiles(active: pd.DataFrame):
+
+def _compact_group(value):
+    text = str(value or "").strip()
+    if not text or text.lower() in {"nan", "<na>", "none"}:
+        return "-"
+    return text.replace("Group ", "")
+
+
+def _runner_label(number, horse):
+    try:
+        if number is not None and not pd.isna(number):
+            return f"#{int(round(float(number)))} {horse}"
+    except Exception:
+        pass
+    return str(horse)
+
+
+def _prediction_lookup(prediction: dict | None) -> pd.DataFrame:
+    if not prediction:
+        return pd.DataFrame()
+    rows = prediction.get("rows")
+    if rows is None or rows.empty:
+        return pd.DataFrame()
+    out = rows.copy()
+    out["Horse Key"] = out["Horse"].map(canon_horse)
+    return out
+
+
+def _enhanced_racecard_table(active: pd.DataFrame, prediction: dict | None) -> pd.DataFrame:
+    """Primary race-day table: today's card plus Race Edge ability snapshot."""
+    table = active.copy()
+    pred = _prediction_lookup(prediction)
+
+    if not pred.empty:
+        merge_cols = [
+            c for c in [
+                "Horse Key", "Latest MR", "Established MR", "Peak MR",
+                "Latest Group", "Established Group", "Peak Group"
+            ]
+            if c in pred.columns
+        ]
+        table["Horse Key"] = table["Horse"].map(canon_horse)
+        table = table.merge(
+            pred[merge_cols].drop_duplicates("Horse Key"),
+            on="Horse Key",
+            how="left",
+        )
+    else:
+        for c in [
+            "Latest MR", "Established MR", "Peak MR",
+            "Latest Group", "Established Group", "Peak Group"
+        ]:
+            table[c] = np.nan
+
+    table["Groups"] = table.apply(
+        lambda r: " / ".join([
+            _compact_group(r.get("Latest Group")),
+            _compact_group(r.get("Established Group")),
+            _compact_group(r.get("Peak Group")),
+        ]),
+        axis=1,
+    )
+
+    out = table[[
+        c for c in [
+            "No.", "Horse", "Draw", "Age", "Weight", "Official MR",
+            "Latest MR", "Established MR", "Peak MR", "Groups"
+        ]
+        if c in table.columns
+    ]].copy()
+
+    for c in ["No.", "Draw", "Age", "Official MR"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").round().astype("Int64")
+    if "Weight" in out.columns:
+        out["Weight"] = pd.to_numeric(out["Weight"], errors="coerce").round(1)
+    for c in ["Latest MR", "Established MR", "Peak MR"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").round(1)
+
+    out = out.rename(columns={
+        "Weight": "Wgt",
+        "Official MR": "MR",
+        "Latest MR": "Latest",
+        "Established MR": "Est.",
+        "Peak MR": "Peak",
+    })
+    return out
+
+
+def _format_margin(margin) -> str:
+    margin = _racecard_float(margin)
+    if margin is None or abs(margin) < 1e-9:
+        return "0.0L"
+    if abs(margin * 4 - round(margin * 4)) < 1e-9:
+        if abs(margin * 2 - round(margin * 2)) < 1e-9:
+            return f"{margin:.1f}L"
+        return f"{margin:.2f}L"
+    return f"{margin:.2f}L"
+
+
+def _scenario_group_blocks(scenario: pd.DataFrame, group_col: str):
+    """Return ordered (group, dataframe) blocks for a scenario."""
+    if scenario is None or scenario.empty:
+        return []
+    work = scenario.copy()
+    if group_col not in work.columns:
+        work[group_col] = "Group A"
+    groups = []
+    for group in work[group_col].dropna().drop_duplicates().tolist():
+        groups.append((str(group), work.loc[work[group_col] == group].copy()))
+    return groups
+
+
+def _render_racecard_runner_profiles(active: pd.DataFrame, prediction: dict | None = None):
     """
     Show every active runner as an expandable full Race Edge profile.
     Saved runs are ordered by race date, newest first.
@@ -255,6 +369,14 @@ def _render_racecard_runner_profiles(active: pd.DataFrame):
     if not _supabase_configured():
         st.info("Supabase is not configured, so saved Race Edge profiles cannot be loaded.")
         return
+
+    pred_lookup = _prediction_lookup(prediction)
+    pred_by_key = {}
+    if not pred_lookup.empty:
+        pred_by_key = {
+            str(row["Horse Key"]): row
+            for _, row in pred_lookup.iterrows()
+        }
 
     for _, runner in active.iterrows():
         horse = str(runner.get("Horse") or "").strip()
@@ -272,12 +394,12 @@ def _render_racecard_runner_profiles(active: pd.DataFrame):
         try:
             hist = load_horse_history(horse)
         except Exception as exc:
-            with st.expander(f"{horse} | profile unavailable", expanded=False):
+            with st.expander(f"{_runner_label(saddle_no, horse)} | profile unavailable", expanded=False):
                 st.warning(f"Could not load saved history: {exc}")
             continue
 
         if hist.empty:
-            label = f"{horse} | No Race Edge history"
+            label = f"{_runner_label(saddle_no, horse)} | No Race Edge history"
             with st.expander(label, expanded=False):
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Current Official MR", "-" if pd.isna(current_official) else f"{int(round(float(current_official)))}")
@@ -302,7 +424,25 @@ def _render_racecard_runner_profiles(active: pd.DataFrame):
             na_position="last",
         ).reset_index(drop=True)
 
-        label_bits = [horse, f"{len(h)} saved run{'s' if len(h) != 1 else ''}"]
+        pred_row = pred_by_key.get(canon_horse(horse))
+        group_text = "-"
+        if pred_row is not None:
+            group_text = " / ".join([
+                _compact_group(pred_row.get("Latest Group")),
+                _compact_group(pred_row.get("Established Group")),
+                _compact_group(pred_row.get("Peak Group")),
+            ])
+
+        label_bits = [
+            _runner_label(saddle_no, horse),
+            f"{len(h)} saved run{'s' if len(h) != 1 else ''}",
+        ]
+        if pd.notna(current_official):
+            label_bits.append(f"MR {int(round(float(current_official)))}")
+        if pd.notna(current_weight):
+            label_bits.append(f"{float(current_weight):.1f}kg")
+        if group_text != "- / - / -":
+            label_bits.append(group_text)
 
         # Build the shared Performance Profile from this horse's historical runs.
         # The live Race Card Official MR is passed separately as the current mark;
@@ -380,44 +520,47 @@ def _render_racecard_runner_profiles(active: pd.DataFrame):
 
 
 
-def _render_race_prediction(active: pd.DataFrame, card: dict):
+def _render_race_prediction(
+    active: pd.DataFrame,
+    card: dict,
+    prediction: dict | None = None,
+):
     if active is None or active.empty or not _supabase_configured():
-        return
+        return prediction
 
     distance = _racecard_float(card.get("distance"))
     if distance is None:
-        return
+        return prediction
 
-    prediction = build_race_predictions(
-        active,
-        race_date=card.get("date") or card.get("dateFormat"),
-        distance_m=distance,
-        history_loader=load_horse_history,
-    )
+    if prediction is None:
+        prediction = build_race_predictions(
+            active,
+            race_date=card.get("date") or card.get("dateFormat"),
+            distance_m=distance,
+            history_loader=load_horse_history,
+        )
 
-    rows = prediction.get("rows")
+    rows = prediction.get("rows") if prediction else None
     st.markdown("### Race Edge Prediction")
     if rows is None or rows.empty:
         st.caption("No runners have enough saved Race Edge history to build a prediction yet.")
-        return
+        return prediction
 
     st.caption(
-        "Three independent views of today's race. Latest, Established and Peak ratings are "
-        "adjusted for today's carded weight and WFA. Margins are sequential: each horse is "
-        "shown behind the horse immediately above it, using 1 rating point = 0.5L. "
-        "Consensus uses finishing ranks only; the ratings themselves are not blended."
+        "Latest, Established and Peak are independent views of today's race. "
+        "Margins are sequential and use 1 rating point = 0.5L. "
+        "A 5-point gap starts a new ability group."
     )
 
     scenarios = prediction.get("scenarios", {})
-    scenario_order = ["Latest Form", "Established Ability", "Peak Ability"]
-    projection_cols = {
-        "Latest Form": "Latest Projection",
-        "Established Ability": "Established Projection",
-        "Peak Ability": "Peak Projection",
-    }
+    scenario_order = [
+        ("Latest Form", "Latest Group"),
+        ("Established Ability", "Established Group"),
+        ("Peak Ability", "Peak Group"),
+    ]
 
     display_columns = st.columns(3)
-    for display_col, scenario_name in zip(display_columns, scenario_order):
+    for display_col, (scenario_name, group_col) in zip(display_columns, scenario_order):
         with display_col:
             st.markdown(f"#### {scenario_name}")
             scenario = scenarios.get(scenario_name)
@@ -425,29 +568,18 @@ def _render_race_prediction(active: pd.DataFrame, card: dict):
                 st.caption("No valid ratings.")
                 continue
 
-            projection_col = projection_cols[scenario_name]
-            for _, row in scenario.head(4).iterrows():
-                rank = int(row["Rank"])
-                margin = _racecard_float(row.get("Margin Behind Previous (L)"))
-                if margin is None:
-                    margin = 0.0
-
-                # Keep zero explicitly as 0.0L. Quarter-length margins retain
-                # their precision (e.g. 0.25L, 0.5L, 0.75L).
-                if abs(margin) < 1e-9:
-                    margin_text = "0.0L"
-                elif abs(margin * 4 - round(margin * 4)) < 1e-9:
-                    if abs(margin * 2 - round(margin * 2)) < 1e-9:
-                        margin_text = f"{margin:.1f}L"
+            for group_name, block in _scenario_group_blocks(scenario, group_col):
+                st.caption(group_name.upper())
+                for _, row in block.head(4).iterrows():
+                    rank = int(row["Rank"])
+                    runner = _runner_label(row.get("No."), row["Horse"])
+                    if rank == 1:
+                        st.markdown(f"**{rank}. {runner}**")
                     else:
-                        margin_text = f"{margin:.2f}L"
-                else:
-                    margin_text = f"{margin:.2f}L"
-
-                if rank == 1:
-                    st.markdown(f"**1. {row['Horse']}**")
-                else:
-                    st.markdown(f"**{rank}. {row['Horse']}** - {margin_text}")
+                        st.markdown(
+                            f"**{rank}. {runner}** - "
+                            f"{_format_margin(row.get('Margin Behind Previous (L)'))}"
+                        )
 
     st.markdown("#### Race Edge Consensus Top 4")
     consensus = prediction.get("consensus", [])
@@ -456,19 +588,29 @@ def _render_race_prediction(active: pd.DataFrame, card: dict):
     else:
         consensus_rows = []
         for item in consensus:
-            ranks = [
-                item.get("latest_rank"),
-                item.get("established_rank"),
-                item.get("peak_rank"),
-            ]
+            rank_text = " / ".join(
+                "-" if rank is None else str(rank)
+                for rank in [
+                    item.get("latest_rank"),
+                    item.get("established_rank"),
+                    item.get("peak_rank"),
+                ]
+            )
+            group_text = " / ".join(
+                _compact_group(group)
+                for group in [
+                    item.get("latest_group"),
+                    item.get("established_group"),
+                    item.get("peak_group"),
+                ]
+            )
             consensus_rows.append({
-                "Predicted": item["position"],
-                "Horse": item["horse"],
-                "Latest / Established / Peak": " / ".join(
-                    "-" if rank is None else str(rank) for rank in ranks
-                ),
-                "Evidence": item.get("evidence"),
+                "#": item["position"],
+                "Runner": _runner_label(item.get("no"), item["horse"]),
+                "L / E / P": rank_text,
+                "Groups": group_text,
             })
+
         st.dataframe(
             pd.DataFrame(consensus_rows),
             width="stretch",
@@ -482,42 +624,27 @@ def _render_race_prediction(active: pd.DataFrame, card: dict):
             hide_index=True,
         )
         st.caption(
-            "Raw projected ratings are shown here for reference. Latest, Established and Peak "
-            "are grouped independently into Group A, B, C and so on. A new group starts when a "
-            "horse is 5 or more rating points below the leader of the current group. "
-            "Each projection is normalised to the lightest effective weight in today's field. "
-            "Race Edge uses 1 kg = 2 MR points and 1 rating point = 0.5L."
+            "Projected ratings are shown only as an audit layer. "
+            "A/B/C groups are calculated independently for Latest, Established and Peak; "
+            "a new group starts at a 5-point gap from the current group leader."
         )
 
+    return prediction
+
+
 def _render_loaded_race_card(card: dict):
-    """Render a loaded Race Edge card regardless of whether it came from SAHR or pasted JSON."""
-    # Race header.
+    """Render the Race Card as the race-day decision centre."""
     date_label = str(card.get("dateFormat") or card.get("date") or "-")
     track = str(card.get("clubName") or "-")
     race_no = _racecard_int(card.get("race"))
     time_label = str(card.get("time") or "-")
     distance = _racecard_int(card.get("distance"))
     surface = str(card.get("surfaceDescr") or "-")
-    direction = str(card.get("direction") or "").strip()
     name = str(card.get("name") or "").strip()
     description = str(card.get("description") or "").strip()
     wfa_text = str(card.get("WFA") or "").strip()
     stake = str(card.get("stake") or "").strip()
     currency = str(card.get("currency") or "").strip()
-
-    st.markdown(f"### {track}")
-    st.markdown(
-        f"**{date_label} | Race {race_no if race_no is not None else '-'} | {time_label} | "
-        f"{distance if distance is not None else '-'}m | {surface}"
-        + (f" | {direction}" if direction else "")
-        + "**"
-    )
-    if name:
-        st.write(name)
-    if description:
-        st.caption(description)
-    if wfa_text:
-        st.caption(wfa_text)
 
     active_count = sum(
         1 for r in card.get("runners", [])
@@ -528,17 +655,26 @@ def _render_loaded_race_card(card: dict):
         if str(r.get("status") or "").strip().upper() == "R"
     )
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Runners", active_count)
-    m2.metric("Reserves", reserve_count)
-    m3.metric("Distance", "-" if distance is None else f"{distance}m")
-    stake_label = "-"
+    # Compact race header.
+    st.markdown(
+        f"### {track} | R{race_no if race_no is not None else '-'} | "
+        f"{distance if distance is not None else '-'}m | {time_label}"
+    )
+    header_bits = [date_label, surface, f"{active_count} runners"]
+    if reserve_count:
+        header_bits.append(f"{reserve_count} reserve{'s' if reserve_count != 1 else ''}")
     if stake:
         try:
-            stake_label = f"{currency}{int(float(str(stake).replace(',', ''))):,}"
+            header_bits.append(f"{currency}{int(float(str(stake).replace(',', ''))):,}")
         except Exception:
-            stake_label = f"{currency}{stake}"
-    m4.metric("Stake", stake_label)
+            header_bits.append(f"{currency}{stake}")
+    st.caption(" | ".join(header_bits))
+    if name:
+        st.markdown(f"**{name}**")
+    if description:
+        st.caption(description)
+    if wfa_text:
+        st.caption(wfa_text)
 
     db_counts = {}
     db_error = None
@@ -556,27 +692,45 @@ def _render_loaded_race_card(card: dict):
     active = field[field["Status"] == "Runner"].copy()
     reserves = field[field["Status"] == "Reserve"].copy()
 
+    # Build prediction once and reuse it across card, prediction and profiles.
+    prediction = None
+    if _supabase_configured() and distance is not None:
+        try:
+            prediction = build_race_predictions(
+                active,
+                race_date=card.get("date") or card.get("dateFormat"),
+                distance_m=distance,
+                history_loader=load_horse_history,
+            )
+        except Exception as exc:
+            st.warning(f"Race Edge prediction could not be built: {exc}")
+
     if db_error:
         st.warning(f"Race Edge database status could not be loaded: {db_error}")
     elif _supabase_configured():
         with_history = int((active["Race Edge Runs"].fillna(0) > 0).sum())
-        st.caption(f"Race Edge database coverage: {with_history}/{len(active)} active runners have saved history.")
+        st.caption(
+            f"Race Edge coverage: {with_history}/{len(active)} active runners have saved history."
+        )
 
-    display_cols = [
-        "No.", "Horse", "Draw", "Age", "Weight", "Official MR",
-        "Jockey", "Trainer", "Race Edge Runs",
-        "Latest MR Achieved", "Highest MR Achieved",
-    ]
-
-    st.markdown("### Runners")
-    st.dataframe(active[display_cols], width="stretch", hide_index=True)
+    st.markdown("### Race Card")
+    st.dataframe(
+        _enhanced_racecard_table(active, prediction),
+        width="stretch",
+        hide_index=True,
+    )
+    st.caption("Groups = Latest / Established / Peak. A 5-point gap starts the next group.")
 
     if not reserves.empty:
         with st.expander(f"Reserves ({len(reserves)})", expanded=False):
-            st.dataframe(reserves[display_cols], width="stretch", hide_index=True)
+            reserve_cols = [
+                c for c in ["No.", "Horse", "Draw", "Age", "Weight", "Official MR", "Jockey", "Trainer"]
+                if c in reserves.columns
+            ]
+            st.dataframe(reserves[reserve_cols], width="stretch", hide_index=True)
 
-    _render_race_prediction(active, card)
-    _render_racecard_runner_profiles(active)
+    _render_race_prediction(active, card, prediction=prediction)
+    _render_racecard_runner_profiles(active, prediction=prediction)
 
 
 def render_race_card():

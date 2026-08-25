@@ -153,6 +153,7 @@ def build_race_predictions(
         effective_weight = float(carded_weight) + wfa_kg
 
         rows.append({
+            "No.": _num(runner.get("No.")),
             "Horse": horse,
             "Current MR": current_mr,
             "Age": int(round(age)),
@@ -217,6 +218,44 @@ def build_race_predictions(
             dict(zip(valid["Horse"], valid["Rank"]))
         )
 
+    # Independent 5-point ability groups for today's adjusted projections.
+    # Group membership is anchored to the leader of each group; a 5+ point
+    # gap starts the next group.
+    for _projection_col, _group_col in [
+        ("Latest Projection", "Latest Group"),
+        ("Established Projection", "Established Group"),
+        ("Peak Projection", "Peak Group"),
+    ]:
+        if _projection_col in df.columns:
+            df[_group_col] = assign_rating_groups(
+                df[_projection_col],
+                threshold_points=5.0,
+            )
+
+    # Add the assigned group back into each scenario frame.
+    for _scenario_name, _scenario in scenarios.items():
+        _projection_col = {
+            "Latest Form": "Latest Projection",
+            "Established Ability": "Established Projection",
+            "Peak Ability": "Peak Projection",
+        }[_scenario_name]
+        _group_col = {
+            "Latest Form": "Latest Group",
+            "Established Ability": "Established Group",
+            "Peak Ability": "Peak Group",
+        }[_scenario_name]
+        _group_map = dict(zip(df["Horse"], df[_group_col]))
+        _number_map = dict(zip(df["Horse"], df["No."]))
+        _scenario[_group_col] = _scenario["Horse"].map(_group_map)
+        _scenario["No."] = _scenario["Horse"].map(_number_map)
+        ordered = [
+            "Rank", "No.", "Horse", _projection_col, _group_col,
+            "Margin Behind Previous (L)", "Current MR", "Evidence"
+        ]
+        scenarios[_scenario_name] = _scenario[
+            [c for c in ordered if c in _scenario.columns]
+        ].copy()
+
     # Consensus is rank-based only. No projected rating blend is calculated.
     rank_cols = [f"{name} Rank" for name in scenario_defs]
     df["Scenarios Available"] = df[rank_cols].notna().sum(axis=1)
@@ -241,10 +280,14 @@ def build_race_predictions(
     for _, row in consensus_df.head(4).iterrows():
         consensus.append({
             "position": int(row["Consensus Position"]),
+            "no": None if pd.isna(row.get("No.")) else int(round(float(row.get("No.")))),
             "horse": row["Horse"],
             "latest_rank": None if pd.isna(row["Latest Form Rank"]) else int(row["Latest Form Rank"]),
             "established_rank": None if pd.isna(row["Established Ability Rank"]) else int(row["Established Ability Rank"]),
             "peak_rank": None if pd.isna(row["Peak Ability Rank"]) else int(row["Peak Ability Rank"]),
+            "latest_group": row.get("Latest Group"),
+            "established_group": row.get("Established Group"),
+            "peak_group": row.get("Peak Group"),
             "evidence": row["Evidence"],
         })
 
@@ -260,11 +303,11 @@ def build_race_predictions(
 
 def prediction_display_table(prediction: dict) -> pd.DataFrame:
     """
-    Detailed prediction table with independent 5-point rating groups.
+    Compact audit table for the Race Card.
 
-    Group A/B/C... is calculated separately for Latest, Established and Peak.
-    A new group begins when a horse is 5 or more rating points below the
-    leader of the current group.
+    Latest / Established / Peak groups are independent 5-point bands.
+    Raw projected ratings remain visible here, while the main Race Card
+    uses rank, sequential margins and group structure.
     """
     df = prediction.get("rows")
     if df is None or df.empty:
@@ -272,31 +315,30 @@ def prediction_display_table(prediction: dict) -> pd.DataFrame:
 
     work = df.copy()
 
-    scenario_columns = [
+    # Backward-safe grouping in case a caller supplies an older prediction dict.
+    for projection_col, group_col in [
         ("Latest Projection", "Latest Group"),
         ("Established Projection", "Established Group"),
         ("Peak Projection", "Peak Group"),
-    ]
-
-    for projection_col, group_col in scenario_columns:
-        if projection_col in work.columns:
+    ]:
+        if group_col not in work.columns and projection_col in work.columns:
             work[group_col] = assign_rating_groups(
                 work[projection_col],
                 threshold_points=5.0,
             )
 
-    cols = [
-        "Horse",
-        "Current MR",
-        "Latest Projection",
-        "Latest Group",
-        "Established Projection",
-        "Established Group",
-        "Peak Projection",
-        "Peak Group",
-        "Evidence",
-    ]
-    out = work[[c for c in cols if c in work.columns]].copy()
+    out = work[[
+        c for c in [
+            "No.", "Horse", "Current MR",
+            "Latest Projection", "Latest Group",
+            "Established Projection", "Established Group",
+            "Peak Projection", "Peak Group",
+        ]
+        if c in work.columns
+    ]].copy()
+
+    if "No." in out.columns:
+        out["No."] = pd.to_numeric(out["No."], errors="coerce").round().astype("Int64")
 
     for col in [
         "Current MR",
@@ -306,6 +348,11 @@ def prediction_display_table(prediction: dict) -> pd.DataFrame:
     ]:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce").round(1)
+
+    # Use compact A/B/C labels in the detail table.
+    for col in ["Latest Group", "Established Group", "Peak Group"]:
+        if col in out.columns:
+            out[col] = out[col].astype("string").str.replace("Group ", "", regex=False)
 
     helper = work[
         ["Horse", "Latest Form Rank", "Established Ability Rank", "Peak Ability Rank"]
