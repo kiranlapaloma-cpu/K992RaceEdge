@@ -742,19 +742,17 @@ def _session_load_meeting_race(meeting: dict, race_key: str):
     return card
 
 
-def _meeting_race_nav(meeting: dict):
+def _render_race_strip(meeting: dict):
     """
-    One-click navigation for an already-loaded meeting.
-
-    Returns the selected race card when a navigation control is used,
-    otherwise None.
+    Formgrids-style one-tap race navigation.
+    Shows a single row (or wrapped rows on narrow screens) of R1, R2, R3...
+    and highlights the currently loaded race.
     """
     options = meeting_race_options(meeting)
     if not options:
-        return None
+        return
 
     race_keys = [str(key) for key, _label in options]
-    label_by_key = {str(key): label for key, label in options}
 
     current_key = str(st.session_state.get("sahr_current_race_key") or "")
     if current_key not in race_keys:
@@ -765,51 +763,18 @@ def _meeting_race_nav(meeting: dict):
                 try:
                     if int(key) == int(payload_race):
                         current_key = key
+                        st.session_state["sahr_current_race_key"] = key
                         break
                 except Exception:
                     pass
 
-    # Previous / current position / next
-    current_index = race_keys.index(current_key) if current_key in race_keys else None
-    pcol, ccol, ncol = st.columns([1, 1.5, 1])
+    st.markdown("**Race:**")
 
-    with pcol:
-        prev_disabled = current_index is None or current_index == 0
-        if st.button(
-            "< Previous Race",
-            disabled=prev_disabled,
-            width="stretch",
-            key="sahr_prev_race",
-        ):
-            return _session_load_meeting_race(meeting, race_keys[current_index - 1])
-
-    with ccol:
-        if current_index is None:
-            st.markdown(
-                "<div style='text-align:center;padding-top:0.45rem;'><b>Select a race</b></div>",
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
-                f"<div style='text-align:center;padding-top:0.45rem;'>"
-                f"<b>R{current_index + 1} of {len(race_keys)}</b></div>",
-                unsafe_allow_html=True,
-            )
-
-    with ncol:
-        next_disabled = current_index is None or current_index >= len(race_keys) - 1
-        if st.button(
-            "Next Race >",
-            disabled=next_disabled,
-            width="stretch",
-            key="sahr_next_race",
-        ):
-            return _session_load_meeting_race(meeting, race_keys[current_index + 1])
-
-    # Direct race jump buttons. Keep rows reasonably compact on iPad/mobile.
-    st.caption("Quick race navigation")
-    for start in range(0, len(race_keys), 8):
-        chunk = race_keys[start:start + 8]
+    # Keep the strip compact. Up to 10 races usually fits comfortably on iPad.
+    # If there are more, wrap onto a second row.
+    per_row = 10
+    for start in range(0, len(race_keys), per_row):
+        chunk = race_keys[start:start + per_row]
         cols = st.columns(len(chunk))
         for col, key in zip(cols, chunk):
             with col:
@@ -817,16 +782,16 @@ def _meeting_race_nav(meeting: dict):
                     race_num = int(key)
                 except Exception:
                     race_num = race_keys.index(key) + 1
+
                 is_current = key == current_key
                 if st.button(
-                    f"R{race_num}",
+                    str(race_num),
                     type="primary" if is_current else "secondary",
                     width="stretch",
-                    key=f"sahr_quick_race_{key}",
+                    key=f"sahr_race_strip_{key}",
                 ):
-                    return _session_load_meeting_race(meeting, key)
-
-    return None
+                    _session_load_meeting_race(meeting, key)
+                    st.rerun()
 
 
 def render_race_card():
@@ -898,6 +863,13 @@ def render_race_card():
                     st.session_state["race_card_payload"] = None
                     st.session_state["sahr_current_race_key"] = None
                     st.success(str(meeting.get("heading") or "Meeting loaded."))
+
+                    # Open Race 1 immediately after loading the meeting.
+                    options = meeting_race_options(meeting)
+                    if options:
+                        first_key = str(options[0][0])
+                        _session_load_meeting_race(meeting, first_key)
+                        st.rerun()
                 except Exception as exc:
                     st.session_state["sahr_meeting"] = None
                     st.error(f"Could not load SAHorseracing meeting: {exc}")
@@ -909,31 +881,7 @@ def render_race_card():
                 st.markdown(f"**{heading}**")
             options = meeting_race_options(meeting)
             if options:
-                try:
-                    nav_card = _meeting_race_nav(meeting)
-                    if nav_card is not None:
-                        st.session_state["race_card_payload"] = nav_card
-                except Exception as exc:
-                    st.error(f"Could not switch race: {exc}")
-
-                # Keep the descriptive dropdown as a fallback for jumping by
-                # race name/time, but quick buttons and Previous/Next are the
-                # normal one-click race-day workflow.
-                option_map = {label: str(key) for key, label in options}
-                selected_label = st.selectbox(
-                    "Jump by race details",
-                    list(option_map.keys()),
-                    key="sahr_race_select",
-                )
-                if st.button("Open Selected Race", width="stretch", key="sahr_load_race"):
-                    try:
-                        card = _session_load_meeting_race(
-                            meeting,
-                            option_map[selected_label],
-                        )
-                        st.session_state["race_card_payload"] = card
-                    except Exception as exc:
-                        st.error(f"Could not load selected race: {exc}")
+                _render_race_strip(meeting)
 
             st.caption(
                 "Source: SAHorseracing / National Horse Racing Bureau data feed. "
