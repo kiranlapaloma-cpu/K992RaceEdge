@@ -618,15 +618,75 @@ def _render_race_prediction(
         )
 
     with st.expander("Prediction Detail", expanded=False):
+        detail_view = st.segmented_control(
+            "Prediction View",
+            ["Latest Form", "Established Ability", "Peak Ability"],
+            default="Latest Form",
+            key="race_card_prediction_detail_view",
+        )
+
+        detail_table = prediction_display_table(prediction)
+
+        view_map = {
+            "Latest Form": {
+                "projection": "Latest Projection",
+                "group": "Latest Group",
+                "rank": "Latest Form Rank",
+            },
+            "Established Ability": {
+                "projection": "Established Projection",
+                "group": "Established Group",
+                "rank": "Established Ability Rank",
+            },
+            "Peak Ability": {
+                "projection": "Peak Projection",
+                "group": "Peak Group",
+                "rank": "Peak Ability Rank",
+            },
+        }
+
+        selected = view_map.get(detail_view or "Latest Form", view_map["Latest Form"])
+        projection_col = selected["projection"]
+        group_col = selected["group"]
+        rank_col = selected["rank"]
+
+        # Show only the selected prediction view while keeping all three
+        # scenarios calculated in the underlying prediction engine.
+        wanted_cols = [
+            c for c in ["No.", "Horse", "Current MR", projection_col, group_col]
+            if c in detail_table.columns
+        ]
+        selected_table = detail_table[wanted_cols].copy()
+
+        # Rank the audit table according to the selected scenario rather than
+        # the combined consensus ordering.
+        prediction_rows = prediction.get("rows")
+        if (
+            prediction_rows is not None
+            and not prediction_rows.empty
+            and "Horse" in selected_table.columns
+            and rank_col in prediction_rows.columns
+        ):
+            rank_lookup = prediction_rows[["Horse", rank_col]].copy()
+            selected_table = selected_table.merge(
+                rank_lookup,
+                on="Horse",
+                how="left",
+            )
+            selected_table = selected_table.sort_values(
+                [rank_col, "Horse"],
+                ascending=[True, True],
+                na_position="last",
+            ).drop(columns=[rank_col])
+
         st.dataframe(
-            prediction_display_table(prediction),
+            selected_table.reset_index(drop=True),
             width="stretch",
             hide_index=True,
         )
         st.caption(
-            "Projected ratings are shown only as an audit layer. "
-            "A/B/C groups are calculated independently for Latest, Established and Peak; "
-            "a new group starts at a 5-point gap from the current group leader."
+            f"{detail_view or 'Latest Form'} projection shown. "
+            "A new group starts at a 5-point gap from the current group leader."
         )
 
     return prediction
