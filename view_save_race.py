@@ -127,12 +127,69 @@ def render_save_race(ctx):
                 missing_age_horses = edited_ages.loc[edited_ages["Age"].isna(), "Horse"].astype(str).tolist()
 
                 line_options = handicap_df["Horse"].astype(str).tolist()
+
+                # Race Edge Suggested Line Horse:
+                # 1) Sustain Residual closest to 0.00
+                # 2) If tied, PI closest to 5.00
+                _suggested_line_horse = None
+                _suggested_residual = None
+                _suggested_pi = None
+                if not db_plane.empty and "Sustain_Residual" in db_plane.columns:
+                    _line_candidates = db_plane[["Horse", "Sustain_Residual"]].copy()
+                    _line_candidates["Sustain_Residual"] = pd.to_numeric(
+                        _line_candidates["Sustain_Residual"], errors="coerce"
+                    )
+
+                    _pi_lookup = metrics[["Horse", "PI"]].copy() if "PI" in metrics.columns else pd.DataFrame()
+                    if not _pi_lookup.empty:
+                        _pi_lookup["PI"] = pd.to_numeric(_pi_lookup["PI"], errors="coerce")
+                        _line_candidates = _line_candidates.merge(
+                            _pi_lookup.drop_duplicates("Horse"),
+                            on="Horse",
+                            how="left",
+                        )
+                    else:
+                        _line_candidates["PI"] = np.nan
+
+                    _line_candidates = _line_candidates[
+                        _line_candidates["Horse"].astype(str).isin(line_options)
+                        & _line_candidates["Sustain_Residual"].notna()
+                    ].copy()
+
+                    if not _line_candidates.empty:
+                        _line_candidates["_ResidualDistance"] = _line_candidates["Sustain_Residual"].abs()
+                        _line_candidates["_PIDistance"] = (
+                            pd.to_numeric(_line_candidates["PI"], errors="coerce") - 5.0
+                        ).abs().fillna(np.inf)
+                        _line_candidates = _line_candidates.sort_values(
+                            ["_ResidualDistance", "_PIDistance"],
+                            ascending=[True, True],
+                            kind="stable",
+                        )
+                        _suggested_row = _line_candidates.iloc[0]
+                        _suggested_line_horse = str(_suggested_row["Horse"])
+                        _suggested_residual = float(_suggested_row["Sustain_Residual"])
+                        _suggested_pi = _db_num(_suggested_row.get("PI"))
+
+                _default_line_index = (
+                    line_options.index(_suggested_line_horse)
+                    if _suggested_line_horse in line_options
+                    else 0
+                )
+
                 h1, h2 = st.columns(2)
                 with h1:
                     line_horse = st.selectbox(
                         "Line Horse", line_options,
+                        index=_default_line_index,
                         key=f"db_line_horse_{db_race_date.isoformat()}_{int(db_race_number)}",
                     )
+                    if _suggested_line_horse is not None:
+                        _pi_text = "N/A" if _suggested_pi is None else f"{_suggested_pi:.2f}"
+                        st.caption(
+                            f"Suggested: {_suggested_line_horse} | "
+                            f"Sustain Residual {_suggested_residual:+.2f} | PI {_pi_text}"
+                        )
                 _official_mr_lookup = {}
                 if not _horse_meta.empty:
                     for _, _r in _horse_meta.drop_duplicates("Horse Key").iterrows():
