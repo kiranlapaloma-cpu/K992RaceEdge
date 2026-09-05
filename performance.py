@@ -46,7 +46,8 @@ def _adaptive_tssp_start(D, step, markers):
     D = float(D)
     step = int(step)
     if step == 100:
-        return int(D - (150 if int(D) % 100 == 50 else 300))
+        # F150 ends at D-150; the next 100m split is labelled D-250.
+        return int(D - (250 if int(D) % 100 == 50 else 300))
     if not markers:
         return int(D - 400)
     ordered = sorted({int(m) for m in markers}, reverse=True)
