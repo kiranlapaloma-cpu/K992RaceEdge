@@ -140,14 +140,16 @@ def render_save_race(ctx):
                 # Race Edge Suggested Line Horse - MR alignment method:
                 # 1) Test each horse with an Official MR as the line horse at that MR.
                 # 2) Recalculate the whole field with the existing Performance MR + WFA maths.
-                # 3) Count every runner in the denominator; a match is within +/-2 of Official MR.
-                # 4) A credible anchor needs >=50% alignment; highest alignment wins.
+                # 3) Count every runner in the denominator. First test +/-2 MR points.
+                # 4) If nobody reaches >=50% at +/-2, retry the same candidates at +/-3.
+                # 5) Highest alignment wins at the first tolerance that produces a credible anchor.
                 # Exact best-score ties are shown as joint-best anchors; no extra tie-breaker is applied.
                 _suggested_line_horse = None
                 _joint_best_line_horses = []
                 _alignment_matches = 0
                 _alignment_total = len(line_options)
                 _alignment_pct = 0.0
+                _alignment_tolerance = None
 
                 if not missing_age_horses and _alignment_total > 0:
                     _alignment_df = handicap_df.merge(edited_ages, on="Horse", how="left")
@@ -167,7 +169,7 @@ def render_save_race(ctx):
                         _alignment_df["Official MR"], errors="coerce"
                     )
 
-                    _candidate_results = []
+                    _candidate_errors = []
                     for _candidate in line_options:
                         _candidate_rows = _alignment_df.loc[
                             _alignment_df["Horse"].astype(str) == str(_candidate)
@@ -188,10 +190,17 @@ def render_save_race(ctx):
                         )
                         _achieved = _achieved_raw.map(_db_round_mr)
                         _mr_error = pd.to_numeric(_achieved, errors="coerce") - _alignment_df["Official MR"]
-                        _matches = int((_mr_error.abs() <= 2).fillna(False).sum())
-                        _candidate_results.append((_candidate, _matches))
+                        _candidate_errors.append((_candidate, _mr_error))
 
-                    if _candidate_results:
+                    # Prefer the tighter +/-2 standard. Only widen to +/-3 if no
+                    # candidate reaches 50% of the full field at +/-2.
+                    for _tolerance in (2, 3):
+                        _candidate_results = [
+                            (_horse, int((_errors.abs() <= _tolerance).fillna(False).sum()))
+                            for _horse, _errors in _candidate_errors
+                        ]
+                        if not _candidate_results:
+                            break
                         _best_matches = max(_matches for _, _matches in _candidate_results)
                         _best_pct = _best_matches / _alignment_total
                         if _best_pct >= 0.50:
@@ -202,6 +211,8 @@ def render_save_race(ctx):
                             _suggested_line_horse = _joint_best_line_horses[0]
                             _alignment_matches = _best_matches
                             _alignment_pct = 100.0 * _best_pct
+                            _alignment_tolerance = _tolerance
+                            break
 
                 _default_line_index = (
                     line_options.index(_suggested_line_horse)
@@ -220,19 +231,19 @@ def render_save_race(ctx):
                     if len(_joint_best_line_horses) == 1:
                         st.caption(
                             f"Suggested: {_suggested_line_horse} | MR alignment "
-                            f"{_alignment_pct:.1f}% ({_alignment_matches}/{_alignment_total} within +/-2)"
+                            f"{_alignment_pct:.1f}% ({_alignment_matches}/{_alignment_total} within +/-{_alignment_tolerance})"
                         )
                     elif len(_joint_best_line_horses) > 1:
                         st.caption(
                             f"Joint best: {', '.join(_joint_best_line_horses)} | MR alignment "
-                            f"{_alignment_pct:.1f}% ({_alignment_matches}/{_alignment_total} within +/-2)"
+                            f"{_alignment_pct:.1f}% ({_alignment_matches}/{_alignment_total} within +/-{_alignment_tolerance})"
                         )
                     elif missing_age_horses:
                         st.caption("Line-horse suggestion becomes available once every horse has an age.")
                     else:
                         st.caption(
                             "No suggested line horse: no tested anchor produces at least 50% "
-                            "of the full field within +/-2 of Official MR."
+                            "of the full field within +/-3 of Official MR (after first testing +/-2)."
                         )
                 _line_mr_default = _official_mr_lookup.get(canon_horse(line_horse), 100)
                 with h2:
