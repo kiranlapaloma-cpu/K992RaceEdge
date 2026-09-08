@@ -128,62 +128,80 @@ def render_save_race(ctx):
 
                 line_options = handicap_df["Horse"].astype(str).tolist()
 
-                # Race Edge Suggested Line Horse:
-                # 1) Eligible only when PI is between 4.9 and 5.9 inclusive.
-                # 2) Among eligible horses, choose Sustain Residual closest to 0.00.
-                # 3) If tied, choose PI closest to 5.00.
+                # Official MR lookup used both for automatic line-horse selection and
+                # for the line-horse MR Achieved default.
+                _official_mr_lookup = {}
+                if not _horse_meta.empty:
+                    for _, _r in _horse_meta.drop_duplicates("Horse Key").iterrows():
+                        _mr = _db_num(_r.get("Official MR"))
+                        if _mr is not None:
+                            _official_mr_lookup[str(_r.get("Horse Key"))] = _db_round_mr(_mr)
+
+                # Race Edge Suggested Line Horse - MR alignment method:
+                # 1) Test each horse with an Official MR as the line horse at that MR.
+                # 2) Recalculate the whole field with the existing Performance MR + WFA maths.
+                # 3) Count every runner in the denominator; a match is within +/-2 of Official MR.
+                # 4) A credible anchor needs >=50% alignment; highest alignment wins.
+                # Exact best-score ties are shown as joint-best anchors; no extra tie-breaker is applied.
                 _suggested_line_horse = None
-                _suggested_residual = None
-                _suggested_pi = None
+                _joint_best_line_horses = []
+                _alignment_matches = 0
+                _alignment_total = len(line_options)
+                _alignment_pct = 0.0
 
-                if not db_plane.empty and "Sustain_Residual" in db_plane.columns:
-                    _line_candidates = db_plane[["Horse", "Sustain_Residual"]].copy()
-                    _line_candidates["Sustain_Residual"] = pd.to_numeric(
-                        _line_candidates["Sustain_Residual"], errors="coerce"
+                if not missing_age_horses and _alignment_total > 0:
+                    _alignment_df = handicap_df.merge(edited_ages, on="Horse", how="left")
+                    _alignment_df["Age"] = pd.to_numeric(_alignment_df["Age"], errors="coerce").astype(int)
+                    _alignment_df["WFA (lb)"] = _alignment_df["Age"].map(
+                        lambda age: get_wfa_lb(db_race_date, race_distance_input, int(age))
+                    )
+                    _alignment_df["WFA (kg)"] = _alignment_df["WFA (lb)"] * 0.5
+                    _alignment_df["Effective Weight"] = (
+                        pd.to_numeric(_alignment_df["Weight (kg)"], errors="coerce")
+                        + _alignment_df["WFA (kg)"]
+                    )
+                    _alignment_df["Official MR"] = _alignment_df["Horse"].map(
+                        lambda horse: _official_mr_lookup.get(canon_horse(horse))
+                    )
+                    _alignment_df["Official MR"] = pd.to_numeric(
+                        _alignment_df["Official MR"], errors="coerce"
                     )
 
-                    _pi_lookup = (
-                        metrics[["Horse", "PI"]].copy()
-                        if "PI" in metrics.columns
-                        else pd.DataFrame()
-                    )
-                    if not _pi_lookup.empty:
-                        _pi_lookup["PI"] = pd.to_numeric(
-                            _pi_lookup["PI"], errors="coerce"
-                        )
-                        _line_candidates = _line_candidates.merge(
-                            _pi_lookup.drop_duplicates("Horse"),
-                            on="Horse",
-                            how="left",
-                        )
-                    else:
-                        _line_candidates["PI"] = np.nan
+                    _candidate_results = []
+                    for _candidate in line_options:
+                        _candidate_rows = _alignment_df.loc[
+                            _alignment_df["Horse"].astype(str) == str(_candidate)
+                        ]
+                        if _candidate_rows.empty:
+                            continue
+                        _candidate_mr = _official_mr_lookup.get(canon_horse(_candidate))
+                        if _candidate_mr is None:
+                            continue
 
-                    _line_candidates = _line_candidates[
-                        _line_candidates["Horse"].astype(str).isin(line_options)
-                        & _line_candidates["Sustain_Residual"].notna()
-                        & _line_candidates["PI"].between(4.9, 5.9, inclusive="both")
-                    ].copy()
+                        _candidate_row = _candidate_rows.iloc[0]
+                        _candidate_perf = float(_candidate_row["Performance MR"])
+                        _candidate_eff_weight = float(_candidate_row["Effective Weight"])
+                        _achieved_raw = (
+                            float(_candidate_mr)
+                            + (_alignment_df["Performance MR"] - _candidate_perf)
+                            + 2.0 * (_alignment_df["Effective Weight"] - _candidate_eff_weight)
+                        )
+                        _achieved = _achieved_raw.map(_db_round_mr)
+                        _mr_error = pd.to_numeric(_achieved, errors="coerce") - _alignment_df["Official MR"]
+                        _matches = int((_mr_error.abs() <= 2).fillna(False).sum())
+                        _candidate_results.append((_candidate, _matches))
 
-                    if not _line_candidates.empty:
-                        _line_candidates["_ResidualDistance"] = (
-                            _line_candidates["Sustain_Residual"].abs()
-                        )
-                        _line_candidates["_PIDistance"] = (
-                            _line_candidates["PI"] - 5.0
-                        ).abs()
-                        _line_candidates = _line_candidates.sort_values(
-                            ["_ResidualDistance", "_PIDistance"],
-                            ascending=[True, True],
-                            kind="stable",
-                        )
-
-                        _suggested_row = _line_candidates.iloc[0]
-                        _suggested_line_horse = str(_suggested_row["Horse"])
-                        _suggested_residual = float(
-                            _suggested_row["Sustain_Residual"]
-                        )
-                        _suggested_pi = _db_num(_suggested_row.get("PI"))
+                    if _candidate_results:
+                        _best_matches = max(_matches for _, _matches in _candidate_results)
+                        _best_pct = _best_matches / _alignment_total
+                        if _best_pct >= 0.50:
+                            _joint_best_line_horses = [
+                                _horse for _horse, _matches in _candidate_results
+                                if _matches == _best_matches
+                            ]
+                            _suggested_line_horse = _joint_best_line_horses[0]
+                            _alignment_matches = _best_matches
+                            _alignment_pct = 100.0 * _best_pct
 
                 _default_line_index = (
                     line_options.index(_suggested_line_horse)
@@ -199,23 +217,23 @@ def render_save_race(ctx):
                         index=_default_line_index,
                         key=f"db_line_horse_{db_race_date.isoformat()}_{int(db_race_number)}",
                     )
-                    if _suggested_line_horse is not None:
-                        _pi_text = "N/A" if _suggested_pi is None else f"{_suggested_pi:.2f}"
+                    if len(_joint_best_line_horses) == 1:
                         st.caption(
-                            f"Suggested: {_suggested_line_horse} | "
-                            f"Sustain Residual {_suggested_residual:+.2f} | PI {_pi_text}"
+                            f"Suggested: {_suggested_line_horse} | MR alignment "
+                            f"{_alignment_pct:.1f}% ({_alignment_matches}/{_alignment_total} within +/-2)"
                         )
+                    elif len(_joint_best_line_horses) > 1:
+                        st.caption(
+                            f"Joint best: {', '.join(_joint_best_line_horses)} | MR alignment "
+                            f"{_alignment_pct:.1f}% ({_alignment_matches}/{_alignment_total} within +/-2)"
+                        )
+                    elif missing_age_horses:
+                        st.caption("Line-horse suggestion becomes available once every horse has an age.")
                     else:
                         st.caption(
-                            "No suggested line horse: no runner has PI between 4.9 and 5.9 "
-                            "with a valid Sustain Residual."
+                            "No suggested line horse: no tested anchor produces at least 50% "
+                            "of the full field within +/-2 of Official MR."
                         )
-                _official_mr_lookup = {}
-                if not _horse_meta.empty:
-                    for _, _r in _horse_meta.drop_duplicates("Horse Key").iterrows():
-                        _mr = _db_num(_r.get("Official MR"))
-                        if _mr is not None:
-                            _official_mr_lookup[str(_r.get("Horse Key"))] = _db_round_mr(_mr)
                 _line_mr_default = _official_mr_lookup.get(canon_horse(line_horse), 100)
                 with h2:
                     line_mr = st.number_input(
