@@ -546,151 +546,169 @@ def _render_race_prediction(
         st.caption("No runners have enough saved Race Edge history to build a prediction yet.")
         return prediction
 
-    st.caption(
-        "Latest, Established and Peak are independent views of today's race. "
-        "Margins are sequential and use 1 rating point = 0.5L. "
-        "A 5-point gap starts a new ability group."
-    )
-
     scenarios = prediction.get("scenarios", {})
-    scenario_order = [
-        ("Latest Form", "Latest Group"),
-        ("Established Ability", "Established Group"),
-        ("Peak Ability", "Peak Group"),
-    ]
+    scenario_names = ["Latest Form", "Established Ability", "Peak Ability"]
 
-    display_columns = st.columns(3)
-    for display_col, (scenario_name, group_col) in zip(display_columns, scenario_order):
-        with display_col:
-            st.markdown(f"#### {scenario_name}")
-            scenario = scenarios.get(scenario_name)
-            if scenario is None or scenario.empty:
-                st.caption("No valid ratings.")
-                continue
-
-            for group_name, block in _scenario_group_blocks(scenario, group_col):
-                st.caption(group_name.upper())
-                for _, row in block.head(4).iterrows():
-                    rank = int(row["Rank"])
-                    runner = _runner_label(row.get("No."), row["Horse"])
-                    if rank == 1:
-                        st.markdown(f"**{rank}. {runner}**")
-                    else:
-                        st.markdown(
-                            f"**{rank}. {runner}** - "
-                            f"{_format_margin(row.get('Margin Behind Previous (L)'))}"
-                        )
-
-    st.markdown("#### Race Edge Consensus Top 4")
-    consensus = prediction.get("consensus", [])
-    if not consensus:
-        st.caption("Not enough comparable Race Edge history for a consensus.")
-    else:
-        consensus_rows = []
-        for item in consensus:
-            rank_text = " / ".join(
-                "-" if rank is None else str(rank)
-                for rank in [
-                    item.get("latest_rank"),
-                    item.get("established_rank"),
-                    item.get("peak_rank"),
-                ]
-            )
-            group_text = " / ".join(
-                _compact_group(group)
-                for group in [
-                    item.get("latest_group"),
-                    item.get("established_group"),
-                    item.get("peak_group"),
-                ]
-            )
-            consensus_rows.append({
-                "#": item["position"],
-                "Runner": _runner_label(item.get("no"), item["horse"]),
-                "L / E / P": rank_text,
-                "Groups": group_text,
+    # --- Consensus verdict -------------------------------------------------
+    leaders = []
+    for scenario_name in scenario_names:
+        scenario = scenarios.get(scenario_name)
+        if scenario is not None and not scenario.empty:
+            top = scenario.sort_values("Rank").iloc[0]
+            leaders.append({
+                "scenario": scenario_name,
+                "horse": str(top.get("Horse") or ""),
+                "no": top.get("No."),
             })
 
-        st.dataframe(
-            pd.DataFrame(consensus_rows),
-            width="stretch",
-            hide_index=True,
-        )
+    if leaders:
+        counts = {}
+        for item in leaders:
+            counts[item["horse"]] = counts.get(item["horse"], 0) + 1
+        best_count = max(counts.values())
+        best_horses = [h for h, c in counts.items() if c == best_count]
 
-    with st.expander("Prediction Detail", expanded=False):
-        detail_view = st.segmented_control(
-            "Prediction View",
-            ["Latest Form", "Established Ability", "Peak Ability"],
-            default="Latest Form",
-            key="race_card_prediction_detail_view",
-        )
+        if len(leaders) == 3 and best_count == 3:
+            verdict = "UNANIMOUS TOP RATED - 3/3"
+        elif best_count >= 2:
+            verdict = f"MAJORITY TOP RATED - {best_count}/{len(leaders)}"
+        else:
+            verdict = "SPLIT DECISION"
 
-        detail_table = prediction_display_table(prediction)
+        if len(best_horses) == 1:
+            top_horse = best_horses[0]
+            top_item = next(x for x in leaders if x["horse"] == top_horse)
+            st.markdown(f"#### {_runner_label(top_item.get('no'), top_horse)}")
+            st.markdown(f"**{verdict}**")
+        else:
+            st.markdown(f"#### {verdict}")
 
-        view_map = {
-            "Latest Form": {
-                "projection": "Latest Projection",
-                "group": "Latest Group",
-                "rank": "Latest Form Rank",
-            },
-            "Established Ability": {
-                "projection": "Established Projection",
-                "group": "Established Group",
-                "rank": "Established Ability Rank",
-            },
-            "Peak Ability": {
-                "projection": "Peak Projection",
-                "group": "Peak Group",
-                "rank": "Peak Ability Rank",
-            },
+        leader_bits = []
+        short_names = {
+            "Latest Form": "Latest",
+            "Established Ability": "Established",
+            "Peak Ability": "Peak",
         }
-
-        selected = view_map.get(detail_view or "Latest Form", view_map["Latest Form"])
-        projection_col = selected["projection"]
-        group_col = selected["group"]
-        rank_col = selected["rank"]
-
-        # Show only the selected prediction view while keeping all three
-        # scenarios calculated in the underlying prediction engine.
-        wanted_cols = [
-            c for c in ["No.", "Horse", "Current MR", projection_col, group_col]
-            if c in detail_table.columns
-        ]
-        selected_table = detail_table[wanted_cols].copy()
-
-        # Rank the audit table according to the selected scenario rather than
-        # the combined consensus ordering.
-        prediction_rows = prediction.get("rows")
-        if (
-            prediction_rows is not None
-            and not prediction_rows.empty
-            and "Horse" in selected_table.columns
-            and rank_col in prediction_rows.columns
-        ):
-            rank_lookup = prediction_rows[["Horse", rank_col]].copy()
-            selected_table = selected_table.merge(
-                rank_lookup,
-                on="Horse",
-                how="left",
+        for item in leaders:
+            leader_bits.append(
+                f"**{short_names[item['scenario']]}:** {_runner_label(item.get('no'), item['horse'])}"
             )
-            selected_table = selected_table.sort_values(
-                [rank_col, "Horse"],
-                ascending=[True, True],
-                na_position="last",
-            ).drop(columns=[rank_col])
+        st.markdown(" | ".join(leader_bits))
 
+    # Main opposition: best consensus horses excluding the dominant top horse.
+    consensus = prediction.get("consensus", [])
+    dominant = best_horses[0] if leaders and len(best_horses) == 1 else None
+    opposition = [x for x in consensus if x.get("horse") != dominant][:3]
+    if opposition:
+        st.caption(
+            "Main opposition: " + " | ".join(
+                _runner_label(x.get("no"), x.get("horse")) for x in opposition
+            )
+        )
+
+    # --- Compact cross-scenario comparison --------------------------------
+    st.markdown("#### Consensus Ranking")
+    comparison = rows[[
+        c for c in [
+            "No.", "Horse", "Latest Form Rank",
+            "Established Ability Rank", "Peak Ability Rank"
+        ] if c in rows.columns
+    ]].copy()
+    comparison = comparison.rename(columns={
+        "Latest Form Rank": "Latest",
+        "Established Ability Rank": "Established",
+        "Peak Ability Rank": "Peak",
+    })
+    rank_cols = [c for c in ["Latest", "Established", "Peak"] if c in comparison.columns]
+    comparison["Views"] = comparison[rank_cols].notna().sum(axis=1)
+    comparison["Rank Sum"] = comparison[rank_cols].sum(axis=1, skipna=True)
+    comparison = comparison.loc[comparison["Views"] > 0].copy()
+    comparison = comparison.sort_values(
+        ["Views", "Rank Sum", "Horse"],
+        ascending=[False, True, True],
+        na_position="last",
+    ).reset_index(drop=True)
+    comparison.insert(0, "Consensus", range(1, len(comparison) + 1))
+    if "No." in comparison.columns:
+        comparison["No."] = pd.to_numeric(comparison["No."], errors="coerce").round().astype("Int64")
+    for c in rank_cols:
+        comparison[c] = pd.to_numeric(comparison[c], errors="coerce").round().astype("Int64")
+    st.dataframe(
+        comparison[[c for c in ["Consensus", "No.", "Horse", "Latest", "Established", "Peak"] if c in comparison.columns]],
+        width="stretch",
+        hide_index=True,
+    )
+
+    # --- One scenario at a time -------------------------------------------
+    st.markdown("#### Prediction View")
+    prediction_view = st.segmented_control(
+        "Prediction View",
+        scenario_names,
+        default="Latest Form",
+        key="race_card_main_prediction_view",
+        label_visibility="collapsed",
+    ) or "Latest Form"
+
+    selected = scenarios.get(prediction_view)
+    if selected is None or selected.empty:
+        st.caption("No valid ratings for this view.")
+    else:
+        selected = selected.sort_values("Rank").copy()
+        projection_col = {
+            "Latest Form": "Latest Projection",
+            "Established Ability": "Established Projection",
+            "Peak Ability": "Peak Projection",
+        }[prediction_view]
+        top_rating = pd.to_numeric(selected[projection_col], errors="coerce").max()
+        selected["Behind Leader (L)"] = (
+            (top_rating - pd.to_numeric(selected[projection_col], errors="coerce")) * 0.5
+        ).clip(lower=0.0).round(2)
+        selected["Runner"] = [
+            _runner_label(no, horse)
+            for no, horse in zip(selected.get("No."), selected["Horse"])
+        ]
+        selected["Pred"] = pd.to_numeric(selected["Rank"], errors="coerce").round().astype("Int64")
+        selected["Behind Leader"] = selected["Behind Leader (L)"].map(
+            lambda x: "Leader" if pd.notna(x) and abs(float(x)) < 1e-9 else _format_margin(x)
+        )
         st.dataframe(
-            selected_table.reset_index(drop=True),
+            selected[["Pred", "Runner", "Behind Leader"]].reset_index(drop=True),
             width="stretch",
             hide_index=True,
         )
         st.caption(
-            f"{detail_view or 'Latest Form'} projection shown. "
-            "A new group starts at a 5-point gap from the current group leader."
+            "Margins are cumulative from the predicted winner. "
+            "Race Edge convention: 1 rating point = 0.5L."
         )
 
-    return prediction
+    # Preserve the raw selected-view audit table in a collapsible detail area.
+    with st.expander("Prediction Detail", expanded=False):
+        detail_table = prediction_display_table(prediction)
+        view_map = {
+            "Latest Form": {"projection": "Latest Projection", "group": "Latest Group", "rank": "Latest Form Rank"},
+            "Established Ability": {"projection": "Established Projection", "group": "Established Group", "rank": "Established Ability Rank"},
+            "Peak Ability": {"projection": "Peak Projection", "group": "Peak Group", "rank": "Peak Ability Rank"},
+        }
+        detail_view = st.segmented_control(
+            "Detail View",
+            scenario_names,
+            default=prediction_view,
+            key="race_card_prediction_detail_view_v2",
+        ) or prediction_view
+        detail_selected = view_map[detail_view]
+        wanted_cols = [
+            c for c in ["No.", "Horse", "Current MR", detail_selected["projection"], detail_selected["group"]]
+            if c in detail_table.columns
+        ]
+        selected_table = detail_table[wanted_cols].copy()
+        rank_col = detail_selected["rank"]
+        if "Horse" in selected_table.columns and rank_col in rows.columns:
+            selected_table = selected_table.merge(rows[["Horse", rank_col]], on="Horse", how="left")
+            selected_table = selected_table.sort_values([rank_col, "Horse"], na_position="last").drop(columns=[rank_col])
+        st.dataframe(selected_table.reset_index(drop=True), width="stretch", hide_index=True)
+        st.caption("Detailed projected rating and existing ability group for the selected view.")
 
+    return prediction
 
 def _render_loaded_race_card(card: dict):
     """Render the Race Card as the race-day decision centre."""
