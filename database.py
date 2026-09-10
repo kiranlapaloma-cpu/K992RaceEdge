@@ -149,6 +149,59 @@ def save_horse_runs(records: list[dict]) -> int:
     return len(records)
 
 
+def load_races_by_date(race_date) -> pd.DataFrame:
+    """Load every saved horse run for a single race date.
+
+    Race management uses the natural race key already enforced by the table:
+    race_date + track + course + race_number.
+    """
+    client = get_supabase_client()
+    if hasattr(race_date, "isoformat"):
+        race_date = race_date.isoformat()
+    race_date = str(race_date or "").strip()
+    if not race_date:
+        return pd.DataFrame()
+
+    columns = (
+        "id,horse,finish_position,race_date,track,course,race_number,distance,"
+        "rpss,race_test,official_mr,mr_achieved,sustain_residual,sustain_verdict,analyst_note"
+    )
+    response = (
+        client.table("horse_runs")
+        .select(columns)
+        .eq("race_date", race_date)
+        .order("race_number")
+        .execute()
+    )
+    rows = response.data or []
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    for col in ["race_number", "distance", "official_mr", "mr_achieved", "rpss", "sustain_residual"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def delete_saved_race(race_date, track: str, course: str, race_number: int) -> int:
+    """Delete one complete saved race using the table's race identity fields."""
+    client = get_supabase_client()
+    if hasattr(race_date, "isoformat"):
+        race_date = race_date.isoformat()
+    response = (
+        client.table("horse_runs")
+        .delete()
+        .eq("race_date", str(race_date))
+        .eq("track", str(track))
+        .eq("course", str(course))
+        .eq("race_number", int(race_number))
+        .execute()
+    )
+    load_saved_horses.clear() if hasattr(load_saved_horses, "clear") else None
+    load_rating_improver_runs.clear() if hasattr(load_rating_improver_runs, "clear") else None
+    return len(response.data or [])
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def load_rating_improver_runs() -> pd.DataFrame:
     """Load database runs that have both Official MR and MR Achieved available."""
