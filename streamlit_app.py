@@ -264,15 +264,7 @@ if not up:
     if _view_is("Race Card"):
         render_race_card()
     elif _view_is("Horse Database"):
-        st.title("Horse Database")
-        st.caption("Research saved horse histories or compare multiple horses. No race file is required.")
-        search_tab, improver_tab, compare_tab = st.tabs(["Horse Search", "Rating Improvers", "Compare Horses"])
-        with search_tab:
-            render_horse_search()
-        with improver_tab:
-            render_rating_improvers()
-        with compare_tab:
-            render_horse_compare()
+        render_horse_database_view(globals())
     elif _view_is("Save Race to Database"):
         st.title("Save Race to Database")
         st.info("Upload a sectional file in the sidebar to calculate ratings and save the race.")

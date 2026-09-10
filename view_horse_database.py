@@ -11,9 +11,13 @@ def render_horse_database_view(ctx):
     if _view_is("Horse Database"):
         st.title("Horse Database")
         st.caption("Research saved horse histories or compare multiple horses. This module works without a race file loaded.")
-        search_tab, compare_tab, manage_tab = st.tabs(["Horse Search", "Compare Horses", "Race Management"])
+        search_tab, improver_tab, compare_tab, manage_tab = st.tabs(
+            ["Horse Search", "Rating Improvers", "Compare Horses", "Race Management"]
+        )
         with search_tab:
             render_horse_search()
+        with improver_tab:
+            render_rating_improvers()
         with compare_tab:
             render_horse_compare()
         with manage_tab:
