@@ -277,7 +277,7 @@ def _enhanced_racecard_table(active: pd.DataFrame, prediction: dict | None) -> p
     if not pred.empty:
         merge_cols = [
             c for c in [
-                "Horse Key", "Latest MR", "Recent Best MR", "Peak MR",
+                "Horse Key", "Recent Best MR", "Latest MR", "Peak MR",
                 "Latest Group", "Recent Best Group", "Peak Group"
             ]
             if c in pred.columns
@@ -290,7 +290,7 @@ def _enhanced_racecard_table(active: pd.DataFrame, prediction: dict | None) -> p
         )
     else:
         for c in [
-            "Latest MR", "Recent Best MR", "Peak MR",
+            "Recent Best MR", "Latest MR", "Peak MR",
             "Latest Group", "Recent Best Group", "Peak Group"
         ]:
             table[c] = np.nan
@@ -307,7 +307,7 @@ def _enhanced_racecard_table(active: pd.DataFrame, prediction: dict | None) -> p
     out = table[[
         c for c in [
             "No.", "Horse", "Draw", "Age", "Weight", "Official MR",
-            "Latest MR", "Recent Best MR", "Peak MR", "Groups"
+            "Recent Best MR", "Latest MR", "Peak MR", "Groups"
         ]
         if c in table.columns
     ]].copy()
@@ -547,7 +547,7 @@ def _render_race_prediction(
         return prediction
 
     scenarios = prediction.get("scenarios", {})
-    scenario_names = ["Latest Form", "Recent Best", "Peak Ability"]
+    scenario_names = ["Recent Best", "Latest Form", "Peak Ability"]
 
     # --- Consensus verdict -------------------------------------------------
     leaders = []
@@ -610,8 +610,8 @@ def _render_race_prediction(
     st.markdown("#### Consensus Ranking")
     comparison = rows[[
         c for c in [
-            "No.", "Horse", "Latest Form Rank",
-            "Recent Best Rank", "Peak Ability Rank"
+            "No.", "Horse", "Recent Best Rank",
+            "Latest Form Rank", "Peak Ability Rank"
         ] if c in rows.columns
     ]].copy()
     comparison = comparison.rename(columns={
@@ -619,7 +619,7 @@ def _render_race_prediction(
         "Recent Best Rank": "Recent",
         "Peak Ability Rank": "Peak",
     })
-    rank_cols = [c for c in ["Latest", "Recent", "Peak"] if c in comparison.columns]
+    rank_cols = [c for c in ["Recent", "Latest", "Peak"] if c in comparison.columns]
     comparison["Views"] = comparison[rank_cols].notna().sum(axis=1)
     comparison["Rank Sum"] = comparison[rank_cols].sum(axis=1, skipna=True)
     comparison = comparison.loc[comparison["Views"] > 0].copy()
@@ -634,7 +634,7 @@ def _render_race_prediction(
     for c in rank_cols:
         comparison[c] = pd.to_numeric(comparison[c], errors="coerce").round().astype("Int64")
     st.dataframe(
-        comparison[[c for c in ["Consensus", "No.", "Horse", "Latest", "Recent", "Peak"] if c in comparison.columns]],
+        comparison[[c for c in ["Consensus", "No.", "Horse", "Recent", "Latest", "Peak"] if c in comparison.columns]],
         width="stretch",
         hide_index=True,
     )
@@ -644,10 +644,10 @@ def _render_race_prediction(
     prediction_view = st.segmented_control(
         "Prediction View",
         scenario_names,
-        default="Latest Form",
+        default="Recent Best",
         key="race_card_main_prediction_view_v2",
         label_visibility="collapsed",
-    ) or "Latest Form"
+    ) or "Recent Best"
 
     selected = scenarios.get(prediction_view)
     if selected is None or selected.empty:
@@ -797,7 +797,7 @@ def _render_loaded_race_card(card: dict):
         width="stretch",
         hide_index=True,
     )
-    st.caption("Groups = Latest / Recent Best / Peak. A 5-point gap starts the next group.")
+    st.caption("Groups = Recent Best / Latest / Peak. A 5-point gap starts the next group.")
 
     if not reserves.empty:
         with st.expander(f"Reserves ({len(reserves)})", expanded=False):
