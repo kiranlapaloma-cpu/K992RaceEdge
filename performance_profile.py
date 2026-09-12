@@ -181,6 +181,9 @@ def build_performance_profile(
             "last_recorded_official_mr": None,
             "latest_mr_achieved": None,
             "highest_mr_achieved": None,
+            "recent_best_mr": None,
+            "recent_best_evidence": "No evidence",
+            # Backward-compatible aliases for any older callers.
             "established_mr": None,
             "established_evidence": "No evidence",
             "average_mr_edge": None,
@@ -197,9 +200,12 @@ def build_performance_profile(
     mr_series = h["mr_achieved"].dropna()
     edge_series = h["MR Edge"].dropna()
 
+    # Recent Best = the strongest MR Achieved from up to the horse's
+    # three most recent valid runs. A horse does not need three runs:
+    # 1 run -> that run, 2 runs -> best of 2, 3+ runs -> best of latest 3.
     recent_values = mr_series.head(3)
-    established = float(recent_values.median()) if not recent_values.empty else None
-    established_evidence = evidence_label(len(recent_values))
+    recent_best = float(recent_values.max()) if not recent_values.empty else None
+    recent_best_evidence = evidence_label(len(recent_values))
 
     trend = "Limited evidence"
     trend_values = mr_series.head(4)
@@ -236,8 +242,11 @@ def build_performance_profile(
         "last_recorded_official_mr": float(official.iloc[0]) if not official.empty else None,
         "latest_mr_achieved": float(mr_series.iloc[0]) if not mr_series.empty else None,
         "highest_mr_achieved": float(mr_series.max()) if not mr_series.empty else None,
-        "established_mr": established,
-        "established_evidence": established_evidence,
+        "recent_best_mr": recent_best,
+        "recent_best_evidence": recent_best_evidence,
+        # Backward-compatible aliases for any older callers.
+        "established_mr": recent_best,
+        "established_evidence": recent_best_evidence,
         "average_mr_edge": float(edge_series.mean()) if not edge_series.empty else None,
         "trend": trend,
         "peak": peak,
@@ -293,14 +302,20 @@ def render_performance_profile(
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric(official_label, _fmt_mr(official_value))
-    c2.metric("Established MR", _fmt_mr(profile.get("established_mr")))
+    c2.metric(
+        "Recent Best MR",
+        _fmt_mr(profile.get("recent_best_mr", profile.get("established_mr"))),
+    )
     c3.metric("Latest MR Achieved", _fmt_mr(profile.get("latest_mr_achieved")))
     c4.metric("Highest MR Achieved", _fmt_mr(profile.get("highest_mr_achieved")))
 
     c5, c6, c7 = st.columns(3)
     c5.metric("Average MR +/-", _fmt_edge(profile.get("average_mr_edge"), 1))
     c6.metric("Trend", str(profile.get("trend") or "-"))
-    c7.metric("Profile Evidence", str(profile.get("established_evidence") or "-"))
+    c7.metric(
+        "Profile Evidence",
+        str(profile.get("recent_best_evidence", profile.get("established_evidence")) or "-"),
+    )
 
     peak = profile.get("peak")
     st.markdown("##### Peak Performance")

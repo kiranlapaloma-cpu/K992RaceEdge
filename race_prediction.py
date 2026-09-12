@@ -100,7 +100,7 @@ def build_race_predictions(
     """
     Build three independent Race Edge projections for today's race.
 
-    Latest, Established and Peak ability are never blended.
+    Latest, Recent Best and Peak ability are never blended.
 
     Today's terms:
         Effective Weight = carded weight + WFA allowance in kg
@@ -139,9 +139,9 @@ def build_race_predictions(
             current_official_mr=current_mr,
         )
         latest = _num(profile.get("latest_mr_achieved"))
-        established = _num(profile.get("established_mr"))
+        recent_best = _num(profile.get("recent_best_mr", profile.get("established_mr")))
         peak = _num(profile.get("highest_mr_achieved"))
-        if latest is None and established is None and peak is None:
+        if latest is None and recent_best is None and peak is None:
             continue
 
         try:
@@ -162,10 +162,15 @@ def build_race_predictions(
             "WFA kg": wfa_kg,
             "Effective Weight": effective_weight,
             "Latest MR": latest,
-            "Established MR": established,
+            "Recent Best MR": recent_best,
             "Peak MR": peak,
-            "Evidence": str(profile.get("established_evidence") or "No evidence"),
-            "Evidence Score": _evidence_score(profile.get("established_evidence")),
+            "Evidence": str(
+                profile.get("recent_best_evidence", profile.get("established_evidence"))
+                or "No evidence"
+            ),
+            "Evidence Score": _evidence_score(
+                profile.get("recent_best_evidence", profile.get("established_evidence"))
+            ),
         })
 
     df = pd.DataFrame(rows)
@@ -177,7 +182,7 @@ def build_race_predictions(
 
     scenario_defs = {
         "Latest Form": ("Latest MR", "Latest Projection"),
-        "Established Ability": ("Established MR", "Established Projection"),
+        "Recent Best": ("Recent Best MR", "Recent Best Projection"),
         "Peak Ability": ("Peak MR", "Peak Projection"),
     }
 
@@ -223,7 +228,7 @@ def build_race_predictions(
     # gap starts the next group.
     for _projection_col, _group_col in [
         ("Latest Projection", "Latest Group"),
-        ("Established Projection", "Established Group"),
+        ("Recent Best Projection", "Recent Best Group"),
         ("Peak Projection", "Peak Group"),
     ]:
         if _projection_col in df.columns:
@@ -236,12 +241,12 @@ def build_race_predictions(
     for _scenario_name, _scenario in scenarios.items():
         _projection_col = {
             "Latest Form": "Latest Projection",
-            "Established Ability": "Established Projection",
+            "Recent Best": "Recent Best Projection",
             "Peak Ability": "Peak Projection",
         }[_scenario_name]
         _group_col = {
             "Latest Form": "Latest Group",
-            "Established Ability": "Established Group",
+            "Recent Best": "Recent Best Group",
             "Peak Ability": "Peak Group",
         }[_scenario_name]
         _group_map = dict(zip(df["Horse"], df[_group_col]))
@@ -266,7 +271,7 @@ def build_race_predictions(
         [
             "Scenarios Available",
             "Consensus Rank Sum",
-            "Established Ability Rank",
+            "Recent Best Rank",
             "Latest Form Rank",
             "Peak Ability Rank",
             "Horse",
@@ -283,10 +288,12 @@ def build_race_predictions(
             "no": None if pd.isna(row.get("No.")) else int(round(float(row.get("No.")))),
             "horse": row["Horse"],
             "latest_rank": None if pd.isna(row["Latest Form Rank"]) else int(row["Latest Form Rank"]),
-            "established_rank": None if pd.isna(row["Established Ability Rank"]) else int(row["Established Ability Rank"]),
+            "recent_best_rank": None if pd.isna(row["Recent Best Rank"]) else int(row["Recent Best Rank"]),
+            # Backward-compatible alias for any older consumer of the consensus dict.
+            "established_rank": None if pd.isna(row["Recent Best Rank"]) else int(row["Recent Best Rank"]),
             "peak_rank": None if pd.isna(row["Peak Ability Rank"]) else int(row["Peak Ability Rank"]),
             "latest_group": row.get("Latest Group"),
-            "established_group": row.get("Established Group"),
+            "recent_best_group": row.get("Recent Best Group"),
             "peak_group": row.get("Peak Group"),
             "evidence": row["Evidence"],
         })
@@ -305,7 +312,7 @@ def prediction_display_table(prediction: dict) -> pd.DataFrame:
     """
     Compact audit table for the Race Card.
 
-    Latest / Established / Peak groups are independent 5-point bands.
+    Latest / Recent Best / Peak groups are independent 5-point bands.
     Raw projected ratings remain visible here, while the main Race Card
     uses rank, sequential margins and group structure.
     """
@@ -318,7 +325,7 @@ def prediction_display_table(prediction: dict) -> pd.DataFrame:
     # Backward-safe grouping in case a caller supplies an older prediction dict.
     for projection_col, group_col in [
         ("Latest Projection", "Latest Group"),
-        ("Established Projection", "Established Group"),
+        ("Recent Best Projection", "Recent Best Group"),
         ("Peak Projection", "Peak Group"),
     ]:
         if group_col not in work.columns and projection_col in work.columns:
@@ -331,7 +338,7 @@ def prediction_display_table(prediction: dict) -> pd.DataFrame:
         c for c in [
             "No.", "Horse", "Current MR",
             "Latest Projection", "Latest Group",
-            "Established Projection", "Established Group",
+            "Recent Best Projection", "Recent Best Group",
             "Peak Projection", "Peak Group",
         ]
         if c in work.columns
@@ -343,21 +350,21 @@ def prediction_display_table(prediction: dict) -> pd.DataFrame:
     for col in [
         "Current MR",
         "Latest Projection",
-        "Established Projection",
+        "Recent Best Projection",
         "Peak Projection",
     ]:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce").round(1)
 
     # Use compact A/B/C labels in the detail table.
-    for col in ["Latest Group", "Established Group", "Peak Group"]:
+    for col in ["Latest Group", "Recent Best Group", "Peak Group"]:
         if col in out.columns:
             out[col] = out[col].astype("string").str.replace("Group ", "", regex=False)
 
     helper = work[
-        ["Horse", "Latest Form Rank", "Established Ability Rank", "Peak Ability Rank"]
+        ["Horse", "Latest Form Rank", "Recent Best Rank", "Peak Ability Rank"]
     ].copy()
-    rank_cols = ["Latest Form Rank", "Established Ability Rank", "Peak Ability Rank"]
+    rank_cols = ["Latest Form Rank", "Recent Best Rank", "Peak Ability Rank"]
     helper["Rank Sum"] = helper[rank_cols].sum(axis=1, skipna=True)
     helper["Available"] = helper[rank_cols].notna().sum(axis=1)
 
