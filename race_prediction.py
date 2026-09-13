@@ -96,6 +96,7 @@ def build_race_predictions(
     race_date: Any,
     distance_m: float,
     history_loader,
+    apply_apprentice_claims: bool = False,
 ) -> dict:
     """
     Build three independent Race Edge projections for today's race.
@@ -103,7 +104,7 @@ def build_race_predictions(
     Latest, Recent Best and Peak ability are never blended.
 
     Today's terms:
-        Effective Weight = carded weight - apprentice claim + WFA allowance in kg
+        Effective Weight = carded weight - applied apprentice claim + WFA allowance in kg
         1 kg = 2 MR points
 
     Each scenario is projected to the lightest effective weight in today's field.
@@ -152,11 +153,11 @@ def build_race_predictions(
         wfa_kg = wfa_lb * 0.5
         apprentice_claim = _num(runner.get("Claim"))
         apprentice_claim = max(0.0, float(apprentice_claim or 0.0))
+        applied_claim = apprentice_claim if apply_apprentice_claims else 0.0
 
-        # SAHR carded weight is pre-claim. The apprentice allowance therefore
-        # reduces today's carried/effective weight before the existing WFA
-        # adjustment is applied.
-        claimed_weight = float(carded_weight) - apprentice_claim
+        # SAHR carded weight is pre-claim. Apprentice allowances are deliberately
+        # optional at race level and are OFF by default.
+        claimed_weight = float(carded_weight) - applied_claim
         effective_weight = claimed_weight + wfa_kg
 
         rows.append({
@@ -166,6 +167,7 @@ def build_race_predictions(
             "Age": int(round(age)),
             "Carded Weight": float(carded_weight),
             "Apprentice Claim": apprentice_claim,
+            "Applied Claim": applied_claim,
             "Claimed Weight": claimed_weight,
             "WFA lb": wfa_lb,
             "WFA kg": wfa_kg,
@@ -224,7 +226,7 @@ def build_race_predictions(
         scenarios[scenario_name] = valid[
             [
                 "Rank", "Horse", projection_col, "Margin Behind Previous (L)",
-                "Current MR", "Apprentice Claim", "Effective Weight", "Evidence"
+                "Current MR", "Apprentice Claim", "Applied Claim", "Effective Weight", "Evidence"
             ]
         ].copy()
 
@@ -314,6 +316,7 @@ def build_race_predictions(
         "scenarios": scenarios,
         "consensus": consensus,
         "reference_effective_weight": reference_weight,
+        "apply_apprentice_claims": bool(apply_apprentice_claims),
         "race_date": race_date,
         "distance": distance_m,
     }
@@ -348,7 +351,7 @@ def prediction_display_table(prediction: dict) -> pd.DataFrame:
     out = work[[
         c for c in [
             "No.", "Horse", "Current MR",
-            "Apprentice Claim", "Effective Weight",
+            "Apprentice Claim", "Applied Claim", "Effective Weight",
             "Latest Projection", "Latest Group",
             "Recent Best Projection", "Recent Best Group",
             "Peak Projection", "Peak Group",

@@ -583,16 +583,48 @@ def _render_race_prediction(
     if distance is None:
         return prediction
 
+    claim_available = (
+        "Claim" in active.columns
+        and pd.to_numeric(active["Claim"], errors="coerce").fillna(0).gt(0).any()
+    )
+    apply_apprentice_claims = False
+    if claim_available:
+        apply_apprentice_claims = st.toggle(
+            "Apply apprentice claims",
+            value=False,
+            key=f"race_card_apply_claims_{card.get('date')}_{card.get('race') or card.get('raceNumber')}",
+            help="OFF uses carded weights. ON subtracts all detected apprentice claims before Race Edge applies its existing weight and WFA adjustments.",
+        )
+        st.caption(
+            "Apprentice claims are ignored by default. Turn this on to apply all detected claims in this race."
+        )
+
     if prediction is None:
         prediction = build_race_predictions(
             active,
             race_date=card.get("date") or card.get("dateFormat"),
             distance_m=distance,
             history_loader=load_horse_history,
+            apply_apprentice_claims=apply_apprentice_claims,
+        )
+
+    if prediction is not None and claim_available:
+        prediction = build_race_predictions(
+            active,
+            race_date=card.get("date") or card.get("dateFormat"),
+            distance_m=distance,
+            history_loader=load_horse_history,
+            apply_apprentice_claims=apply_apprentice_claims,
         )
 
     rows = prediction.get("rows") if prediction else None
     st.markdown("### Race Edge Prediction")
+    if claim_available:
+        st.caption(
+            "Apprentice claims: APPLIED to all claimed runners."
+            if apply_apprentice_claims
+            else "Apprentice claims: OFF - carded weights used."
+        )
     if rows is None or rows.empty:
         st.caption("No runners have enough saved Race Edge history to build a prediction yet.")
         return prediction
@@ -762,7 +794,7 @@ def _render_race_prediction(
         detail_selected = view_map[detail_view]
         wanted_cols = [
             c for c in [
-                "No.", "Horse", "Current MR", "Apprentice Claim", "Effective Weight",
+                "No.", "Horse", "Current MR", "Apprentice Claim", "Applied Claim", "Effective Weight",
                 detail_selected["projection"], detail_selected["group"]
             ]
             if c in detail_table.columns
@@ -881,7 +913,7 @@ def _render_loaded_race_card(card: dict):
     )
     st.caption("Groups = Recent Best / Latest / Peak. A 5-point gap starts the next group.")
     if "Claim" in active.columns and pd.to_numeric(active["Claim"], errors="coerce").fillna(0).gt(0).any():
-        st.caption("# after horse name = apprentice claim applied to Race Edge prediction.")
+        st.caption("# after horse name = apprentice claim available.")
 
     if not reserves.empty:
         with st.expander(f"Reserves ({len(reserves)})", expanded=False):
