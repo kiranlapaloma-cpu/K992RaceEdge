@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -38,6 +39,34 @@ def _racecard_float(value):
         return v if np.isfinite(v) else None
     except Exception:
         return None
+
+
+def _racecard_apprentice_claim(runner: dict) -> float:
+    """Read an apprentice claim in kg from the card or the jockey text."""
+    for key in ("apprenticeClaim", "jockeyClaim", "claim"):
+        value = _racecard_float(runner.get(key))
+        if value is not None:
+            return max(0.0, abs(float(value)))
+
+    for key in ("jockeyName", "jockeyFull"):
+        text = str(runner.get(key) or "").strip()
+        match = re.search(r"-\s*(\d+(?:\.\d+)?)\s*$", text)
+        if match:
+            try:
+                return float(match.group(1))
+            except Exception:
+                pass
+    return 0.0
+
+
+def _claim_horse_name(horse, claim) -> str:
+    """Display marker only; the stored/canonical horse name remains unchanged."""
+    try:
+        if claim is not None and not pd.isna(claim) and float(claim) > 0:
+            return f"{horse} #"
+    except Exception:
+        pass
+    return str(horse)
 
 
 def _racecard_parse(raw_text: str) -> dict:
@@ -114,6 +143,7 @@ def _racecard_runner_frame(card: dict, db_counts: dict[str, int] | None = None) 
         is_reserve = status == "R" or str(runner.get("jockeyName") or "").strip().lower().startswith("reserve")
         horse_weight = _racecard_int(runner.get("horseWeight"))
         weight_delta = _racecard_int(runner.get("horseWeightDelta"))
+        apprentice_claim = _racecard_apprentice_claim(runner)
         official_mr = _racecard_official_mr(runner.get("MR"))
         latest_mr_achieved, highest_mr_achieved = _racecard_mr_achieved_stats(horse)
         draw = _racecard_int(runner.get("draw"))
@@ -127,6 +157,7 @@ def _racecard_runner_frame(card: dict, db_counts: dict[str, int] | None = None) 
             "Age": _racecard_int(runner.get("age")),
             "Sex": str(runner.get("sex") or "").strip().upper(),
             "Weight": _racecard_float(runner.get("weight")),
+            "Claim": apprentice_claim,
             "Official MR": official_mr,
             "Horse Wgt": horse_weight,
             "Wgt Change": weight_delta,
@@ -152,6 +183,7 @@ def _racecard_runner_frame(card: dict, db_counts: dict[str, int] | None = None) 
     ]:
         df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
     df["Weight"] = pd.to_numeric(df["Weight"], errors="coerce")
+    df["Claim"] = pd.to_numeric(df["Claim"], errors="coerce").fillna(0.0)
     return df.sort_values(["Status", "No."], ascending=[True, True], na_position="last").reset_index(drop=True)
 
 
@@ -306,17 +338,26 @@ def _enhanced_racecard_table(active: pd.DataFrame, prediction: dict | None) -> p
 
     out = table[[
         c for c in [
-            "No.", "Horse", "Draw", "Age", "Weight", "Official MR",
+            "No.", "Horse", "Draw", "Age", "Weight", "Claim", "Official MR",
             "Recent Best MR", "Latest MR", "Peak MR", "Groups"
         ]
         if c in table.columns
     ]].copy()
+
+    if "Horse" in out.columns and "Claim" in out.columns:
+        out["Horse"] = [
+            _claim_horse_name(horse, claim)
+            for horse, claim in zip(out["Horse"], out["Claim"])
+        ]
 
     for c in ["No.", "Draw", "Age", "Official MR"]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce").round().astype("Int64")
     if "Weight" in out.columns:
         out["Weight"] = pd.to_numeric(out["Weight"], errors="coerce").round(1)
+    if "Claim" in out.columns:
+        out["Claim"] = pd.to_numeric(out["Claim"], errors="coerce").round(1)
+        out["Claim"] = out["Claim"].where(out["Claim"] > 0)
     for c in ["Latest MR", "Recent Best MR", "Peak MR"]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce").round(1)
@@ -388,18 +429,20 @@ def _render_racecard_runner_profiles(active: pd.DataFrame, prediction: dict | No
         ).iloc[0]
         current_age = runner.get("Age")
         current_weight = runner.get("Weight")
+        current_claim = runner.get("Claim")
         current_draw = runner.get("Draw")
         saddle_no = runner.get("No.")
+        display_horse = _claim_horse_name(horse, current_claim)
 
         try:
             hist = load_horse_history(horse)
         except Exception as exc:
-            with st.expander(f"{_runner_label(saddle_no, horse)} | profile unavailable", expanded=False):
+            with st.expander(f"{_runner_label(saddle_no, display_horse)} | profile unavailable", expanded=False):
                 st.warning(f"Could not load saved history: {exc}")
             continue
 
         if hist.empty:
-            label = f"{_runner_label(saddle_no, horse)} | No Race Edge history"
+            label = f"{_runner_label(saddle_no, display_horse)} | No Race Edge history"
             with st.expander(label, expanded=False):
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Current Official MR", "-" if pd.isna(current_official) else f"{int(round(float(current_official)))}")
@@ -434,13 +477,15 @@ def _render_racecard_runner_profiles(active: pd.DataFrame, prediction: dict | No
             ])
 
         label_bits = [
-            _runner_label(saddle_no, horse),
+            _runner_label(saddle_no, display_horse),
             f"{len(h)} saved run{'s' if len(h) != 1 else ''}",
         ]
         if pd.notna(current_official):
             label_bits.append(f"MR {int(round(float(current_official)))}")
         if pd.notna(current_weight):
             label_bits.append(f"{float(current_weight):.1f}kg")
+        if pd.notna(current_claim) and float(current_claim) > 0:
+            label_bits.append(f"Claim {float(current_claim):.1f}kg")
         if group_text != "- / - / -":
             label_bits.append(group_text)
 
@@ -465,7 +510,13 @@ def _render_racecard_runner_profiles(active: pd.DataFrame, prediction: dict | No
             if pd.notna(current_age):
                 current_bits.append(f"Age {int(current_age)}")
             if pd.notna(current_weight):
-                current_bits.append(f"{float(current_weight):.1f} kg")
+                current_bits.append(f"{float(current_weight):.1f} kg carded")
+            if pd.notna(current_claim) and float(current_claim) > 0:
+                current_bits.append(f"Claim {float(current_claim):.1f} kg")
+                if pd.notna(current_weight):
+                    current_bits.append(
+                        f"{float(current_weight) - float(current_claim):.1f} kg after claim"
+                    )
             if pd.notna(current_draw):
                 current_bits.append(f"Draw {int(current_draw)}")
             if current_bits:
@@ -548,6 +599,10 @@ def _render_race_prediction(
 
     scenarios = prediction.get("scenarios", {})
     scenario_names = ["Recent Best", "Latest Form", "Peak Ability"]
+    claim_by_horse = {
+        str(r.get("Horse") or ""): float(r.get("Apprentice Claim") or 0.0)
+        for _, r in rows.iterrows()
+    }
 
     # --- Consensus verdict -------------------------------------------------
     leaders = []
@@ -559,6 +614,7 @@ def _render_race_prediction(
                 "scenario": scenario_name,
                 "horse": str(top.get("Horse") or ""),
                 "no": top.get("No."),
+                "claim": float(top.get("Apprentice Claim") or 0.0),
             })
 
     if leaders:
@@ -578,7 +634,7 @@ def _render_race_prediction(
         if len(best_horses) == 1:
             top_horse = best_horses[0]
             top_item = next(x for x in leaders if x["horse"] == top_horse)
-            st.markdown(f"#### {_runner_label(top_item.get('no'), top_horse)}")
+            st.markdown(f"#### {_runner_label(top_item.get('no'), _claim_horse_name(top_horse, top_item.get('claim')))}")
             st.markdown(f"**{verdict}**")
         else:
             st.markdown(f"#### {verdict}")
@@ -591,7 +647,7 @@ def _render_race_prediction(
         }
         for item in leaders:
             leader_bits.append(
-                f"**{short_names[item['scenario']]}:** {_runner_label(item.get('no'), item['horse'])}"
+                f"**{short_names[item['scenario']]}:** {_runner_label(item.get('no'), _claim_horse_name(item['horse'], item.get('claim')))}"
             )
         st.markdown(" | ".join(leader_bits))
 
@@ -602,7 +658,7 @@ def _render_race_prediction(
     if opposition:
         st.caption(
             "Main opposition: " + " | ".join(
-                _runner_label(x.get("no"), x.get("horse")) for x in opposition
+                _runner_label(x.get("no"), _claim_horse_name(x.get("horse"), x.get("apprentice_claim", 0.0))) for x in opposition
             )
         )
 
@@ -619,6 +675,10 @@ def _render_race_prediction(
         "Recent Best Rank": "Recent",
         "Peak Ability Rank": "Peak",
     })
+    comparison["Horse"] = [
+        _claim_horse_name(horse, claim_by_horse.get(str(horse), 0.0))
+        for horse in comparison["Horse"]
+    ]
     rank_cols = [c for c in ["Recent", "Latest", "Peak"] if c in comparison.columns]
     comparison["Views"] = comparison[rank_cols].notna().sum(axis=1)
     comparison["Rank Sum"] = comparison[rank_cols].sum(axis=1, skipna=True)
@@ -664,8 +724,12 @@ def _render_race_prediction(
             (top_rating - pd.to_numeric(selected[projection_col], errors="coerce")) * 0.5
         ).clip(lower=0.0).round(2)
         selected["Runner"] = [
-            _runner_label(no, horse)
-            for no, horse in zip(selected.get("No."), selected["Horse"])
+            _runner_label(no, _claim_horse_name(horse, claim))
+            for no, horse, claim in zip(
+                selected.get("No."),
+                selected["Horse"],
+                selected.get("Apprentice Claim", pd.Series(0.0, index=selected.index)),
+            )
         ]
         selected["Pred"] = pd.to_numeric(selected["Rank"], errors="coerce").round().astype("Int64")
         selected["Behind Leader"] = selected["Behind Leader (L)"].map(
@@ -697,13 +761,31 @@ def _render_race_prediction(
         ) or prediction_view
         detail_selected = view_map[detail_view]
         wanted_cols = [
-            c for c in ["No.", "Horse", "Current MR", detail_selected["projection"], detail_selected["group"]]
+            c for c in [
+                "No.", "Horse", "Current MR", "Apprentice Claim", "Effective Weight",
+                detail_selected["projection"], detail_selected["group"]
+            ]
             if c in detail_table.columns
         ]
         selected_table = detail_table[wanted_cols].copy()
+        if "Horse" in selected_table.columns:
+            selected_table["Horse"] = [
+                _claim_horse_name(horse, claim_by_horse.get(str(horse), 0.0))
+                for horse in selected_table["Horse"]
+            ]
         rank_col = detail_selected["rank"]
         if "Horse" in selected_table.columns and rank_col in rows.columns:
-            selected_table = selected_table.merge(rows[["Horse", rank_col]], on="Horse", how="left")
+            rank_lookup = rows[["Horse", rank_col]].copy()
+            rank_lookup["Horse Display"] = [
+                _claim_horse_name(horse, claim_by_horse.get(str(horse), 0.0))
+                for horse in rank_lookup["Horse"]
+            ]
+            selected_table = selected_table.merge(
+                rank_lookup[["Horse Display", rank_col]],
+                left_on="Horse",
+                right_on="Horse Display",
+                how="left",
+            ).drop(columns=["Horse Display"])
             selected_table = selected_table.sort_values([rank_col, "Horse"], na_position="last").drop(columns=[rank_col])
         st.dataframe(selected_table.reset_index(drop=True), width="stretch", hide_index=True)
         st.caption("Detailed projected rating and existing ability group for the selected view.")
@@ -798,6 +880,8 @@ def _render_loaded_race_card(card: dict):
         hide_index=True,
     )
     st.caption("Groups = Recent Best / Latest / Peak. A 5-point gap starts the next group.")
+    if "Claim" in active.columns and pd.to_numeric(active["Claim"], errors="coerce").fillna(0).gt(0).any():
+        st.caption("# after horse name = apprentice claim applied to Race Edge prediction.")
 
     if not reserves.empty:
         with st.expander(f"Reserves ({len(reserves)})", expanded=False):

@@ -28,6 +28,33 @@ class SAHRError(RuntimeError):
     """Raised when the SAHorseracing feed cannot be loaded or parsed."""
 
 
+def _apprentice_claim_kg(runner: dict[str, Any]) -> float:
+    """Return the apprentice claim in kg from the SAHR runner payload.
+
+    SAHR commonly appends the claim to the jockey text, e.g.
+    "*Divesh Ramkhalawonn -2.5".  Explicit claim fields are also accepted
+    so this remains compatible if the feed exposes one directly later.
+    """
+    for key in ("apprenticeClaim", "jockeyClaim", "claim"):
+        raw = runner.get(key)
+        if raw not in (None, ""):
+            try:
+                claim = abs(float(raw))
+                return claim if claim > 0 else 0.0
+            except Exception:
+                pass
+
+    for key in ("jockey", "jockeyFull"):
+        text = str(runner.get(key) or "").strip()
+        match = re.search(r"-\s*(\d+(?:\.\d+)?)\s*$", text)
+        if match:
+            try:
+                return float(match.group(1))
+            except Exception:
+                pass
+    return 0.0
+
+
 def _date_key(value: date | datetime | str) -> str:
     if isinstance(value, datetime):
         return value.strftime("%Y%m%d")
@@ -356,6 +383,7 @@ def race_to_race_edge_card(meeting: dict[str, Any], race_key: str) -> dict[str, 
     for r in race.get("runners") or []:
         if not isinstance(r, dict):
             continue
+        apprentice_claim = _apprentice_claim_kg(r)
         card["runners"].append({
             "saddleNo": r.get("sno"),
             "horseSeq": r.get("seq"),
@@ -370,6 +398,7 @@ def race_to_race_edge_card(meeting: dict[str, Any], race_key: str) -> dict[str, 
             "MR": r.get("MR"),
             "jockeyName": r.get("jockey") or "",
             "jockeyFull": r.get("jockeyFull") or "",
+            "apprenticeClaim": apprentice_claim,
             "trainerName": r.get("trainer") or "",
             "trainerEst": r.get("trainerEst") or "",
             "owner": r.get("ownerName") or "",

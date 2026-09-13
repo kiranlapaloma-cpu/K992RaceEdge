@@ -103,7 +103,7 @@ def build_race_predictions(
     Latest, Recent Best and Peak ability are never blended.
 
     Today's terms:
-        Effective Weight = carded weight + WFA allowance in kg
+        Effective Weight = carded weight - apprentice claim + WFA allowance in kg
         1 kg = 2 MR points
 
     Each scenario is projected to the lightest effective weight in today's field.
@@ -150,7 +150,14 @@ def build_race_predictions(
             wfa_lb = 0.0
 
         wfa_kg = wfa_lb * 0.5
-        effective_weight = float(carded_weight) + wfa_kg
+        apprentice_claim = _num(runner.get("Claim"))
+        apprentice_claim = max(0.0, float(apprentice_claim or 0.0))
+
+        # SAHR carded weight is pre-claim. The apprentice allowance therefore
+        # reduces today's carried/effective weight before the existing WFA
+        # adjustment is applied.
+        claimed_weight = float(carded_weight) - apprentice_claim
+        effective_weight = claimed_weight + wfa_kg
 
         rows.append({
             "No.": _num(runner.get("No.")),
@@ -158,6 +165,8 @@ def build_race_predictions(
             "Current MR": current_mr,
             "Age": int(round(age)),
             "Carded Weight": float(carded_weight),
+            "Apprentice Claim": apprentice_claim,
+            "Claimed Weight": claimed_weight,
             "WFA lb": wfa_lb,
             "WFA kg": wfa_kg,
             "Effective Weight": effective_weight,
@@ -215,7 +224,7 @@ def build_race_predictions(
         scenarios[scenario_name] = valid[
             [
                 "Rank", "Horse", projection_col, "Margin Behind Previous (L)",
-                "Current MR", "Evidence"
+                "Current MR", "Apprentice Claim", "Effective Weight", "Evidence"
             ]
         ].copy()
 
@@ -255,7 +264,8 @@ def build_race_predictions(
         _scenario["No."] = _scenario["Horse"].map(_number_map)
         ordered = [
             "Rank", "No.", "Horse", _projection_col, _group_col,
-            "Margin Behind Previous (L)", "Current MR", "Evidence"
+            "Margin Behind Previous (L)", "Current MR",
+            "Apprentice Claim", "Effective Weight", "Evidence"
         ]
         scenarios[_scenario_name] = _scenario[
             [c for c in ordered if c in _scenario.columns]
@@ -287,6 +297,7 @@ def build_race_predictions(
             "position": int(row["Consensus Position"]),
             "no": None if pd.isna(row.get("No.")) else int(round(float(row.get("No.")))),
             "horse": row["Horse"],
+            "apprentice_claim": float(row.get("Apprentice Claim") or 0.0),
             "latest_rank": None if pd.isna(row["Latest Form Rank"]) else int(row["Latest Form Rank"]),
             "recent_best_rank": None if pd.isna(row["Recent Best Rank"]) else int(row["Recent Best Rank"]),
             # Backward-compatible alias for any older consumer of the consensus dict.
@@ -337,6 +348,7 @@ def prediction_display_table(prediction: dict) -> pd.DataFrame:
     out = work[[
         c for c in [
             "No.", "Horse", "Current MR",
+            "Apprentice Claim", "Effective Weight",
             "Latest Projection", "Latest Group",
             "Recent Best Projection", "Recent Best Group",
             "Peak Projection", "Peak Group",
