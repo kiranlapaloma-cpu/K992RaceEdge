@@ -118,6 +118,12 @@ def build_race_predictions(
 
     rows = []
     for _, runner in active.iterrows():
+        status = str(runner.get("Status") or "").strip().upper()
+        if status in {"SCRATCHED", "SCR", "SCRATCH", "S", "NON-RUNNER", "NON RUNNER", "NR", "RESERVE", "R"}:
+            continue
+        scratched_flag = runner.get("scratched", False)
+        if scratched_flag is True or str(scratched_flag).strip().upper() in {"TRUE", "YES", "Y", "1"}:
+            continue
         horse = str(runner.get("Horse") or "").strip()
         if not horse:
             continue

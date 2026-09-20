@@ -28,6 +28,20 @@ class SAHRError(RuntimeError):
     """Raised when the SAHorseracing feed cannot be loaded or parsed."""
 
 
+def _sahr_is_scratched(runner: dict[str, Any]) -> bool:
+    """Recognise scratchings without confusing reserves (R) with non-runners."""
+    status = str(runner.get("status") or "").strip().upper()
+    if status in {"S", "SCR", "SCRATCH", "SCRATCHED", "SCRATCHING", "NON-RUNNER", "NON RUNNER", "NR"}:
+        return True
+    for key in ("scratched", "isScratched", "is_scratched", "scratch"):
+        value = runner.get(key)
+        if isinstance(value, bool) and value:
+            return True
+        if str(value or "").strip().upper() in {"TRUE", "YES", "Y", "1", "S", "SCR", "SCRATCHED"}:
+            return True
+    return False
+
+
 def _apprentice_claim_kg(runner: dict[str, Any]) -> float:
     """Return the apprentice claim in kg from the SAHR runner payload.
 
@@ -389,6 +403,7 @@ def race_to_race_edge_card(meeting: dict[str, Any], race_key: str) -> dict[str, 
             "horseSeq": r.get("seq"),
             "horseName": r.get("horse") or "",
             "status": r.get("status") or "F",
+            "scratched": _sahr_is_scratched(r),
             "draw": r.get("draw"),
             "officialDraw": r.get("odraw"),
             "age": r.get("age"),

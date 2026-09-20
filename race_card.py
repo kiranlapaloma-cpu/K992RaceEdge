@@ -131,6 +131,20 @@ def _racecard_mr_achieved_stats(horse: str) -> tuple[int | None, int | None]:
     highest = int(round(float(achieved.max())))
     return latest, highest
 
+def _racecard_is_scratched(runner: dict) -> bool:
+    """Support native SAHR statuses and the normalized/manual JSON flag."""
+    status = str(runner.get("status") or "").strip().upper()
+    if status in {"S", "SCR", "SCRATCH", "SCRATCHED", "SCRATCHING", "NON-RUNNER", "NON RUNNER", "NR"}:
+        return True
+    for key in ("scratched", "isScratched", "is_scratched", "scratch"):
+        value = runner.get(key)
+        if isinstance(value, bool) and value:
+            return True
+        if str(value or "").strip().upper() in {"TRUE", "YES", "Y", "1", "S", "SCR", "SCRATCHED"}:
+            return True
+    return False
+
+
 def _racecard_runner_frame(card: dict, db_counts: dict[str, int] | None = None) -> pd.DataFrame:
     db_counts = db_counts or {}
     rows = []
@@ -140,7 +154,8 @@ def _racecard_runner_frame(card: dict, db_counts: dict[str, int] | None = None) 
             continue
 
         status = str(runner.get("status") or "").strip().upper()
-        is_reserve = status == "R" or str(runner.get("jockeyName") or "").strip().lower().startswith("reserve")
+        is_scratched = _racecard_is_scratched(runner)
+        is_reserve = (not is_scratched) and (status == "R" or str(runner.get("jockeyName") or "").strip().lower().startswith("reserve"))
         horse_weight = _racecard_int(runner.get("horseWeight"))
         weight_delta = _racecard_int(runner.get("horseWeightDelta"))
         apprentice_claim = _racecard_apprentice_claim(runner)
@@ -170,7 +185,7 @@ def _racecard_runner_frame(card: dict, db_counts: dict[str, int] | None = None) 
             "Race Edge Runs": int(db_counts.get(canon_horse(horse), 0)),
             "Latest MR Achieved": latest_mr_achieved,
             "Highest MR Achieved": highest_mr_achieved,
-            "Status": "Reserve" if is_reserve else "Runner",
+            "Status": "Scratched" if is_scratched else ("Reserve" if is_reserve else "Runner"),
         })
 
     df = pd.DataFrame(rows)
@@ -336,6 +351,23 @@ def _enhanced_racecard_table(active: pd.DataFrame, prediction: dict | None) -> p
         axis=1,
     )
 
+    # Scratchings have no race-day projection, but retain saved historical ratings.
+    if "Status" in table.columns:
+        for idx, row in table.loc[table["Status"] == "Scratched"].iterrows():
+            table.at[idx, "Groups"] = "SCRATCHED"
+            if pd.notna(row.get("Latest MR Achieved")):
+                table.at[idx, "Latest MR"] = row["Latest MR Achieved"]
+            if pd.notna(row.get("Highest MR Achieved")):
+                table.at[idx, "Peak MR"] = row["Highest MR Achieved"]
+            if _supabase_configured():
+                try:
+                    history = load_horse_history(str(row["Horse"]))
+                    if history is not None and not history.empty:
+                        profile = build_performance_profile(history)
+                        table.at[idx, "Recent Best MR"] = profile.get("recent_best_mr")
+                except Exception:
+                    pass
+
     out = table[[
         c for c in [
             "No.", "Horse", "Draw", "Age", "Weight", "Claim", "Official MR",
@@ -346,8 +378,8 @@ def _enhanced_racecard_table(active: pd.DataFrame, prediction: dict | None) -> p
 
     if "Horse" in out.columns and "Claim" in out.columns:
         out["Horse"] = [
-            _claim_horse_name(horse, claim)
-            for horse, claim in zip(out["Horse"], out["Claim"])
+            _claim_horse_name(horse, claim) + (" - SCRATCHED" if status == "Scratched" else "")
+            for horse, claim, status in zip(out["Horse"], out["Claim"], table["Status"])
         ]
 
     for c in ["No.", "Draw", "Age", "Official MR"]:
@@ -433,6 +465,8 @@ def _render_racecard_runner_profiles(active: pd.DataFrame, prediction: dict | No
         current_draw = runner.get("Draw")
         saddle_no = runner.get("No.")
         display_horse = _claim_horse_name(horse, current_claim)
+        if runner.get("Status") == "Scratched":
+            display_horse += " - SCRATCHED"
 
         try:
             hist = load_horse_history(horse)
@@ -839,13 +873,13 @@ def _render_loaded_race_card(card: dict):
     currency = str(card.get("currency") or "").strip()
 
     active_count = sum(
-        1 for r in card.get("runners", [])
-        if str(r.get("status") or "").strip().upper() != "R"
+        not _racecard_is_scratched(r)
+        and str(r.get("status") or "").strip().upper() != "R"
+        and not str(r.get("jockeyName") or "").strip().lower().startswith("reserve")
+        for r in card.get("runners", [])
     )
-    reserve_count = sum(
-        1 for r in card.get("runners", [])
-        if str(r.get("status") or "").strip().upper() == "R"
-    )
+    scratched_count = sum(_racecard_is_scratched(r) for r in card.get("runners", []))
+    reserve_count = len(card.get("runners", [])) - active_count - scratched_count
 
     # Compact race header.
     st.markdown(
@@ -853,6 +887,8 @@ def _render_loaded_race_card(card: dict):
         f"{distance if distance is not None else '-'}m | {time_label}"
     )
     header_bits = [date_label, surface, f"{active_count} runners"]
+    if scratched_count:
+        header_bits.append(f"{scratched_count} scratched")
     if reserve_count:
         header_bits.append(f"{reserve_count} reserve{'s' if reserve_count != 1 else ''}")
     if stake:
@@ -883,6 +919,7 @@ def _render_loaded_race_card(card: dict):
 
     active = field[field["Status"] == "Runner"].copy()
     reserves = field[field["Status"] == "Reserve"].copy()
+    scratched = field[field["Status"] == "Scratched"].copy()
 
     # Build prediction once and reuse it across card, prediction and profiles.
     prediction = None
@@ -906,14 +943,20 @@ def _render_loaded_race_card(card: dict):
         )
 
     st.markdown("### Race Card")
+    # Show the complete declared field, but only active runners enter prediction maths.
+    card_field = pd.concat([active, scratched], ignore_index=True)
+    card_field = card_field.sort_values("No.", na_position="last")
     st.dataframe(
-        _enhanced_racecard_table(active, prediction),
+        _enhanced_racecard_table(card_field, prediction),
         width="stretch",
         hide_index=True,
     )
     st.caption("Groups = Recent Best / Latest / Peak. A 5-point gap starts the next group.")
-    if "Claim" in active.columns and pd.to_numeric(active["Claim"], errors="coerce").fillna(0).gt(0).any():
+    if "Claim" in card_field.columns and pd.to_numeric(card_field["Claim"], errors="coerce").fillna(0).gt(0).any():
         st.caption("# after horse name = apprentice claim available.")
+
+    if not scratched.empty:
+        st.caption("SCRATCHED runners remain on the card but are excluded from all predictions, groups and margins.")
 
     if not reserves.empty:
         with st.expander(f"Reserves ({len(reserves)})", expanded=False):
@@ -924,7 +967,7 @@ def _render_loaded_race_card(card: dict):
             st.dataframe(reserves[reserve_cols], width="stretch", hide_index=True)
 
     _render_race_prediction(active, card, prediction=prediction)
-    _render_racecard_runner_profiles(active, prediction=prediction)
+    _render_racecard_runner_profiles(card_field, prediction=prediction)
 
 
 
