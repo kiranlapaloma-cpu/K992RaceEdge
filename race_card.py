@@ -134,7 +134,7 @@ def _racecard_mr_achieved_stats(horse: str) -> tuple[int | None, int | None]:
 def _racecard_is_scratched(runner: dict) -> bool:
     """Support native SAHR statuses and the normalized/manual JSON flag."""
     status = str(runner.get("status") or "").strip().upper()
-    if status in {"S", "SCR", "SCRATCH", "SCRATCHED", "SCRATCHING", "NON-RUNNER", "NON RUNNER", "NR"}:
+    if status in {"L", "S", "SCR", "SCRATCH", "SCRATCHED", "SCRATCHING", "NON-RUNNER", "NON RUNNER", "NR"}:
         return True
     for key in ("scratched", "isScratched", "is_scratched", "scratch"):
         value = runner.get(key)

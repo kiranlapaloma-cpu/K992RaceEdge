@@ -31,7 +31,7 @@ class SAHRError(RuntimeError):
 def _sahr_is_scratched(runner: dict[str, Any]) -> bool:
     """Recognise scratchings without confusing reserves (R) with non-runners."""
     status = str(runner.get("status") or "").strip().upper()
-    if status in {"S", "SCR", "SCRATCH", "SCRATCHED", "SCRATCHING", "NON-RUNNER", "NON RUNNER", "NR"}:
+    if status in {"L", "S", "SCR", "SCRATCH", "SCRATCHED", "SCRATCHING", "NON-RUNNER", "NON RUNNER", "NR"}:
         return True
     for key in ("scratched", "isScratched", "is_scratched", "scratch"):
         value = runner.get(key)
