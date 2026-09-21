@@ -8,6 +8,7 @@ from common import canon_horse
 from database import _supabase_configured, load_horse_history, _fetch_all_horse_rows
 from performance_profile import build_performance_profile, render_performance_profile
 from race_prediction import build_race_predictions, prediction_display_table
+from view_pick6 import render_suggested_pick6
 from sahr import (
     get_fields_meeting, get_meetings_for_date, meeting_display_label,
     meeting_race_options, race_to_race_edge_card, SAHRError,
@@ -1005,6 +1006,7 @@ def _render_race_strip(meeting: dict):
                 except Exception:
                     pass
 
+    is_pick6 = st.session_state.get("sahr_show_pick6", False)
     st.markdown("**Race:**")
 
     # Keep the strip compact. Up to 10 races usually fits comfortably on iPad.
@@ -1027,8 +1029,18 @@ def _render_race_strip(meeting: dict):
                     width="stretch",
                     key=f"sahr_race_strip_{key}",
                 ):
+                    st.session_state["sahr_show_pick6"] = False
                     _session_load_meeting_race(meeting, key)
                     st.rerun()
+
+    if st.button(
+        "Suggested Pick 6",
+        type="primary" if is_pick6 else "secondary",
+        width="stretch",
+        key="sahr_suggested_pick6_button",
+    ):
+        st.session_state["sahr_show_pick6"] = True
+        st.rerun()
 
 
 def render_race_card():
@@ -1059,6 +1071,7 @@ def render_race_card():
             st.session_state["sahr_meeting_date_key"] = date_key
             st.session_state["sahr_available_meetings"] = None
             st.session_state["sahr_meeting"] = None
+            st.session_state["sahr_show_pick6"] = False
             st.session_state["race_card_payload"] = None
             st.session_state["sahr_current_race_key"] = None
 
@@ -1067,6 +1080,7 @@ def render_race_card():
                 found = get_meetings_for_date(race_date)
                 st.session_state["sahr_available_meetings"] = found
                 st.session_state["sahr_meeting"] = None
+                st.session_state["sahr_show_pick6"] = False
                 st.session_state["race_card_payload"] = None
                 st.session_state["sahr_current_race_key"] = None
                 if found:
@@ -1097,6 +1111,7 @@ def render_race_card():
                 try:
                     meeting = get_fields_meeting(race_date, int(selected_meeting["club"]))
                     st.session_state["sahr_meeting"] = meeting
+                    st.session_state["sahr_show_pick6"] = False
                     st.session_state["race_card_payload"] = None
                     st.session_state["sahr_current_race_key"] = None
                     st.success(str(meeting.get("heading") or "Meeting loaded."))
@@ -1157,4 +1172,16 @@ def render_race_card():
         return
 
     st.divider()
-    _render_loaded_race_card(card)
+    if st.session_state.get("sahr_show_pick6") and st.session_state.get("sahr_meeting"):
+        render_suggested_pick6(
+            st.session_state["sahr_meeting"],
+            meeting_race_options(st.session_state["sahr_meeting"]),
+            card_loader=race_to_race_edge_card,
+            runner_frame=_racecard_runner_frame,
+            db_counts_loader=_racecard_db_counts,
+            history_loader=load_horse_history,
+            prediction_builder=build_race_predictions,
+            database_configured=_supabase_configured,
+        )
+    else:
+        _render_loaded_race_card(card)
