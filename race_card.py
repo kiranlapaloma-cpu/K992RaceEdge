@@ -9,6 +9,7 @@ from database import _supabase_configured, load_horse_history, _fetch_all_horse_
 from performance_profile import build_performance_profile, render_performance_profile
 from race_prediction import build_race_predictions, prediction_display_table
 from view_pick6 import render_suggested_pick6
+from view_rating_map import render_rating_map
 from sahr import (
     get_fields_meeting, get_meetings_for_date, meeting_display_label,
     meeting_race_options, race_to_race_edge_card, SAHRError,
@@ -958,6 +959,17 @@ def _render_loaded_race_card(card: dict):
 
     if not scratched.empty:
         st.caption("SCRATCHED runners remain on the card but are excluded from all predictions, groups and margins.")
+
+    # Optional visual only: keep the normal Race Card uncluttered unless selected.
+    map_key = f"race_edge_rating_map_{card.get('date')}_{card.get('race') or card.get('raceNumber')}"
+    show_rating_map = st.toggle(
+        "Race Edge Rating Map",
+        value=False,
+        key=map_key,
+        help="Show how well each runner is placed on today's terms using Recent Best, Latest Form or Peak Ability.",
+    )
+    if show_rating_map:
+        render_rating_map(prediction)
 
     if not reserves.empty:
         with st.expander(f"Reserves ({len(reserves)})", expanded=False):
