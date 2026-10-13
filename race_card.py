@@ -10,6 +10,7 @@ from performance_profile import build_performance_profile, render_performance_pr
 from race_prediction import build_race_predictions, prediction_display_table
 from view_pick6 import render_suggested_pick6
 from view_rating_map import render_rating_map
+from worksheet_export import build_worksheet_pdf
 from sahr import (
     get_fields_meeting, get_meetings_for_date, meeting_display_label,
     meeting_race_options, race_to_race_edge_card, SAHRError,
@@ -1123,6 +1124,7 @@ def render_race_card():
                 try:
                     meeting = get_fields_meeting(race_date, int(selected_meeting["club"]))
                     st.session_state["sahr_meeting"] = meeting
+                    st.session_state.pop("race_edge_worksheet_pdf", None)
                     st.session_state["sahr_show_pick6"] = False
                     st.session_state["race_card_payload"] = None
                     st.session_state["sahr_current_race_key"] = None
@@ -1146,6 +1148,27 @@ def render_race_card():
             options = meeting_race_options(meeting)
             if options:
                 _render_race_strip(meeting)
+                if st.button("Generate Full Meeting Prediction Worksheet", key="race_edge_worksheet_generate", width="stretch"):
+                    try:
+                        with st.spinner("Calculating all races and preparing worksheet..."):
+                            pdf, warnings = build_worksheet_pdf(
+                                meeting, options, race_to_race_edge_card,
+                                _racecard_runner_frame, _racecard_db_counts,
+                                build_race_predictions, load_horse_history,
+                            )
+                        st.session_state["race_edge_worksheet_pdf"] = pdf
+                        st.session_state["race_edge_worksheet_warnings"] = warnings
+                    except Exception as exc:
+                        st.error(f"Worksheet generation failed: {exc}")
+                if st.session_state.get("race_edge_worksheet_pdf"):
+                    st.download_button(
+                        "Download Full Meeting Prediction Worksheet (PDF)",
+                        data=st.session_state["race_edge_worksheet_pdf"],
+                        file_name="race_edge_prediction_worksheet.pdf",
+                        mime="application/pdf", width="stretch",
+                    )
+                    for warning in st.session_state.get("race_edge_worksheet_warnings", []):
+                        st.warning(warning)
 
             st.caption(
                 "Source: SAHorseracing / National Horse Racing Bureau data feed. "
