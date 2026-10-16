@@ -106,150 +106,122 @@ def render_pace_curve(ctx):
                         ylab = "Speed (m/s)"
                         title_tail = "raw pace by segment"
 
-                    # ---- Plot ----
-                    fig, ax = plt.subplots(figsize=(10.8, 6.4))
+                    # ---- Interactive Plotly chart (no Streamlit image endpoint) ----
+                    import plotly.graph_objects as go
+                    from plotly.colors import qualitative
+                    fig = go.Figure()
+                    palette = (qualitative.Dark24 + qualitative.Light24)
+                    winner_name = picked_names[0] if picked_names else None
+                    top4_names = set(picked_names[:min(4, len(picked_names))])
 
-                    # phase shading: early / sustain / acceleration / grind
+                    # Shade the same early/sustain/acceleration/grind intervals.
                     if show_phase_shading and nseg >= 2:
                         seg_marks = [int(xv) for (xv, _, _) in segs]
                         idx_600 = seg_marks.index(600) if 600 in seg_marks else None
                         idx_200 = seg_marks.index(200) if 200 in seg_marks else None
                         idx_fin = seg_marks.index(0) if 0 in seg_marks else (nseg - 1)
-
                         bands = []
-                        # Everything before the acceleration phase
                         if idx_600 is not None and idx_600 > 0:
                             if idx_600 >= 2:
-                                mid_cut = max(0, int(round(idx_600 * 0.55)))
-                                mid_cut = min(mid_cut, idx_600)
+                                mid_cut = min(max(0, int(round(idx_600 * 0.55))), idx_600)
                                 if mid_cut > 0:
                                     bands.append((-0.5, mid_cut - 0.5, "Early"))
-                                if idx_600 - 0.5 > mid_cut - 0.5:
+                                if idx_600 > mid_cut:
                                     bands.append((mid_cut - 0.5, idx_600 - 0.5, "Sustain"))
                             else:
                                 bands.append((-0.5, idx_600 - 0.5, "Early"))
                         elif idx_fin > 0:
                             bands.append((-0.5, idx_fin - 0.5, "Race"))
-
-                        # User-defined pace phases
                         if idx_600 is not None and idx_200 is not None and idx_200 >= idx_600:
                             bands.append((idx_600 - 0.5, idx_200 + 0.5, "Acceleration"))
                         if idx_fin is not None:
                             bands.append((idx_fin - 0.5, idx_fin + 0.5, "Grind"))
-
-                        for idx_b, (x0, x1, lab) in enumerate(bands):
-                            x0 = max(-0.5, x0)
-                            x1 = min(nseg - 0.5, x1)
+                        for ib, (x0, x1, label) in enumerate(bands):
+                            x0, x1 = max(-0.5, x0), min(nseg - 0.5, x1)
                             if x1 > x0:
-                                ax.axvspan(x0, x1, alpha=0.06 if idx_b % 2 == 0 else 0.10, color="grey")
-                                ax.text((x0+x1)/2.0, 0.98, lab, transform=ax.get_xaxis_transform(),
-                                        ha="center", va="top", fontsize=8)
+                                fig.add_vrect(x0=x0, x1=x1,
+                                    fillcolor="rgba(100,116,139,0.07)" if ib % 2 == 0 else "rgba(100,116,139,0.13)",
+                                    line_width=0, layer="below")
+                                fig.add_annotation(x=(x0+x1)/2, y=1, yref="paper", text=label,
+                                    showarrow=False, yanchor="top", font=dict(size=10, color="#64748b"))
 
-                    # field average
-                    ax.plot(x_vals, field_line, color="black", lw=2.8, marker="o", ms=4.2, label="Field average", zorder=4)
-
-                    # runner lines
-                    palette = color_cycle(len(picked))
-                    winner_name = picked_names[0] if picked_names else None
-                    top4_names = set(picked_names[:min(4, len(picked_names))])
-                    end_label_specs = []
-
+                    fig.add_trace(go.Scatter(
+                        x=x_vals.tolist(), y=np.asarray(field_line, dtype=float).tolist(),
+                        mode="lines+markers", name="Field average",
+                        line=dict(color="#111827", width=3, dash="dash"),
+                        marker=dict(size=6), hovertemplate="%{y:.3f} m/s<extra>Field average</extra>"
+                    ))
+                    end_specs = []
                     for i, name in enumerate(picked_names):
                         y = disp_map.get(name)
                         if y is None or not np.any(np.isfinite(y)):
                             continue
-                        is_winner = (name == winner_name)
+                        is_winner = name == winner_name
                         is_top4 = name in top4_names
-                        lw = 2.8 if is_winner else (2.0 if is_top4 else 1.15)
-                        alpha = 1.0 if is_winner else (0.92 if is_top4 else 0.58)
-                        ms = 4.0 if is_winner else (3.2 if is_top4 else 2.4)
-                        z = 6 if is_winner else (5 if is_top4 else 3)
-                        ax.plot(x_vals, y, color=palette[i], lw=lw, alpha=alpha,
-                                marker="o", ms=ms, label=name, zorder=z)
-
-                        # mark strongest segment
-                        finite = np.where(np.isfinite(y))[0]
+                        color = palette[i % len(palette)]
+                        yplot = np.asarray(y, dtype=float)
+                        finite = np.flatnonzero(np.isfinite(yplot))
+                        # Plotly naturally leaves gaps at missing segments.
+                        fig.add_trace(go.Scatter(
+                            x=x_vals.tolist(), y=[float(v) if np.isfinite(v) else None for v in yplot],
+                            mode="lines+markers", name=name,
+                            line=dict(color=color, width=3.5 if is_winner else (2.5 if is_top4 else 1.5)),
+                            marker=dict(size=7 if is_winner else (6 if is_top4 else 4)),
+                            opacity=1 if is_winner else (0.9 if is_top4 else 0.65),
+                            showlegend=is_top4,
+                            hovertemplate="%{fullData.name}<br>%{x}: %{y:.3f} m/s<extra></extra>"
+                        ))
                         if len(finite):
-                            jj = finite[np.nanargmax(y[finite])]
-                            ax.scatter([x_vals[jj]], [y[jj]], color=palette[i], s=28 if is_top4 else 20,
-                                       edgecolor="black", linewidth=0.4, zorder=z+1)
+                            peak_idx = finite[np.argmax(yplot[finite])]
+                            fig.add_trace(go.Scatter(
+                                x=[int(peak_idx)], y=[float(yplot[peak_idx])], mode="markers",
+                                marker=dict(size=10 if is_top4 else 8, color=color,
+                                            line=dict(color="#111827", width=1)),
+                                showlegend=False, hoverinfo="skip"
+                            ))
+                            if show_end_labels:
+                                last = finite[-1]
+                                end_specs.append((name, float(last), float(yplot[last]), color, is_winner))
 
-                        # store end labels for all shown runners
-                        if show_end_labels and len(finite):
-                            jf = finite[-1]
-                            end_label_specs.append({
-                                "name": name,
-                                "x": float(x_vals[jf]),
-                                "y": float(y[jf]),
-                                "color": palette[i],
-                                "is_winner": is_winner,
-                                "z": z,
-                            })
+                    # Non-overlapping labels placed to the right, with connector lines.
+                    if show_end_labels and end_specs:
+                        all_y = np.concatenate([np.asarray(field_line, dtype=float)] +
+                                               [np.asarray(v, dtype=float) for v in disp_map.values()])
+                        valid = all_y[np.isfinite(all_y)]
+                        if len(valid):
+                            lo, hi = float(valid.min()), float(valid.max())
+                            span = max(hi-lo, 0.1)
+                            gap = span * 0.055
+                            ordered = sorted(end_specs, key=lambda t: t[2])
+                            placed = []
+                            for spec in ordered:
+                                placed.append(max(spec[2], placed[-1] + gap) if placed else spec[2])
+                            # Allow sufficient vertical space for crowded labels.
+                            lower = min(lo - 0.05*span, placed[0])
+                            upper = max(hi + 0.05*span, placed[-1] + 0.03*span)
+                            fig.update_yaxes(range=[lower, upper])
+                            for (name, xend, yend, color, is_winner), yl in zip(ordered, placed):
+                                fig.add_shape(type="line", x0=xend, y0=yend,
+                                              x1=nseg-1+0.17, y1=yl,
+                                              line=dict(color=color, width=1))
+                                fig.add_annotation(x=nseg-1+0.20, y=yl, text=name,
+                                                   showarrow=False, xanchor="left", yanchor="middle",
+                                                   font=dict(size=10, color=color,
+                                                             family="Arial Black" if is_winner else "Arial"))
 
-                    # non-overlapping right-edge labels with leader lines
-                    if show_end_labels and end_label_specs:
-                        y0, y1 = ax.get_ylim()
-                        yr = max(1e-9, y1 - y0)
-                        min_gap = 0.055 * yr
-                        label_x = len(x_vals) - 1 + 0.10
-
-                        end_label_specs = sorted(end_label_specs, key=lambda d: d["y"])
-                        placed_y = []
-                        for d in end_label_specs:
-                            yy = d["y"]
-                            if placed_y:
-                                yy = max(yy, placed_y[-1] + min_gap)
-                            placed_y.append(yy)
-                        # keep inside axes and back-propagate if needed
-                        upper_cap = y1 - 0.03 * yr
-                        lower_cap = y0 + 0.03 * yr
-                        if placed_y:
-                            if placed_y[-1] > upper_cap:
-                                shift = placed_y[-1] - upper_cap
-                                placed_y = [yy - shift for yy in placed_y]
-                            if placed_y[0] < lower_cap:
-                                shift = lower_cap - placed_y[0]
-                                placed_y = [yy + shift for yy in placed_y]
-                            for k in range(len(placed_y) - 2, -1, -1):
-                                placed_y[k] = min(placed_y[k], placed_y[k + 1] - min_gap)
-                            for k in range(1, len(placed_y)):
-                                placed_y[k] = max(placed_y[k], placed_y[k - 1] + min_gap)
-
-                        for d, yy in zip(end_label_specs, placed_y):
-                            ax.plot([d["x"], label_x - 0.02], [d["y"], yy], color=d["color"], alpha=0.55,
-                                    lw=1.0 if d["is_winner"] else 0.8, zorder=d["z"])
-                            ax.text(label_x, yy, d["name"], fontsize=8.2 if d["is_winner"] else 7.8,
-                                    fontweight="bold" if d["is_winner"] else "normal",
-                                    color=d["color"], va="center", ha="left", zorder=d["z"] + 1,
-                                    bbox=dict(boxstyle="round,pad=0.12", facecolor="white", edgecolor="none", alpha=0.7))
-
-                    ax.set_xticks(x_vals)
-                    ax.set_xticklabels(x_labels, rotation=0, fontsize=9)
-                    ax.set_ylabel(ylab)
-                    ax.set_title(f"Pace Curve — {title_tail}")
-                    ax.grid(True, ls="--", alpha=0.28)
-                    ax.set_xlim(-0.35, len(x_vals)-1 + (1.30 if (show_end_labels and len(picked_names) > 12) else (1.05 if show_end_labels else 0.25)))
-
-                    # cleaner legend: just field avg + winner + top placers when available
-                    handles, labels = ax.get_legend_handles_labels()
-                    keep_labels = ["Field average"]
-                    if winner_name:
-                        keep_labels.append(winner_name)
-                    keep_labels.extend([nm for nm in picked_names[1:min(4, len(picked_names))]])
-                    keep = [(h, l) for h, l in zip(handles, labels) if l in keep_labels]
-                    if keep:
-                        ax.legend([h for h, _ in keep], [l for _, l in keep],
-                                  loc="upper center", bbox_to_anchor=(0.5, -0.14),
-                                  ncol=min(4, len(keep)), frameon=False, fontsize=8)
-
-                    # Render as PNG bytes to avoid Streamlit pyplot image delivery issues.
-                    from io import BytesIO
-                    png_buffer = BytesIO()
-                    try:
-                        fig.savefig(png_buffer, format="png", dpi=160, bbox_inches="tight", facecolor="white")
-                        st.image(png_buffer.getvalue(), width="stretch")
-                    finally:
-                        png_buffer.close()
+                    fig.update_layout(
+                        title=f"Pace Curve — {title_tail}",
+                        xaxis=dict(title="Race segment (distance remaining)",
+                                   tickmode="array", tickvals=x_vals.tolist(), ticktext=x_labels,
+                                   range=[-0.35, nseg-1+(2.3 if show_end_labels else 0.25)],
+                                   showgrid=True, gridcolor="rgba(148,163,184,0.18)"),
+                        yaxis=dict(title=ylab, showgrid=True, gridcolor="rgba(148,163,184,0.25)", zeroline=True),
+                        template="plotly_white", height=610,
+                        margin=dict(l=55, r=15, t=70, b=65),
+                        legend=dict(orientation="h", yanchor="top", y=-0.18, xanchor="center", x=0.5),
+                        hovermode="x unified",
+                    )
+                    st.plotly_chart(fig, width="stretch", config={"displaylogo": False, "responsive": True})
 
                     # caption / interpretation
                     try:
@@ -273,5 +245,3 @@ def render_pace_curve(ctx):
                             st.caption(f"View: {runner_set}. Ranking basis: {ranking_rule}. Values above zero indicate segments run faster than the field average.")
                     except Exception:
                         st.caption(f"View: {runner_set}. Ranking basis: {ranking_rule}.")
-
-                    plt.close(fig)
