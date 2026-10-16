@@ -242,7 +242,14 @@ def render_pace_curve(ctx):
                                   loc="upper center", bbox_to_anchor=(0.5, -0.14),
                                   ncol=min(4, len(keep)), frameon=False, fontsize=8)
 
-                    st.pyplot(fig)
+                    # Render as PNG bytes to avoid Streamlit pyplot image delivery issues.
+                    from io import BytesIO
+                    png_buffer = BytesIO()
+                    try:
+                        fig.savefig(png_buffer, format="png", dpi=160, bbox_inches="tight", facecolor="white")
+                        st.image(png_buffer.getvalue(), width="stretch")
+                    finally:
+                        png_buffer.close()
 
                     # caption / interpretation
                     try:
