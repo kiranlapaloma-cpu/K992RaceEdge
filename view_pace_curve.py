@@ -108,9 +108,16 @@ def render_pace_curve(ctx):
 
                     # ---- Interactive Plotly chart (no Streamlit image endpoint) ----
                     import plotly.graph_objects as go
-                    from plotly.colors import qualitative
                     fig = go.Figure()
-                    palette = (qualitative.Dark24 + qualitative.Light24)
+                    # High-contrast runner colours: never use black or near-black.
+                    palette = [
+                        "#E63946", "#0077B6", "#16A34A", "#D97706",
+                        "#9333EA", "#DB2777", "#0891B2", "#65A30D",
+                        "#EA580C", "#4F46E5", "#0D9488", "#C026D3",
+                        "#B45309", "#2563EB", "#DC2626", "#7C3AED",
+                        "#15803D", "#BE185D", "#0369A1", "#A16207",
+                        "#6D28D9", "#0F766E", "#C2410C", "#4338CA",
+                    ]
                     winner_name = picked_names[0] if picked_names else None
                     top4_names = set(picked_names[:min(4, len(picked_names))])
 
@@ -148,7 +155,7 @@ def render_pace_curve(ctx):
                     fig.add_trace(go.Scatter(
                         x=x_vals.tolist(), y=np.asarray(field_line, dtype=float).tolist(),
                         mode="lines+markers", name="Field average",
-                        line=dict(color="#111827", width=3, dash="dash"),
+                        line=dict(color="#64748B", width=3, dash="dash"),
                         marker=dict(size=6), hovertemplate="%{y:.3f} m/s<extra>Field average</extra>"
                     ))
                     end_specs = []
@@ -176,7 +183,7 @@ def render_pace_curve(ctx):
                             fig.add_trace(go.Scatter(
                                 x=[int(peak_idx)], y=[float(yplot[peak_idx])], mode="markers",
                                 marker=dict(size=10 if is_top4 else 8, color=color,
-                                            line=dict(color="#111827", width=1)),
+                                            line=dict(color="#FFFFFF", width=1)),
                                 showlegend=False, hoverinfo="skip"
                             ))
                             if show_end_labels:
